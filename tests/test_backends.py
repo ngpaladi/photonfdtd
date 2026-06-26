@@ -80,6 +80,8 @@ def test_numba_particle_matches_numpy():
     ("xy-TE", (3e-6, 3e-6), (8, 8, 0), "Ex"),
     ("yz-TM", (None, 3e-6, 3e-6), (0, 8, 8), "Ex"),
     ("yz-TE", (None, 3e-6, 3e-6), (0, 8, 8), "Ey"),
+    ("xz-TM", (3e-6, None, 3e-6), (8, 0, 8), "Ey"),
+    ("xz-TE", (3e-6, None, 3e-6), (8, 0, 8), "Ex"),
 ])
 def test_numba_matches_numpy_2d(label, size, pml, component):
     """The Numba kernel must reproduce NumPy in 2D. Guards against the
