@@ -234,7 +234,15 @@ class Simulation:
         verbose: bool = False,
         use_gpu: bool = False,
         use_numba: bool = False,
+        precision: str = "float64",
     ) -> None:
+        if precision not in ("float32", "float64"):
+            raise ValueError("precision must be 'float32' or 'float64'")
+        # Working dtype for fields, CPML state and coefficients. float32 halves
+        # memory and roughly doubles throughput (FDTD is memory-bandwidth bound)
+        # at single precision; the default float64 is bit-for-bit unchanged.
+        self.precision = precision
+        self.dtype = np.float32 if precision == "float32" else np.float64
         self.use_gpu = use_gpu and _GPU_AVAILABLE
         self.use_numba = use_numba and _NUMBA_AVAILABLE and not self.use_gpu
         if self.use_numba and grid.ndim < 3:
@@ -319,12 +327,14 @@ class Simulation:
             raise ValueError("ChargedParticle velocity must be non-zero.")
         self.particle_sources.append(p)
 
-    def _inject_particle_currents(self, t_now, Ex, Ey, Ez, eps_r_xp, xp) -> None:
+    def _inject_particle_currents(self, t_now, Ex, Ey, Ez, ce_field, xp) -> None:
         """Deposit each moving charge's current onto the E-field at time ``t_now``.
 
         A charge ``q`` moving at velocity ``v`` is a current density
         ``J = q v`` localised at the particle, contributing ``dE = -dt/eps * J``
-        to Ampere's law. The charge is smeared over a Gaussian cloud (width
+        to Ampere's law. Since ``ce_field = dt/(eps_r*EPS_0)``, the per-cell
+        deposit is ``dE = -(q*v/dV) * weight * ce_field`` - reusing ``ce_field``
+        keeps the deposition in the working dtype and needs no separate eps copy. The charge is smeared over a Gaussian cloud (width
         ``cloud_cells``) to band-limit the radiated spectrum, and the cloud is
         deposited only while the particle *centre* sits in the physical
         (non-PML) interior, so it stops radiating into the PML once it exits
@@ -384,14 +394,14 @@ class Simulation:
             wblock = (waxes[0].reshape(-1, 1, 1)
                       * waxes[1].reshape(1, -1, 1)
                       * waxes[2].reshape(1, 1, -1))
-            wblock = xp.asarray(wblock)
-            eps_sub = eps_r_xp[sub[0], sub[1], sub[2]]
+            wblock = xp.asarray(wblock, dtype=ce_field.dtype)
+            ce_sub = ce_field[sub[0], sub[1], sub[2]]
             for a in range(3):
                 va = p.velocity3[a]
                 if va == 0.0 or grid.shape[a] == 1:
                     continue
-                base = -(self.dt * p.charge * va) / (EPS_0 * dV)
-                E_comp[a][sub[0], sub[1], sub[2]] += base * wblock / eps_sub
+                coef = -(p.charge * va) / dV
+                E_comp[a][sub[0], sub[1], sub[2]] += coef * wblock * ce_sub
 
     def add_monitor(self, monitor) -> None:
         self.monitors.append(monitor)
@@ -426,34 +436,39 @@ class Simulation:
             print(f"[photonfdtd] GPU backend (CuPy {xp.__version__}), "
                   f"device: {devname}", file=sys.stderr, flush=True)
 
+        dtype = self.dtype
+
         # Field arrays allocated on the chosen backend
-        Ex = xp.zeros((nx, ny, nz))
-        Ey = xp.zeros((nx, ny, nz))
-        Ez = xp.zeros((nx, ny, nz))
-        Hx = xp.zeros((nx, ny, nz))
-        Hy = xp.zeros((nx, ny, nz))
-        Hz = xp.zeros((nx, ny, nz))
+        Ex = xp.zeros((nx, ny, nz), dtype=dtype)
+        Ey = xp.zeros((nx, ny, nz), dtype=dtype)
+        Ez = xp.zeros((nx, ny, nz), dtype=dtype)
+        Hx = xp.zeros((nx, ny, nz), dtype=dtype)
+        Hy = xp.zeros((nx, ny, nz), dtype=dtype)
+        Hz = xp.zeros((nx, ny, nz), dtype=dtype)
 
         # CPML auxiliary variables
-        psi_Ex_y = xp.zeros((nx, ny, nz)); psi_Ex_z = xp.zeros((nx, ny, nz))
-        psi_Ey_z = xp.zeros((nx, ny, nz)); psi_Ey_x = xp.zeros((nx, ny, nz))
-        psi_Ez_x = xp.zeros((nx, ny, nz)); psi_Ez_y = xp.zeros((nx, ny, nz))
-        psi_Hx_y = xp.zeros((nx, ny, nz)); psi_Hx_z = xp.zeros((nx, ny, nz))
-        psi_Hy_z = xp.zeros((nx, ny, nz)); psi_Hy_x = xp.zeros((nx, ny, nz))
-        psi_Hz_x = xp.zeros((nx, ny, nz)); psi_Hz_y = xp.zeros((nx, ny, nz))
+        z = lambda: xp.zeros((nx, ny, nz), dtype=dtype)
+        psi_Ex_y = z(); psi_Ex_z = z()
+        psi_Ey_z = z(); psi_Ey_x = z()
+        psi_Ez_x = z(); psi_Ez_y = z()
+        psi_Hx_y = z(); psi_Hx_z = z()
+        psi_Hy_z = z(); psi_Hy_x = z()
+        psi_Hz_x = z(); psi_Hz_y = z()
 
-        # CPML coefficient broadcasts.
-        bx_e = self._b_e[0].reshape(-1, 1, 1); cx_e = self._c_e[0].reshape(-1, 1, 1)
-        by_e = self._b_e[1].reshape(1, -1, 1); cy_e = self._c_e[1].reshape(1, -1, 1)
-        bz_e = self._b_e[2].reshape(1, 1, -1); cz_e = self._c_e[2].reshape(1, 1, -1)
-        bx_h = self._b_h[0].reshape(-1, 1, 1); cx_h = self._c_h[0].reshape(-1, 1, 1)
-        by_h = self._b_h[1].reshape(1, -1, 1); cy_h = self._c_h[1].reshape(1, -1, 1)
-        bz_h = self._b_h[2].reshape(1, 1, -1); cz_h = self._c_h[2].reshape(1, 1, -1)
+        # CPML coefficient broadcasts (cast to the working dtype).
+        def _coef(a, shape):
+            return xp.asarray(a, dtype=dtype).reshape(shape)
+        bx_e = _coef(self._b_e[0], (-1, 1, 1)); cx_e = _coef(self._c_e[0], (-1, 1, 1))
+        by_e = _coef(self._b_e[1], (1, -1, 1)); cy_e = _coef(self._c_e[1], (1, -1, 1))
+        bz_e = _coef(self._b_e[2], (1, 1, -1)); cz_e = _coef(self._c_e[2], (1, 1, -1))
+        bx_h = _coef(self._b_h[0], (-1, 1, 1)); cx_h = _coef(self._c_h[0], (-1, 1, 1))
+        by_h = _coef(self._b_h[1], (1, -1, 1)); cy_h = _coef(self._c_h[1], (1, -1, 1))
+        bz_h = _coef(self._b_h[2], (1, 1, -1)); cz_h = _coef(self._c_h[2], (1, 1, -1))
 
-        # Move eps_r to the backend (no-op if already numpy and backend is numpy)
-        eps_r_xp = xp.asarray(self.eps_r)
-        ce_field = dt / (eps_r_xp * EPS_0)    # for E updates
-        ch_field = dt / MU_0                   # for H updates (mu_r = 1)
+        # Per-cell E-update coefficient dt/(eps_r*EPS_0). Computed in float64 for
+        # accuracy then cast; the float64 eps_r copy is released immediately.
+        ce_field = (dt / (xp.asarray(self.eps_r) * EPS_0)).astype(dtype)
+        ch_field = dtype(dt / MU_0)            # for H updates (mu_r = 1)
 
         # Monitor bookkeeping.
         result = Result(times=np.arange(n_steps) * dt)
@@ -501,10 +516,10 @@ class Simulation:
 
         # Pre-compute 1D CPML arrays for the Numba path (they must be plain numpy).
         if self.use_numba:
-            _nb_be = [np.asarray(a) for a in self._b_e]
-            _nb_ce = [np.asarray(a) for a in self._c_e]
-            _nb_bh = [np.asarray(a) for a in self._b_h]
-            _nb_ch = [np.asarray(a) for a in self._c_h]
+            _nb_be = [np.asarray(a, dtype=dtype) for a in self._b_e]
+            _nb_ce = [np.asarray(a, dtype=dtype) for a in self._c_e]
+            _nb_bh = [np.asarray(a, dtype=dtype) for a in self._b_h]
+            _nb_ch = [np.asarray(a, dtype=dtype) for a in self._c_h]
             _nb_ce_field = np.asarray(ce_field)
             print(f"[photonfdtd] Numba CPU backend (parallel JIT), "
                   f"compiling on first step...")
@@ -541,7 +556,7 @@ class Simulation:
                     if src.component[0] == "E":
                         val = src.amplitude * src.waveform(np.array([t_e]))[0]
                         E_map[src.component][i, j, k] += val
-                self._inject_particle_currents(t_e, Ex, Ey, Ez, eps_r_xp, xp)
+                self._inject_particle_currents(t_e, Ex, Ey, Ez, ce_field, xp)
                 for m in self.monitors:
                     if isinstance(m, FieldMonitor):
                         if step in rec_step_list[m.name]:
@@ -716,7 +731,7 @@ class Simulation:
                 E_map[src.component][i, j, k] += val
 
             # -------- Moving charged-particle currents -------- #
-            self._inject_particle_currents(t_e, Ex, Ey, Ez, eps_r_xp, xp)
+            self._inject_particle_currents(t_e, Ex, Ey, Ez, ce_field, xp)
 
             # -------- Monitors -------- #
             for m in self.monitors:

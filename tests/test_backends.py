@@ -95,6 +95,32 @@ def test_numba_matches_numpy_2d(label, size, pml, component):
     assert rel < 1e-6, f"numba 2D {label} diverged from numpy: rel.diff={rel:.2e}"
 
 
+def test_float32_matches_float64():
+    """Single precision must track double precision closely (not bit-for-bit)
+    and actually store float32, halving field/monitor memory.
+    """
+    freq0 = pf.C_0 / 1.0e-6
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=60e-9, pml_layers=(10, 10, 0))
+    src = pf.PointDipole(position=(0.0, 0.0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
+
+    def field(precision):
+        mon = pf.FieldMonitor(name="s", components=("Ez",), times=[16e-15])
+        sim = pf.Simulation(grid, sources=[src], monitors=[mon],
+                            run_time=18e-15, precision=precision)
+        return sim.run().fields["s"]["Ez"][0, :, :, 0]
+
+    f64 = field("float64")
+    f32 = field("float32")
+    assert f32.dtype == np.float32 and f64.dtype == np.float64
+    assert np.isfinite(f32).all()
+    rel = float(np.abs(f64 - f32.astype(np.float64)).max()) / float(np.abs(f64).max())
+    assert rel < 5e-3, f"float32 drifted from float64: rel.diff={rel:.2e}"
+
+    with pytest.raises(ValueError):
+        pf.Simulation(grid, precision="float16")
+
+
 def test_numba_warns_below_3d():
     """Requesting the numba backend on a sub-3D grid emits an advisory warning."""
     pytest.importorskip("numba")
