@@ -1,21 +1,25 @@
 Installation
 ============
 
-From PyPI
----------
+From source
+-----------
+
+photonfdtd is not on PyPI yet, so ``pip install photonfdtd`` does not work.
+Install it from source instead — either directly from GitHub:
 
 .. code-block:: bash
 
-   pip install photonfdtd
+   pip install "git+https://github.com/ngpaladi/photonfdtd"
 
-From a checkout
----------------
+or from a checkout:
 
 .. code-block:: bash
 
    git clone https://github.com/ngpaladi/photonfdtd
    cd photonfdtd
    pip install -e .
+
+Once a release is published to PyPI, ``pip install photonfdtd`` will work too.
 
 Optional extras
 ---------------

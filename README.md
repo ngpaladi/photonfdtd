@@ -10,15 +10,22 @@ correct; the pieces that don't, don't. See *Status* below.
 
 ## Install
 
+photonfdtd is not on PyPI yet, so `pip install photonfdtd` does not work.
+Install it from source instead — either directly from GitHub:
+
 ```bash
-pip install photonfdtd
+pip install "git+https://github.com/ngpaladi/photonfdtd"
 ```
 
-Or from a checkout:
+or from a checkout:
 
 ```bash
+git clone https://github.com/ngpaladi/photonfdtd
+cd photonfdtd
 pip install -e .
 ```
+
+Once a release is published to PyPI, `pip install photonfdtd` will work too.
 
 ## Quick start
 

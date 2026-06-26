@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonfdtd"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local-only FDTD + waveguide mode solver for integrated photonics, in pure Python/NumPy."
 readme = "README.md"
 license = { text = "MIT" }
