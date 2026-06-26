@@ -10,9 +10,25 @@ They specifically cover the moving :class:`~photonfdtd.ChargedParticle`
 current injection, which is dispatched separately in the NumPy/CuPy and Numba
 branches of the time loop.
 """
+import warnings
+
 import numpy as np
 import pytest
 import photonfdtd as pf
+
+
+def _dipole_2d(component, use_numba=False):
+    """Small 2D dipole run; returns the snapshot of ``component``."""
+    freq0 = pf.C_0 / 1.0e-6
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=60e-9, pml_layers=(8, 8, 0))
+    src = pf.PointDipole(position=(0.0, 0.0), component=component,
+                         waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
+    mon = pf.FieldMonitor(name="s", components=(component,), times=[12e-15])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")        # silence the sub-3D numba notice
+        sim = pf.Simulation(grid, sources=[src], monitors=[mon],
+                            run_time=14e-15, use_numba=use_numba)
+    return sim.run().fields["s"][component][0]
 
 
 def _particle_3d(use_numba=False, use_gpu=False):
@@ -54,6 +70,29 @@ def test_numba_particle_matches_numpy():
     assert den > 0.0 and np.isfinite(got).all()
     rel = float(np.abs(ref - got).max()) / den
     assert rel < 1e-6, f"numba diverged from numpy: rel.diff={rel:.2e}"
+
+
+@pytest.mark.parametrize("component", ["Ez", "Ex"])
+def test_numba_matches_numpy_2d(component):
+    """The Numba kernel must reproduce NumPy in 2D too - both the TM (Ez) and
+    TE (Ex) polarisations. Guards against the dimension-collapse bug where the
+    3D loop bounds went empty and silently skipped components on size-1 axes.
+    """
+    pytest.importorskip("numba")
+    ref = _dipole_2d(component, use_numba=False)
+    got = _dipole_2d(component, use_numba=True)
+    den = float(np.abs(ref).max())
+    assert den > 0.0 and np.isfinite(got).all()
+    rel = float(np.abs(ref - got).max()) / den
+    assert rel < 1e-6, f"numba 2D ({component}) diverged from numpy: rel.diff={rel:.2e}"
+
+
+def test_numba_warns_below_3d():
+    """Requesting the numba backend on a sub-3D grid emits an advisory warning."""
+    pytest.importorskip("numba")
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=60e-9, pml_layers=(8, 8, 0))
+    with pytest.warns(UserWarning, match="use_numba"):
+        pf.Simulation(grid, use_numba=True, run_time=1e-15)
 
 
 def test_cupy_particle_matches_numpy():

@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 import math
+import warnings
 import numpy as np
 
 from .constants import C_0, EPS_0, MU_0
@@ -72,70 +73,131 @@ if _NUMBA_AVAILABLE:
         ce_field, ch_field,
         dx, dy, dz,
     ):
-        """One complete H+E Yee update for 3D domains, Numba-parallel over x."""
+        """One complete H+E Yee update for 1D/2D/3D domains, Numba-parallel over x.
+
+        Loop bounds adapt to collapsed (size-1) axes: a forward difference needs
+        the neighbour ``+1`` cell, so it runs over ``n-1`` cells when ``n > 1``
+        but over the single cell when ``n == 1`` (with that derivative term set
+        to zero). Backward differences likewise start at index 1 only when the
+        axis is resolved. This reduces exactly to the dense 3D update when all
+        three axes are resolved, and mirrors the NumPy reference path's
+        reduced-dimension handling otherwise.
+        """
         nx, ny, nz = Ex.shape
-        # ---- H update ----
+        # Forward-difference extents (need the i+1/j+1/k+1 neighbour).
+        fx = nx - 1 if nx > 1 else 1
+        fy = ny - 1 if ny > 1 else 1
+        fz = nz - 1 if nz > 1 else 1
+        # Backward-difference starts (need the i-1/j-1/k-1 neighbour).
+        bx = 1 if nx > 1 else 0
+        by = 1 if ny > 1 else 0
+        bz = 1 if nz > 1 else 0
+
+        # ---- H update (forward differences of E) ----
+        # Hx at (i, j+1/2, k+1/2): full i, forward j (dEz/dy), forward k (dEy/dz)
         for i in _prange(nx):
-            for j in range(ny - 1):
-                for k in range(nz - 1):
-                    dEz_dy = (Ez[i, j+1, k] - Ez[i, j, k]) / dy
-                    dEy_dz = (Ey[i, j, k+1] - Ey[i, j, k]) / dz
-                    psi_Hx_y[i, j, k] = by_h[j] * psi_Hx_y[i, j, k] + cy_h[j] * dEz_dy
-                    psi_Hx_z[i, j, k] = bz_h[k] * psi_Hx_z[i, j, k] + cz_h[k] * dEy_dz
-                    Hx[i, j, k] -= ch_field * (
-                        (dEz_dy + psi_Hx_y[i, j, k]) - (dEy_dz + psi_Hx_z[i, j, k])
-                    )
-        for i in _prange(nx - 1):
+            for j in range(fy):
+                for k in range(fz):
+                    if ny > 1:
+                        dEz_dy = (Ez[i, j+1, k] - Ez[i, j, k]) / dy
+                        psi_Hx_y[i, j, k] = by_h[j] * psi_Hx_y[i, j, k] + cy_h[j] * dEz_dy
+                        cy = dEz_dy + psi_Hx_y[i, j, k]
+                    else:
+                        cy = 0.0
+                    if nz > 1:
+                        dEy_dz = (Ey[i, j, k+1] - Ey[i, j, k]) / dz
+                        psi_Hx_z[i, j, k] = bz_h[k] * psi_Hx_z[i, j, k] + cz_h[k] * dEy_dz
+                        cz = dEy_dz + psi_Hx_z[i, j, k]
+                    else:
+                        cz = 0.0
+                    Hx[i, j, k] -= ch_field * (cy - cz)
+        # Hy at (i+1/2, j, k+1/2): forward i (dEz/dx), full j, forward k (dEx/dz)
+        for i in _prange(fx):
             for j in range(ny):
-                for k in range(nz - 1):
-                    dEx_dz = (Ex[i, j, k+1] - Ex[i, j, k]) / dz
-                    dEz_dx = (Ez[i+1, j, k] - Ez[i, j, k]) / dx
-                    psi_Hy_z[i, j, k] = bz_h[k] * psi_Hy_z[i, j, k] + cz_h[k] * dEx_dz
-                    psi_Hy_x[i, j, k] = bx_h[i] * psi_Hy_x[i, j, k] + cx_h[i] * dEz_dx
-                    Hy[i, j, k] -= ch_field * (
-                        (dEx_dz + psi_Hy_z[i, j, k]) - (dEz_dx + psi_Hy_x[i, j, k])
-                    )
-        for i in _prange(nx - 1):
-            for j in range(ny - 1):
+                for k in range(fz):
+                    if nz > 1:
+                        dEx_dz = (Ex[i, j, k+1] - Ex[i, j, k]) / dz
+                        psi_Hy_z[i, j, k] = bz_h[k] * psi_Hy_z[i, j, k] + cz_h[k] * dEx_dz
+                        cz = dEx_dz + psi_Hy_z[i, j, k]
+                    else:
+                        cz = 0.0
+                    if nx > 1:
+                        dEz_dx = (Ez[i+1, j, k] - Ez[i, j, k]) / dx
+                        psi_Hy_x[i, j, k] = bx_h[i] * psi_Hy_x[i, j, k] + cx_h[i] * dEz_dx
+                        cx = dEz_dx + psi_Hy_x[i, j, k]
+                    else:
+                        cx = 0.0
+                    Hy[i, j, k] -= ch_field * (cz - cx)
+        # Hz at (i+1/2, j+1/2, k): forward i (dEy/dx), forward j (dEx/dy), full k
+        for i in _prange(fx):
+            for j in range(fy):
                 for k in range(nz):
-                    dEy_dx = (Ey[i+1, j, k] - Ey[i, j, k]) / dx
-                    dEx_dy = (Ex[i, j+1, k] - Ex[i, j, k]) / dy
-                    psi_Hz_x[i, j, k] = bx_h[i] * psi_Hz_x[i, j, k] + cx_h[i] * dEy_dx
-                    psi_Hz_y[i, j, k] = by_h[j] * psi_Hz_y[i, j, k] + cy_h[j] * dEx_dy
-                    Hz[i, j, k] -= ch_field * (
-                        (dEy_dx + psi_Hz_x[i, j, k]) - (dEx_dy + psi_Hz_y[i, j, k])
-                    )
-        # ---- E update ----
+                    if nx > 1:
+                        dEy_dx = (Ey[i+1, j, k] - Ey[i, j, k]) / dx
+                        psi_Hz_x[i, j, k] = bx_h[i] * psi_Hz_x[i, j, k] + cx_h[i] * dEy_dx
+                        cx = dEy_dx + psi_Hz_x[i, j, k]
+                    else:
+                        cx = 0.0
+                    if ny > 1:
+                        dEx_dy = (Ex[i, j+1, k] - Ex[i, j, k]) / dy
+                        psi_Hz_y[i, j, k] = by_h[j] * psi_Hz_y[i, j, k] + cy_h[j] * dEx_dy
+                        cy = dEx_dy + psi_Hz_y[i, j, k]
+                    else:
+                        cy = 0.0
+                    Hz[i, j, k] -= ch_field * (cx - cy)
+
+        # ---- E update (backward differences of H) ----
+        # Ex at (i+1/2, j, k): full i, backward j (dHz/dy), backward k (dHy/dz)
         for i in _prange(nx):
-            for j in range(1, ny):
-                for k in range(1, nz):
-                    dHz_dy = (Hz[i, j, k] - Hz[i, j-1, k]) / dy
-                    dHy_dz = (Hy[i, j, k] - Hy[i, j, k-1]) / dz
-                    psi_Ex_y[i, j, k] = by_e[j] * psi_Ex_y[i, j, k] + cy_e[j] * dHz_dy
-                    psi_Ex_z[i, j, k] = bz_e[k] * psi_Ex_z[i, j, k] + cz_e[k] * dHy_dz
-                    Ex[i, j, k] += ce_field[i, j, k] * (
-                        (dHz_dy + psi_Ex_y[i, j, k]) - (dHy_dz + psi_Ex_z[i, j, k])
-                    )
-        for i in _prange(1, nx):
+            for j in range(by, ny):
+                for k in range(bz, nz):
+                    if ny > 1:
+                        dHz_dy = (Hz[i, j, k] - Hz[i, j-1, k]) / dy
+                        psi_Ex_y[i, j, k] = by_e[j] * psi_Ex_y[i, j, k] + cy_e[j] * dHz_dy
+                        cy = dHz_dy + psi_Ex_y[i, j, k]
+                    else:
+                        cy = 0.0
+                    if nz > 1:
+                        dHy_dz = (Hy[i, j, k] - Hy[i, j, k-1]) / dz
+                        psi_Ex_z[i, j, k] = bz_e[k] * psi_Ex_z[i, j, k] + cz_e[k] * dHy_dz
+                        cz = dHy_dz + psi_Ex_z[i, j, k]
+                    else:
+                        cz = 0.0
+                    Ex[i, j, k] += ce_field[i, j, k] * (cy - cz)
+        # Ey at (i, j+1/2, k): backward i (dHz/dx), full j, backward k (dHx/dz)
+        for i in _prange(bx, nx):
             for j in range(ny):
-                for k in range(1, nz):
-                    dHx_dz = (Hx[i, j, k] - Hx[i, j, k-1]) / dz
-                    dHz_dx = (Hz[i, j, k] - Hz[i-1, j, k]) / dx
-                    psi_Ey_z[i, j, k] = bz_e[k] * psi_Ey_z[i, j, k] + cz_e[k] * dHx_dz
-                    psi_Ey_x[i, j, k] = bx_e[i] * psi_Ey_x[i, j, k] + cx_e[i] * dHz_dx
-                    Ey[i, j, k] += ce_field[i, j, k] * (
-                        (dHx_dz + psi_Ey_z[i, j, k]) - (dHz_dx + psi_Ey_x[i, j, k])
-                    )
-        for i in _prange(1, nx):
-            for j in range(1, ny):
+                for k in range(bz, nz):
+                    if nz > 1:
+                        dHx_dz = (Hx[i, j, k] - Hx[i, j, k-1]) / dz
+                        psi_Ey_z[i, j, k] = bz_e[k] * psi_Ey_z[i, j, k] + cz_e[k] * dHx_dz
+                        cz = dHx_dz + psi_Ey_z[i, j, k]
+                    else:
+                        cz = 0.0
+                    if nx > 1:
+                        dHz_dx = (Hz[i, j, k] - Hz[i-1, j, k]) / dx
+                        psi_Ey_x[i, j, k] = bx_e[i] * psi_Ey_x[i, j, k] + cx_e[i] * dHz_dx
+                        cx = dHz_dx + psi_Ey_x[i, j, k]
+                    else:
+                        cx = 0.0
+                    Ey[i, j, k] += ce_field[i, j, k] * (cz - cx)
+        # Ez at (i, j, k+1/2): backward i (dHy/dx), backward j (dHx/dy), full k
+        for i in _prange(bx, nx):
+            for j in range(by, ny):
                 for k in range(nz):
-                    dHy_dx = (Hy[i, j, k] - Hy[i-1, j, k]) / dx
-                    dHx_dy = (Hx[i, j, k] - Hx[i, j-1, k]) / dy
-                    psi_Ez_x[i, j, k] = bx_e[i] * psi_Ez_x[i, j, k] + cx_e[i] * dHy_dx
-                    psi_Ez_y[i, j, k] = by_e[j] * psi_Ez_y[i, j, k] + cy_e[j] * dHx_dy
-                    Ez[i, j, k] += ce_field[i, j, k] * (
-                        (dHy_dx + psi_Ez_x[i, j, k]) - (dHx_dy + psi_Ez_y[i, j, k])
-                    )
+                    if nx > 1:
+                        dHy_dx = (Hy[i, j, k] - Hy[i-1, j, k]) / dx
+                        psi_Ez_x[i, j, k] = bx_e[i] * psi_Ez_x[i, j, k] + cx_e[i] * dHy_dx
+                        cx = dHy_dx + psi_Ez_x[i, j, k]
+                    else:
+                        cx = 0.0
+                    if ny > 1:
+                        dHx_dy = (Hx[i, j, k] - Hx[i, j-1, k]) / dy
+                        psi_Ez_y[i, j, k] = by_e[j] * psi_Ez_y[i, j, k] + cy_e[j] * dHx_dy
+                        cy = dHx_dy + psi_Ez_y[i, j, k]
+                    else:
+                        cy = 0.0
+                    Ez[i, j, k] += ce_field[i, j, k] * (cx - cy)
 
 
 def _get_backend(use_gpu: bool):
@@ -175,6 +237,15 @@ class Simulation:
     ) -> None:
         self.use_gpu = use_gpu and _GPU_AVAILABLE
         self.use_numba = use_numba and _NUMBA_AVAILABLE and not self.use_gpu
+        if self.use_numba and grid.ndim < 3:
+            warnings.warn(
+                "use_numba: the JIT field-update kernel is intended for large "
+                "3D problems. It now produces correct results in 1D/2D as well, "
+                "but the one-time compilation cost usually outweighs any speedup "
+                "there - the default NumPy backend is typically as fast or "
+                "faster for sub-3D grids.",
+                stacklevel=2,
+            )
         self._xp = _get_backend(self.use_gpu)
         self.grid = grid
         self.structures = list(structures)
