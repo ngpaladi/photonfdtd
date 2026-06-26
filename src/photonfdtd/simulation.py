@@ -547,8 +547,12 @@ class Simulation:
                         if step in rec_step_list[m.name]:
                             comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
                                      "Hx": Hx, "Hy": Hy, "Hz": Hz}
+                            ds = m.downsample
                             for c in m.components:
-                                rec_fields[m.name][c].append(comps[c].copy())
+                                snap = comps[c]
+                                if ds > 1:
+                                    snap = snap[::ds, ::ds, ::ds]
+                                rec_fields[m.name][c].append(snap.copy())
                             rec_times[m.name].append(step * dt)
                 if self.verbose and step % max(n_steps // 20, 1) == 0:
                     emax = float(max(abs(Ex).max(), abs(Ey).max(), abs(Ez).max()))
@@ -720,10 +724,15 @@ class Simulation:
                     if step in rec_step_list[m.name]:
                         comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
                                  "Hx": Hx, "Hy": Hy, "Hz": Hz}
+                        ds = m.downsample
                         for c in m.components:
+                            snap = comps[c]
+                            if ds > 1:
+                                snap = snap[::ds, ::ds, ::ds]
                             # Pull to CPU before storing so monitors are always
-                            # plain numpy arrays regardless of the backend.
-                            rec_fields[m.name][c].append(to_cpu(comps[c]).copy())
+                            # plain numpy arrays regardless of the backend. On the
+                            # GPU backend this transfers only the strided subset.
+                            rec_fields[m.name][c].append(to_cpu(snap).copy())
                         rec_times[m.name].append(step * dt)
                 elif isinstance(m, FluxMonitor):
                     result.flux[m.name] += _flux_through_plane(

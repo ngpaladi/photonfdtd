@@ -26,6 +26,12 @@ class FieldMonitor:
         Record every Nth timestep. Mutually exclusive with `times`.
     times : sequence of float, optional
         Record at the timestep nearest each listed time (s).
+    downsample : int, optional
+        Spatial stride for stored snapshots: keep every ``downsample``-th cell
+        on every axis (default 1 = full resolution). Cuts snapshot memory by
+        ``downsample**ndim`` and, on the GPU backend, the host transfer too.
+        The stored array aligns to ``grid.coords[axis][::downsample]`` on each
+        axis. Snapshots are stored in the simulation's working dtype.
     name : str
         Identifier used to retrieve results from sim.run().
     """
@@ -33,12 +39,16 @@ class FieldMonitor:
     components: Tuple[str, ...] = ("Ez",)
     interval: Optional[int] = None
     times: Optional[Sequence[float]] = None
+    downsample: int = 1
 
     def __post_init__(self):
         if self.interval is None and self.times is None:
             self.interval = 1
         if self.interval is not None and self.times is not None:
             raise ValueError("Specify only one of interval or times")
+        if int(self.downsample) != self.downsample or self.downsample < 1:
+            raise ValueError("downsample must be a positive integer")
+        self.downsample = int(self.downsample)
 
 
 @dataclass

@@ -55,3 +55,30 @@ def test_fdtd_3d_dipole_runs():
     sim = pf.Simulation(grid, sources=[src], run_time=20e-15)
     res = sim.run()
     assert res.times.size > 0
+
+
+def test_field_monitor_downsample():
+    """A downsampled monitor stores exactly the strided full-resolution field,
+    aligned to grid.coords[axis][::downsample], and defaults to full resolution.
+    """
+    lam0 = 1.0e-6
+    freq0 = pf.C_0 / lam0
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=lam0 / 16, pml_layers=(8, 8, 0))
+    src = pf.PointDipole(position=(0.0, 0.0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
+
+    def field(ds):
+        mon = pf.FieldMonitor(name="s", components=("Ez",),
+                              times=[12e-15], downsample=ds)
+        sim = pf.Simulation(grid, sources=[src], monitors=[mon], run_time=14e-15)
+        return sim.run().fields["s"]["Ez"][0, :, :, 0]
+
+    full = field(1)
+    strided = field(2)
+    # default (ds=1) is the full grid; ds=2 keeps every other cell per axis
+    assert full.shape == (grid.shape[0], grid.shape[1])
+    assert strided.shape == grid.coords[0][::2].shape + grid.coords[1][::2].shape
+    assert np.array_equal(strided, full[::2, ::2])
+
+    with pytest.raises(ValueError):
+        pf.FieldMonitor(name="bad", downsample=0)
