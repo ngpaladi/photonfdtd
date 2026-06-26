@@ -1,10 +1,13 @@
 """Sources.
 
-Two primitive source types:
+Three primitive source types:
 
 - :class:`PointDipole`     - soft additive source on a single E or H cell.
 - :class:`ModeSource`      - distributed soft source on an injection plane,
   weighted by a user-supplied transverse profile.
+- :class:`ChargedParticle` - a point charge moving in a straight line,
+  injected as a moving current source; radiates Cherenkov light when it
+  outruns the local phase velocity.
 
 And one factory built on top:
 
@@ -73,6 +76,117 @@ class PointDipole:
     component: str                # 'Ex', 'Ey', 'Ez', 'Hx', 'Hy', 'Hz'
     waveform: GaussianPulse
     amplitude: float = 1.0
+
+
+def _to3vec(x) -> Tuple[float, float, float]:
+    """Pad a scalar / 1-/2-/3-sequence into a (x, y, z) float tuple (zeros fill)."""
+    if isinstance(x, (int, float)):
+        return (float(x), 0.0, 0.0)
+    vals = [float(v) for v in x]
+    vals += [0.0] * (3 - len(vals))
+    if len(vals) > 3:
+        raise ValueError("expected a scalar or a 1-/2-/3-component vector")
+    return (vals[0], vals[1], vals[2])
+
+
+@dataclass(frozen=True)
+class ChargedParticle:
+    """A point charge moving in a straight line at constant velocity.
+
+    The charge contributes a current density ``J = q v delta(r - r0(t))`` to
+    Ampere's law, so each FDTD step it adds ``-dt/eps * J`` to the E-field
+    component(s) along its velocity. When the speed exceeds the local phase
+    velocity ``c/n`` (i.e. ``n * beta > 1`` with ``beta = v/c``) the charge
+    emits **Cherenkov radiation**: a shock cone trailing the particle, with the
+    radiation propagating at the Cherenkov angle ``theta_c = arccos(1/(n beta))``
+    to the velocity, and the visible wavefront (Mach) cone making a half-angle
+    ``mu = arcsin(1/(n beta)) = pi/2 - theta_c`` with the trajectory.
+
+    To keep the radiated spectrum band-limited (an ideal point charge in a
+    non-dispersive medium radiates a UV-divergent Frank-Tamm spectrum that the
+    grid cannot represent), the charge is deposited as a small Gaussian "cloud"
+    of width ``cloud_cells`` cells rather than onto a single cell.
+
+    Notes
+    -----
+    * In a 2-D simulation the out-of-plane axis is treated as 1 m thick, so
+      ``charge`` is effectively a charge *per unit length* (C/m) and the field
+      is per unit length. The cone geometry is unaffected.
+    * Velocity components on collapsed (size-1) axes are rejected by the
+      :class:`~photonfdtd.Simulation`, since they have nowhere to radiate.
+    * The deposition ignores the half-cell Yee stagger (a constant sub-cell
+      offset that does not change the cone geometry).
+
+    Parameters
+    ----------
+    charge : float
+        Particle charge in coulombs (C/m in 2-D). Sets only the amplitude;
+        Maxwell's equations are linear, so the cone geometry is independent
+        of it. Use :data:`~photonfdtd.Q_E` for an electron, or a much larger
+        value to get O(1) fields for visualisation.
+    velocity : tuple of float
+        Velocity vector in m/s. Its direction is the trajectory; its magnitude
+        sets ``beta`` and hence whether (and at what angle) the charge radiates.
+    start : tuple of float
+        Position (m) at ``t_start``. Defaults to the origin.
+    t_start, t_stop : float
+        The charge is injected only while ``t_start <= t <= t_stop`` (s).
+        Defaults: from ``t = 0`` until it leaves the domain.
+    cloud_cells : float
+        Standard deviation of the Gaussian charge cloud, in grid cells. Larger
+        values give a smoother, more band-limited (lower-frequency) cone;
+        smaller values approach a point charge and grid noise. Default 1.5.
+    """
+    charge: float
+    velocity: Tuple[float, ...]
+    start: Tuple[float, ...] = (0.0, 0.0, 0.0)
+    t_start: float = 0.0
+    t_stop: float = math.inf
+    cloud_cells: float = 1.5
+
+    @property
+    def velocity3(self) -> Tuple[float, float, float]:
+        return _to3vec(self.velocity)
+
+    @property
+    def start3(self) -> Tuple[float, float, float]:
+        return _to3vec(self.start)
+
+    @property
+    def speed(self) -> float:
+        vx, vy, vz = self.velocity3
+        return math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    @property
+    def beta(self) -> float:
+        """Speed as a fraction of the vacuum speed of light."""
+        return self.speed / C_0
+
+    def position_at(self, t: float) -> Tuple[float, float, float]:
+        """Particle position (m) at time ``t``."""
+        s = self.start3
+        v = self.velocity3
+        dt = t - self.t_start
+        return (s[0] + v[0] * dt, s[1] + v[1] * dt, s[2] + v[2] * dt)
+
+    def cherenkov_angle(self, n: float) -> float:
+        """Cherenkov emission angle ``arccos(1/(n*beta))`` (rad) between the
+        velocity and the radiated wavevector.
+
+        Raises ``ValueError`` below the Cherenkov threshold (``n*beta <= 1``),
+        where no coherent radiation is emitted.
+        """
+        x = 1.0 / (n * self.beta)
+        if x >= 1.0:
+            raise ValueError(
+                f"below Cherenkov threshold: n*beta = {n * self.beta:.3f} <= 1"
+            )
+        return math.acos(x)
+
+    def mach_angle(self, n: float) -> float:
+        """Half-angle (rad) of the visible shock (Mach) cone with the
+        trajectory: ``arcsin(1/(n*beta)) = pi/2 - cherenkov_angle(n)``."""
+        return 0.5 * math.pi - self.cherenkov_angle(n)
 
 
 @dataclass(frozen=True)

@@ -136,3 +136,81 @@ def test_mode_solver_slab_against_eigenvalue_eq():
         f"expected (bounded) n_eff = {n_eff_expected:.6f}, "
         f"numerical = {n_eff_num:.6f},  error = {err:.6f}"
     )
+
+
+# -------------------------------------------------------------------------- #
+# Cherenkov radiation from a moving charged particle.
+# -------------------------------------------------------------------------- #
+def _run_cherenkov(beta, n=2.0, t_snap=22e-15):
+    """Fire a charge at speed ``beta*c`` through an index-``n`` dielectric and
+    return (Hz snapshot, x coords, y coords, particle-x at the snapshot, source).
+    """
+    Lx, Ly, dx = 8e-6, 6e-6, 50e-9
+    grid = pf.Grid(size=(Lx, Ly), cell_size=dx, pml_layers=(12, 12, 0))
+    medium = pf.Box(center=(0.0, 0.0), size=(3 * Lx, 3 * Ly),
+                    medium=pf.Medium.from_index(n))
+    particle = pf.ChargedParticle(
+        charge=2e-9, velocity=(beta * pf.C_0, 0.0), start=(-3e-6, 0.0),
+    )
+    mon = pf.FieldMonitor(name="snap", components=("Hz",), times=[t_snap])
+    sim = pf.Simulation(grid, structures=[medium], sources=[particle],
+                        monitors=[mon], run_time=24e-15)
+    res = sim.run()
+    Hz = res.fields["snap"]["Hz"][0, :, :, 0]
+    x_p = particle.position_at(res.monitor_times["snap"][0])[0]
+    return Hz, grid.coords[0], grid.coords[1], x_p, particle
+
+
+def test_cherenkov_radiates_only_above_threshold():
+    """A charge radiates a far-off-axis cone only when it outruns the local
+    phase velocity (n*beta > 1). Below threshold the field stays bound to the
+    trajectory, so lateral energy is far smaller.
+    """
+    n = 2.0
+    Hz_super, _, y, _, _ = _run_cherenkov(beta=0.9, n=n)   # n*beta = 1.8 > 1
+    Hz_sub, _, _, _, _ = _run_cherenkov(beta=0.4, n=n)     # n*beta = 0.8 < 1
+    assert np.isfinite(Hz_super).all() and np.isfinite(Hz_sub).all()
+
+    lateral = np.abs(y) > 1.2e-6        # energy well away from the trajectory axis
+    e_super = float(np.sum(Hz_super[:, lateral] ** 2))
+    e_sub = float(np.sum(Hz_sub[:, lateral] ** 2))
+    assert e_super > 5.0 * e_sub, (
+        f"expected super-luminal lateral energy >> sub-luminal, "
+        f"got super={e_super:.3e}, sub={e_sub:.3e} (ratio {e_super / e_sub:.1f})"
+    )
+
+
+def test_cherenkov_cone_angle_matches_theory():
+    """The shock-cone half-angle measured from the field equals the analytic
+    Mach angle mu = arcsin(1/(n*beta)).
+    """
+    n, beta = 2.0, 0.9
+    Hz, x, y, x_p, particle = _run_cherenkov(beta=beta, n=n)
+    mu_true = particle.mach_angle(n)
+
+    # Trace the cone front: in the upper half, behind the particle, follow the
+    # y of peak |Hz| in each x-column, then fit |y| = tan(mu) * (x_p - x).
+    j_up = y > 0.2e-6
+    y_up = y[j_up]
+    absHz = np.abs(Hz[:, j_up])
+    dist, ypk = [], []
+    for ix, xx in enumerate(x):
+        d = x_p - xx
+        if d < 0.8e-6 or d > 4.5e-6:     # skip near field and the far turn-on transient
+            continue
+        col = absHz[ix]
+        if col.max() <= 0.0:
+            continue
+        dist.append(d)
+        ypk.append(y_up[int(np.argmax(col))])
+    dist = np.asarray(dist)
+    ypk = np.asarray(ypk)
+    assert dist.size > 20, "not enough cone-front samples to fit an angle"
+
+    slope = float(np.sum(dist * ypk) / np.sum(dist * dist))   # LSQ through origin
+    mu_meas = math.atan(slope)
+    rel_err = abs(mu_meas - mu_true) / mu_true
+    assert rel_err < 0.15, (
+        f"measured Mach angle {math.degrees(mu_meas):.1f} deg vs "
+        f"theory {math.degrees(mu_true):.1f} deg (rel err {rel_err:.1%})"
+    )

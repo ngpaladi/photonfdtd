@@ -38,7 +38,7 @@ import numpy as np
 from .constants import C_0, EPS_0, MU_0
 from .grid import Grid
 from .geometry import Box
-from .sources import PointDipole
+from .sources import PointDipole, ChargedParticle
 from .monitors import FieldMonitor, FluxMonitor
 
 from .boundaries import cpml_coeffs_1axis, CPMLParams
@@ -178,16 +178,22 @@ class Simulation:
         self._xp = _get_backend(self.use_gpu)
         self.grid = grid
         self.structures = list(structures)
+        # Moving current sources (e.g. ChargedParticle) are stepped specially in
+        # the time loop rather than expanded into fixed-cell soft dipoles.
+        self.particle_sources: List[ChargedParticle] = []
         expanded: List[PointDipole] = []
         for s in sources:
             if isinstance(s, PointDipole):
                 expanded.append(s)
+            elif isinstance(s, ChargedParticle):
+                self._register_particle(s)
             elif hasattr(s, "expand"):
                 expanded.extend(s.expand(grid))
             else:
                 raise TypeError(
                     f"Unsupported source type: {type(s).__name__}. "
-                    "Pass a PointDipole, ModeSource, or SinglePhotonSource."
+                    "Pass a PointDipole, ModeSource, SinglePhotonSource, "
+                    "or ChargedParticle."
                 )
         self.sources = expanded
         self.monitors = list(monitors)
@@ -220,12 +226,101 @@ class Simulation:
     def add_source(self, source) -> None:
         if isinstance(source, PointDipole):
             self.sources.append(source)
+        elif isinstance(source, ChargedParticle):
+            self._register_particle(source)
         elif hasattr(source, "expand"):
             self.sources.extend(source.expand(self.grid))
         else:
             raise TypeError(
                 f"Unsupported source type: {type(source).__name__}"
             )
+
+    def _register_particle(self, p: ChargedParticle) -> None:
+        """Validate and store a moving charged-particle current source."""
+        for axis, v in enumerate(p.velocity3):
+            if v != 0.0 and self.grid.shape[axis] == 1:
+                raise ValueError(
+                    f"ChargedParticle has a velocity component on axis {axis}, "
+                    "which is collapsed (size 1) in this grid - it has nowhere "
+                    "to move or radiate. Drop that component or add that axis."
+                )
+        if p.speed == 0.0:
+            raise ValueError("ChargedParticle velocity must be non-zero.")
+        self.particle_sources.append(p)
+
+    def _inject_particle_currents(self, t_now, Ex, Ey, Ez, eps_r_xp, xp) -> None:
+        """Deposit each moving charge's current onto the E-field at time ``t_now``.
+
+        A charge ``q`` moving at velocity ``v`` is a current density
+        ``J = q v`` localised at the particle, contributing ``dE = -dt/eps * J``
+        to Ampere's law. The charge is smeared over a Gaussian cloud (width
+        ``cloud_cells``) to band-limit the radiated spectrum, and the cloud is
+        deposited only while the particle *centre* sits in the physical
+        (non-PML) interior, so it stops radiating into the PML once it exits
+        even if ``t_stop`` has not been reached. (Within ~``radius`` cells of
+        the interior edge the Gaussian tail still leaks a sub-percent fraction
+        into the PML; launch a few cells clear of the PML to avoid it.)
+        """
+        if not self.particle_sources:
+            return
+        grid = self.grid
+        # Cell "volume" of the active axes (collapsed axes count as 1 m, so in
+        # 2-D the charge is per-unit-length, matching the flux convention).
+        dV = 1.0
+        for a in range(3):
+            if grid.shape[a] > 1:
+                dV *= grid.cell_size[a]
+        E_comp = (Ex, Ey, Ez)
+
+        for p in self.particle_sources:
+            if not (p.t_start <= t_now <= p.t_stop):
+                continue
+            pos = p.position_at(t_now)
+            sub = []          # per-axis index slices of the deposition stencil
+            waxes = []        # per-axis normalised Gaussian weights
+            inside = True
+            for a in range(3):
+                n = grid.shape[a]
+                coord = grid.coords[a]
+                if n == 1:
+                    sub.append(slice(0, 1))
+                    waxes.append(np.array([1.0]))
+                    continue
+                npml = grid.pml_layers[a]
+                lo_i, hi_i = npml, n - 1 - npml
+                # Skip entirely once the particle leaves the physical interior,
+                # so we never dump current into (or past) the PML.
+                if pos[a] < coord[lo_i] or pos[a] > coord[hi_i]:
+                    inside = False
+                    break
+                d = grid.cell_size[a]
+                sigma = max(p.cloud_cells, 1e-6) * d
+                radius = max(1, int(math.ceil(3.0 * p.cloud_cells)))
+                ic = int(round((pos[a] - coord[0]) / d))
+                i0 = max(0, ic - radius)
+                i1 = min(n, ic + radius + 1)
+                w = np.exp(-0.5 * ((coord[i0:i1] - pos[a]) / sigma) ** 2)
+                wsum = w.sum()
+                if wsum == 0.0:
+                    inside = False
+                    break
+                sub.append(slice(i0, i1))
+                waxes.append(w / wsum)      # normalise so the cloud carries all of q*v
+            if not inside:
+                continue
+
+            # Separable Gaussian -> outer product weight block (sums to 1).
+            wblock = (waxes[0].reshape(-1, 1, 1)
+                      * waxes[1].reshape(1, -1, 1)
+                      * waxes[2].reshape(1, 1, -1))
+            wblock = xp.asarray(wblock)
+            eps_sub = eps_r_xp[sub[0], sub[1], sub[2]]
+            for a in range(3):
+                va = p.velocity3[a]
+                if va == 0.0 or grid.shape[a] == 1:
+                    continue
+                base = -(self.dt * p.charge * va) / (EPS_0 * dV)
+                E_comp[a][sub[0], sub[1], sub[2]] += base * wblock / eps_sub
 
     def add_monitor(self, monitor) -> None:
         self.monitors.append(monitor)
@@ -366,6 +461,7 @@ class Simulation:
                     if src.component[0] == "E":
                         val = src.amplitude * src.waveform(np.array([t_e]))[0]
                         E_map[src.component][i, j, k] += val
+                self._inject_particle_currents(t_e, Ex, Ey, Ez, eps_r_xp, xp)
                 for m in self.monitors:
                     if isinstance(m, FieldMonitor):
                         if step in rec_step_list[m.name]:
@@ -534,6 +630,9 @@ class Simulation:
                     continue
                 val = src.amplitude * src.waveform(np.array([t_e]))[0]
                 E_map[src.component][i, j, k] += val
+
+            # -------- Moving charged-particle currents -------- #
+            self._inject_particle_currents(t_e, Ex, Ey, Ez, eps_r_xp, xp)
 
             # -------- Monitors -------- #
             for m in self.monitors:

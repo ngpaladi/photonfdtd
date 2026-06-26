@@ -28,8 +28,9 @@ Capabilities
 - Geometry primitives: axis-aligned :class:`~photonfdtd.Box` and
   arbitrary-polygon :class:`~photonfdtd.PolySlab`.
 - Sources: soft point dipole (:class:`~photonfdtd.PointDipole`), distributed
-  mode injection (:class:`~photonfdtd.ModeSource`), and an energy-normalised
-  :class:`~photonfdtd.SinglePhotonSource`.
+  mode injection (:class:`~photonfdtd.ModeSource`), an energy-normalised
+  :class:`~photonfdtd.SinglePhotonSource`, and a moving-charge
+  :class:`~photonfdtd.ChargedParticle` that emits Cherenkov radiation.
 - Field-snapshot and flux monitors.
 - A 2D scalar Helmholtz :class:`~photonfdtd.ModeSolver`.
 - A :func:`~photonfdtd.from_gdsfactory` adapter that turns a gdsfactory

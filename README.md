@@ -82,9 +82,11 @@ print(result.n_eff)            # array of effective indices
 - **Geometry primitives**: axis-aligned `Box` and arbitrary-polygon
   `PolySlab` (a polygon in xy extruded between two z bounds).
 - **Sources**: soft point-dipole (`PointDipole`), distributed line/area
-  mode injection (`ModeSource`), and an energy-normalised
-  `SinglePhotonSource` whose amplitude is set so the launched wavepacket
-  carries exactly $h\,\nu$ of total electromagnetic energy.
+  mode injection (`ModeSource`), an energy-normalised `SinglePhotonSource`
+  whose amplitude is set so the launched wavepacket carries exactly
+  $h\,\nu$ of total electromagnetic energy, and a moving-charge
+  `ChargedParticle` current source that emits **Cherenkov radiation** when
+  it outruns the local phase velocity (see `examples/04_cherenkov.py`).
 - **Field-snapshot and flux monitors.**
 - **2D scalar Helmholtz mode solver** (eigenvalue problem in beta^2).
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout

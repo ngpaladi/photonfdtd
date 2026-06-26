@@ -14,13 +14,13 @@ Capabilities:
 A NumPy backend is used throughout. It is correct but not fast; for production
 runs of large 3D problems a compiled or GPU backend is on the roadmap.
 """
-from .constants import C_0, EPS_0, MU_0, ETA_0
+from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
 from .materials import Medium
 from .geometry import Box, PolySlab
 from .sources import (
     GaussianPulse, PointDipole, ModeSource, SinglePhotonSource,
-    single_photon_field_amplitude, PLANCK_H,
+    ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
 from .monitors import FieldMonitor, FluxMonitor
 from .simulation import Simulation
@@ -29,10 +29,10 @@ from . import adapters
 from .adapters import from_gdsfactory
 
 __all__ = [
-    "C_0", "EPS_0", "MU_0", "ETA_0", "PLANCK_H",
+    "C_0", "EPS_0", "MU_0", "ETA_0", "Q_E", "PLANCK_H",
     "Grid", "Medium", "Box", "PolySlab",
     "GaussianPulse", "PointDipole", "ModeSource", "SinglePhotonSource",
-    "single_photon_field_amplitude",
+    "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor",
     "Simulation", "ModeSolver",
     "adapters", "from_gdsfactory",
