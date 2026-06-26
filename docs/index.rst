@@ -15,6 +15,7 @@ the pieces that don't, don't. See :doc:`api` for the full reference.
 
    installation
    quickstart
+   examples
    api
 
 Capabilities
