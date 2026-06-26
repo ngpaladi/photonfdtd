@@ -57,6 +57,7 @@ def from_gdsfactory(
     courant: float = 0.99,
     use_gpu: bool = False,
     use_numba: bool = False,
+    precision: str = "float64",
 ) -> Simulation:
     """Build a 3D photonfdtd Simulation from a gdsfactory Component.
 
@@ -176,4 +177,5 @@ def from_gdsfactory(
         courant=courant,
         use_gpu=use_gpu,
         use_numba=use_numba,
+        precision=precision,
     )
