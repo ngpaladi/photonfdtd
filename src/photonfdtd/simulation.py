@@ -484,11 +484,20 @@ class Simulation:
         # Helpers for axis-aware finite differences (uniform-grid central)
         # ============================================================== #
         def d_fwd(arr, axis, dl):
-            """Forward first difference along axis: arr[1:] - arr[:-1]."""
+            """Forward first difference along axis: arr[1:] - arr[:-1].
+
+            Uses plain slicing (cheap array views) rather than ``xp.take`` with an
+            index array, which would allocate two full gather copies every call.
+            The slice is built from ``axis`` so it is correct for axes 1 and 2,
+            not just axis 0.
+            """
             if arr.shape[axis] <= 1:
                 return None
-            return (xp.take(arr, xp.arange(1, arr.shape[axis]), axis=axis)
-                    - xp.take(arr, xp.arange(0, arr.shape[axis] - 1), axis=axis)) / dl
+            hi = [slice(None)] * arr.ndim
+            lo = [slice(None)] * arr.ndim
+            hi[axis] = slice(1, None)
+            lo[axis] = slice(0, -1)
+            return (arr[tuple(hi)] - arr[tuple(lo)]) / dl
 
         # Pre-compute 1D CPML arrays for the Numba path (they must be plain numpy).
         if self.use_numba:
