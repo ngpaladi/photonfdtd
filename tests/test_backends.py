@@ -17,11 +17,11 @@ import pytest
 import photonfdtd as pf
 
 
-def _dipole_2d(component, use_numba=False):
-    """Small 2D dipole run; returns the snapshot of ``component``."""
+def _dipole_2d(size, pml, component, use_numba=False):
+    """Small 2D dipole run on the given grid; returns the ``component`` snapshot."""
     freq0 = pf.C_0 / 1.0e-6
-    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=60e-9, pml_layers=(8, 8, 0))
-    src = pf.PointDipole(position=(0.0, 0.0), component=component,
+    grid = pf.Grid(size=size, cell_size=60e-9, pml_layers=pml)
+    src = pf.PointDipole(position=(0.0, 0.0, 0.0), component=component,
                          waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
     mon = pf.FieldMonitor(name="s", components=(component,), times=[12e-15])
     with warnings.catch_warnings():
@@ -72,19 +72,27 @@ def test_numba_particle_matches_numpy():
     assert rel < 1e-6, f"numba diverged from numpy: rel.diff={rel:.2e}"
 
 
-@pytest.mark.parametrize("component", ["Ez", "Ex"])
-def test_numba_matches_numpy_2d(component):
-    """The Numba kernel must reproduce NumPy in 2D too - both the TM (Ez) and
-    TE (Ex) polarisations. Guards against the dimension-collapse bug where the
-    3D loop bounds went empty and silently skipped components on size-1 axes.
+# Cover both 2D planes and both polarisations, including the case where the
+# parallel (x) axis is the one that collapses (nx=1, the yz plane), which drives
+# the prange loops to a single iteration.
+@pytest.mark.parametrize("label,size,pml,component", [
+    ("xy-TM", (3e-6, 3e-6), (8, 8, 0), "Ez"),
+    ("xy-TE", (3e-6, 3e-6), (8, 8, 0), "Ex"),
+    ("yz-TM", (None, 3e-6, 3e-6), (0, 8, 8), "Ex"),
+    ("yz-TE", (None, 3e-6, 3e-6), (0, 8, 8), "Ey"),
+])
+def test_numba_matches_numpy_2d(label, size, pml, component):
+    """The Numba kernel must reproduce NumPy in 2D. Guards against the
+    dimension-collapse bug where the 3D loop bounds went empty and silently
+    skipped components differentiated along a size-1 axis.
     """
     pytest.importorskip("numba")
-    ref = _dipole_2d(component, use_numba=False)
-    got = _dipole_2d(component, use_numba=True)
+    ref = _dipole_2d(size, pml, component, use_numba=False)
+    got = _dipole_2d(size, pml, component, use_numba=True)
     den = float(np.abs(ref).max())
     assert den > 0.0 and np.isfinite(got).all()
     rel = float(np.abs(ref - got).max()) / den
-    assert rel < 1e-6, f"numba 2D ({component}) diverged from numpy: rel.diff={rel:.2e}"
+    assert rel < 1e-6, f"numba 2D {label} diverged from numpy: rel.diff={rel:.2e}"
 
 
 def test_numba_warns_below_3d():
