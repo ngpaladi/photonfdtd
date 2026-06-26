@@ -406,7 +406,7 @@ class Simulation:
         # Helper to pull an array from the backend to a CPU numpy array.
         def to_cpu(arr):
             if self.use_gpu:
-                return np.asarray(arr)   # cupy → numpy
+                return arr.get()         # cupy → numpy (np.asarray is rejected by cupy>=13)
             return arr
 
         # ============================================================== #
