@@ -213,6 +213,27 @@ def _get_backend(use_gpu: bool):
     return np
 
 
+def _contig_nonzero_blocks(arr1d):
+    """Maximal contiguous runs of nonzero entries, as (start, stop) pairs.
+
+    Used to locate the PML slabs along an axis from its CPML coefficient array
+    (which is nonzero only inside the PML layers).
+    """
+    nz = np.flatnonzero(np.asarray(arr1d) != 0.0)
+    if nz.size == 0:
+        return []
+    blocks = []
+    start = prev = int(nz[0])
+    for idx in nz[1:]:
+        idx = int(idx)
+        if idx != prev + 1:
+            blocks.append((start, prev + 1))
+            start = idx
+        prev = idx
+    blocks.append((start, prev + 1))
+    return blocks
+
+
 @dataclass
 class Result:
     times: np.ndarray
@@ -446,24 +467,17 @@ class Simulation:
         Hy = xp.zeros((nx, ny, nz), dtype=dtype)
         Hz = xp.zeros((nx, ny, nz), dtype=dtype)
 
-        # CPML auxiliary variables
-        z = lambda: xp.zeros((nx, ny, nz), dtype=dtype)
-        psi_Ex_y = z(); psi_Ex_z = z()
-        psi_Ey_z = z(); psi_Ey_x = z()
-        psi_Ez_x = z(); psi_Ez_y = z()
-        psi_Hx_y = z(); psi_Hx_z = z()
-        psi_Hy_z = z(); psi_Hy_x = z()
-        psi_Hz_x = z(); psi_Hz_y = z()
-
-        # CPML coefficient broadcasts (cast to the working dtype).
-        def _coef(a, shape):
-            return xp.asarray(a, dtype=dtype).reshape(shape)
-        bx_e = _coef(self._b_e[0], (-1, 1, 1)); cx_e = _coef(self._c_e[0], (-1, 1, 1))
-        by_e = _coef(self._b_e[1], (1, -1, 1)); cy_e = _coef(self._c_e[1], (1, -1, 1))
-        bz_e = _coef(self._b_e[2], (1, 1, -1)); cz_e = _coef(self._c_e[2], (1, 1, -1))
-        bx_h = _coef(self._b_h[0], (-1, 1, 1)); cx_h = _coef(self._c_h[0], (-1, 1, 1))
-        by_h = _coef(self._b_h[1], (1, -1, 1)); cy_h = _coef(self._c_h[1], (1, -1, 1))
-        bz_h = _coef(self._b_h[2], (1, 1, -1)); cz_h = _coef(self._c_h[2], (1, 1, -1))
+        # CPML convolutional state (psi). The Numba kernel uses dense, full-domain
+        # psi arrays; the vectorized numpy/cupy path instead stores psi only in
+        # the PML slabs (built below) to cut peak memory on large volumes.
+        if self.use_numba:
+            z = lambda: xp.zeros((nx, ny, nz), dtype=dtype)
+            psi_Ex_y = z(); psi_Ex_z = z()
+            psi_Ey_z = z(); psi_Ey_x = z()
+            psi_Ez_x = z(); psi_Ez_y = z()
+            psi_Hx_y = z(); psi_Hx_z = z()
+            psi_Hy_z = z(); psi_Hy_x = z()
+            psi_Hz_x = z(); psi_Hz_y = z()
 
         # Per-cell E-update coefficient dt/(eps_r*EPS_0). Computed in float64 for
         # accuracy then cast; the float64 eps_r copy is released immediately.
@@ -525,6 +539,102 @@ class Simulation:
                   f"compiling on first step...")
 
         # ============================================================== #
+        # Vectorized (numpy/cupy) update with slab-restricted CPML psi.
+        #
+        # Each E/H component is curl = termA - termB of two first-differences.
+        # We split the update into a full-domain *bulk* curl (no psi) plus a
+        # *PML correction* applied only on the thin PML slabs, which is exactly
+        # equivalent (ce*((a+psiA)-(b+psiB)) = ce*(a-b) + ce*psiA - ce*psiB) but
+        # lets psi be stored only where it is nonzero (the PML layers).
+        #
+        # Each entry: (F, region, K_region, k_scalar, is_E, terms) where `terms`
+        # is a list of (deriv_axis, source, other_axis, sign, blocks) and each
+        # block is (slab_slices, b_block, c_block, psi_slab).
+        # ============================================================== #
+        cell = (dx, dy, dz)
+        gshape = self.grid.shape
+
+        def _crop(ax, low):
+            return (slice(1, None) if low else slice(0, -1)) if gshape[ax] > 1 \
+                else slice(None)
+
+        vterms_H = []
+        vterms_E = []
+        if not self.use_numba:
+            # (F, aligned_axis, (axA, srcA), (axB, srcB), is_E)
+            _table = [
+                (Hx, 0, (1, Ez), (2, Ey), False, vterms_H),
+                (Hy, 1, (2, Ex), (0, Ez), False, vterms_H),
+                (Hz, 2, (0, Ey), (1, Ex), False, vterms_H),
+                (Ex, 0, (1, Hz), (2, Hy), True,  vterms_E),
+                (Ey, 1, (2, Hx), (0, Hz), True,  vterms_E),
+                (Ez, 2, (0, Hy), (1, Hx), True,  vterms_E),
+            ]
+            for F, _aax, (axA, srcA), (axB, srcB), is_E, bucket in _table:
+                region = [slice(None), slice(None), slice(None)]
+                region[axA] = _crop(axA, is_E)
+                region[axB] = _crop(axB, is_E)
+                region = tuple(region)
+                rshape = F[region].shape
+                K_region = ce_field[region] if is_E else None
+                k_scalar = None if is_E else -ch_field
+                b_src = self._b_e if is_E else self._b_h
+                c_src = self._c_e if is_E else self._c_h
+                terms = []
+                for ax, src, other_ax, sign in ((axA, srcA, axB, 1.0),
+                                                (axB, srcB, axA, -1.0)):
+                    if gshape[ax] <= 1:
+                        continue                      # collapsed axis -> term absent
+                    csl = _crop(ax, is_E)
+                    # coefficients may live on the GPU; pull the tiny 1D arrays
+                    # to the host to locate PML blocks and slice them.
+                    _b = b_src[ax]; _c = c_src[ax]
+                    b1 = (_b.get() if hasattr(_b, "get") else np.asarray(_b))[csl]
+                    c1 = (_c.get() if hasattr(_c, "get") else np.asarray(_c))[csl]
+                    blocks = []
+                    for s0, s1 in _contig_nonzero_blocks(c1):
+                        slab = [slice(None), slice(None), slice(None)]
+                        slab[ax] = slice(s0, s1)
+                        rs = [1, 1, 1]; rs[ax] = s1 - s0
+                        bb = xp.asarray(b1[s0:s1], dtype=dtype).reshape(rs)
+                        cc = xp.asarray(c1[s0:s1], dtype=dtype).reshape(rs)
+                        pshape = list(rshape); pshape[ax] = s1 - s0
+                        blocks.append((tuple(slab), bb, cc,
+                                       xp.zeros(tuple(pshape), dtype=dtype)))
+                    terms.append((ax, src, other_ax, sign, blocks))
+                bucket.append((F, region, K_region, k_scalar, is_E, terms))
+
+        def apply_update(vlist):
+            for F, region, K_region, k_scalar, is_E, terms in vlist:
+                derivs = []
+                for ax, src, other_ax, sign, blocks in terms:
+                    d = d_fwd(src, ax, cell[ax])
+                    if d is not None and gshape[other_ax] > 1:
+                        osl = [slice(None), slice(None), slice(None)]
+                        osl[other_ax] = _crop(other_ax, is_E)
+                        d = d[tuple(osl)]
+                    derivs.append(d)
+                # bulk curl (no psi)
+                curl = None
+                for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
+                    if d is None:
+                        continue
+                    contrib = d if sign > 0 else -d
+                    curl = contrib if curl is None else curl + contrib
+                if curl is None:
+                    continue
+                Freg = F[region]
+                Freg += (K_region * curl) if is_E else (k_scalar * curl)
+                # PML correction on the thin slabs only
+                for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
+                    if d is None:
+                        continue
+                    for slab, bb, cc, psi in blocks:
+                        psi[...] = bb * psi + cc * d[slab]
+                        k = K_region[slab] if is_E else k_scalar
+                        Freg[slab] += sign * k * psi
+
+        # ============================================================== #
         # Main time loop
         # ============================================================== #
         for step in range(n_steps):
@@ -575,74 +685,7 @@ class Simulation:
                 continue   # skip the NumPy/CuPy branch below
 
             # -------- H update (forward differences of E) -------- #
-            # Hx at (i, j+1/2, k+1/2): uses dEz/dy and dEy/dz cropped to (nx, ny-1, nz-1)
-            if ny > 1 or nz > 1:
-                dEz_dy = d_fwd(Ez, 1, dy)               # (nx, ny-1, nz) or None
-                dEy_dz = d_fwd(Ey, 2, dz)               # (nx, ny, nz-1) or None
-                if ny > 1 and nz > 1:
-                    a = dEz_dy[:, :, :-1]; b_ = dEy_dz[:, :-1, :]
-                    psi_Hx_y[:, :-1, :-1] = (by_h[:, :-1, :] * psi_Hx_y[:, :-1, :-1] +
-                                              cy_h[:, :-1, :] * a)
-                    psi_Hx_z[:, :-1, :-1] = (bz_h[:, :, :-1] * psi_Hx_z[:, :-1, :-1] +
-                                              cz_h[:, :, :-1] * b_)
-                    curl = (a + psi_Hx_y[:, :-1, :-1]) - (b_ + psi_Hx_z[:, :-1, :-1])
-                    Hx[:, :-1, :-1] -= ch_field * curl
-                elif ny > 1:                            # 2D in xy-plane (TM): k size 1
-                    a = dEz_dy                          # (nx, ny-1, 1)
-                    psi_Hx_y[:, :-1, :] = (by_h[:, :-1, :] * psi_Hx_y[:, :-1, :] +
-                                            cy_h[:, :-1, :] * a)
-                    Hx[:, :-1, :] -= ch_field * (a + psi_Hx_y[:, :-1, :])
-                elif nz > 1:                            # 2D in xz-plane: j size 1
-                    b_ = dEy_dz                         # (nx, 1, nz-1)
-                    psi_Hx_z[:, :, :-1] = (bz_h[:, :, :-1] * psi_Hx_z[:, :, :-1] +
-                                            cz_h[:, :, :-1] * b_)
-                    Hx[:, :, :-1] -= ch_field * (-(b_ + psi_Hx_z[:, :, :-1]))
-
-            # Hy at (i+1/2, j, k+1/2): uses dEx/dz and dEz/dx cropped to (nx-1, ny, nz-1)
-            if nx > 1 or nz > 1:
-                dEx_dz = d_fwd(Ex, 2, dz)               # (nx, ny, nz-1)
-                dEz_dx = d_fwd(Ez, 0, dx)               # (nx-1, ny, nz)
-                if nx > 1 and nz > 1:
-                    a = dEx_dz[:-1, :, :]; b_ = dEz_dx[:, :, :-1]
-                    psi_Hy_z[:-1, :, :-1] = (bz_h[:, :, :-1] * psi_Hy_z[:-1, :, :-1] +
-                                              cz_h[:, :, :-1] * a)
-                    psi_Hy_x[:-1, :, :-1] = (bx_h[:-1, :, :] * psi_Hy_x[:-1, :, :-1] +
-                                              cx_h[:-1, :, :] * b_)
-                    curl = (a + psi_Hy_z[:-1, :, :-1]) - (b_ + psi_Hy_x[:-1, :, :-1])
-                    Hy[:-1, :, :-1] -= ch_field * curl
-                elif nz > 1:                            # 2D yz-plane: i size 1
-                    a = dEx_dz                          # (1, ny, nz-1)
-                    psi_Hy_z[:, :, :-1] = (bz_h[:, :, :-1] * psi_Hy_z[:, :, :-1] +
-                                            cz_h[:, :, :-1] * a)
-                    Hy[:, :, :-1] -= ch_field * (a + psi_Hy_z[:, :, :-1])
-                elif nx > 1:                            # 2D xz-plane: k size 1, but no Ex/Ez decoupling here
-                    b_ = dEz_dx                         # (nx-1, ny, 1)
-                    psi_Hy_x[:-1, :, :] = (bx_h[:-1, :, :] * psi_Hy_x[:-1, :, :] +
-                                            cx_h[:-1, :, :] * b_)
-                    Hy[:-1, :, :] -= ch_field * (-(b_ + psi_Hy_x[:-1, :, :]))
-
-            # Hz at (i+1/2, j+1/2, k): uses dEy/dx and dEx/dy cropped to (nx-1, ny-1, nz)
-            if nx > 1 or ny > 1:
-                dEy_dx = d_fwd(Ey, 0, dx)               # (nx-1, ny, nz)
-                dEx_dy = d_fwd(Ex, 1, dy)               # (nx, ny-1, nz)
-                if nx > 1 and ny > 1:
-                    a = dEy_dx[:, :-1, :]; b_ = dEx_dy[:-1, :, :]
-                    psi_Hz_x[:-1, :-1, :] = (bx_h[:-1, :, :] * psi_Hz_x[:-1, :-1, :] +
-                                              cx_h[:-1, :, :] * a)
-                    psi_Hz_y[:-1, :-1, :] = (by_h[:, :-1, :] * psi_Hz_y[:-1, :-1, :] +
-                                              cy_h[:, :-1, :] * b_)
-                    curl = (a + psi_Hz_x[:-1, :-1, :]) - (b_ + psi_Hz_y[:-1, :-1, :])
-                    Hz[:-1, :-1, :] -= ch_field * curl
-                elif nx > 1:                            # 1D x-axis: only Ey along axis matters
-                    a = dEy_dx
-                    psi_Hz_x[:-1, :, :] = (bx_h[:-1, :, :] * psi_Hz_x[:-1, :, :] +
-                                            cx_h[:-1, :, :] * a)
-                    Hz[:-1, :, :] -= ch_field * (a + psi_Hz_x[:-1, :, :])
-                elif ny > 1:
-                    b_ = dEx_dy
-                    psi_Hz_y[:, :-1, :] = (by_h[:, :-1, :] * psi_Hz_y[:, :-1, :] +
-                                            cy_h[:, :-1, :] * b_)
-                    Hz[:, :-1, :] -= ch_field * (-(b_ + psi_Hz_y[:, :-1, :]))
+            apply_update(vterms_H)
 
             # -------- H-component sources -------- #
             H_map = {"Hx": Hx, "Hy": Hy, "Hz": Hz}
@@ -653,74 +696,7 @@ class Simulation:
                 H_map[src.component][i, j, k] += val
 
             # -------- E update (backward differences of H) -------- #
-            # Ex at (i+1/2, j, k): uses dHz/dy and dHy/dz; valid j in [1, ny-1], k in [1, nz-1]
-            if ny > 1 or nz > 1:
-                dHz_dy = d_fwd(Hz, 1, dy)               # (nx, ny-1, nz) maps to j in [1, ny-1]
-                dHy_dz = d_fwd(Hy, 2, dz)               # (nx, ny, nz-1) maps to k in [1, nz-1]
-                if ny > 1 and nz > 1:
-                    a = dHz_dy[:, :, 1:]; b_ = dHy_dz[:, 1:, :]
-                    psi_Ex_y[:, 1:, 1:] = (by_e[:, 1:, :] * psi_Ex_y[:, 1:, 1:] +
-                                            cy_e[:, 1:, :] * a)
-                    psi_Ex_z[:, 1:, 1:] = (bz_e[:, :, 1:] * psi_Ex_z[:, 1:, 1:] +
-                                            cz_e[:, :, 1:] * b_)
-                    curl = (a + psi_Ex_y[:, 1:, 1:]) - (b_ + psi_Ex_z[:, 1:, 1:])
-                    Ex[:, 1:, 1:] += ce_field[:, 1:, 1:] * curl
-                elif ny > 1:
-                    a = dHz_dy
-                    psi_Ex_y[:, 1:, :] = (by_e[:, 1:, :] * psi_Ex_y[:, 1:, :] +
-                                           cy_e[:, 1:, :] * a)
-                    Ex[:, 1:, :] += ce_field[:, 1:, :] * (a + psi_Ex_y[:, 1:, :])
-                elif nz > 1:
-                    b_ = dHy_dz
-                    psi_Ex_z[:, :, 1:] = (bz_e[:, :, 1:] * psi_Ex_z[:, :, 1:] +
-                                           cz_e[:, :, 1:] * b_)
-                    Ex[:, :, 1:] += ce_field[:, :, 1:] * (-(b_ + psi_Ex_z[:, :, 1:]))
-
-            # Ey at (i, j+1/2, k): uses dHx/dz and dHz/dx
-            if nx > 1 or nz > 1:
-                dHx_dz = d_fwd(Hx, 2, dz)               # (nx, ny, nz-1)
-                dHz_dx = d_fwd(Hz, 0, dx)               # (nx-1, ny, nz)
-                if nx > 1 and nz > 1:
-                    a = dHx_dz[1:, :, :]; b_ = dHz_dx[:, :, 1:]
-                    psi_Ey_z[1:, :, 1:] = (bz_e[:, :, 1:] * psi_Ey_z[1:, :, 1:] +
-                                            cz_e[:, :, 1:] * a)
-                    psi_Ey_x[1:, :, 1:] = (bx_e[1:, :, :] * psi_Ey_x[1:, :, 1:] +
-                                            cx_e[1:, :, :] * b_)
-                    curl = (a + psi_Ey_z[1:, :, 1:]) - (b_ + psi_Ey_x[1:, :, 1:])
-                    Ey[1:, :, 1:] += ce_field[1:, :, 1:] * curl
-                elif nz > 1:
-                    a = dHx_dz
-                    psi_Ey_z[:, :, 1:] = (bz_e[:, :, 1:] * psi_Ey_z[:, :, 1:] +
-                                           cz_e[:, :, 1:] * a)
-                    Ey[:, :, 1:] += ce_field[:, :, 1:] * (a + psi_Ey_z[:, :, 1:])
-                elif nx > 1:
-                    b_ = dHz_dx
-                    psi_Ey_x[1:, :, :] = (bx_e[1:, :, :] * psi_Ey_x[1:, :, :] +
-                                           cx_e[1:, :, :] * b_)
-                    Ey[1:, :, :] += ce_field[1:, :, :] * (-(b_ + psi_Ey_x[1:, :, :]))
-
-            # Ez at (i, j, k+1/2): uses dHy/dx and dHx/dy
-            if nx > 1 or ny > 1:
-                dHy_dx = d_fwd(Hy, 0, dx)               # (nx-1, ny, nz)
-                dHx_dy = d_fwd(Hx, 1, dy)               # (nx, ny-1, nz)
-                if nx > 1 and ny > 1:
-                    a = dHy_dx[:, 1:, :]; b_ = dHx_dy[1:, :, :]
-                    psi_Ez_x[1:, 1:, :] = (bx_e[1:, :, :] * psi_Ez_x[1:, 1:, :] +
-                                            cx_e[1:, :, :] * a)
-                    psi_Ez_y[1:, 1:, :] = (by_e[:, 1:, :] * psi_Ez_y[1:, 1:, :] +
-                                            cy_e[:, 1:, :] * b_)
-                    curl = (a + psi_Ez_x[1:, 1:, :]) - (b_ + psi_Ez_y[1:, 1:, :])
-                    Ez[1:, 1:, :] += ce_field[1:, 1:, :] * curl
-                elif nx > 1:
-                    a = dHy_dx
-                    psi_Ez_x[1:, :, :] = (bx_e[1:, :, :] * psi_Ez_x[1:, :, :] +
-                                           cx_e[1:, :, :] * a)
-                    Ez[1:, :, :] += ce_field[1:, :, :] * (a + psi_Ez_x[1:, :, :])
-                elif ny > 1:
-                    b_ = dHx_dy
-                    psi_Ez_y[:, 1:, :] = (by_e[:, 1:, :] * psi_Ez_y[:, 1:, :] +
-                                           cy_e[:, 1:, :] * b_)
-                    Ez[:, 1:, :] += ce_field[:, 1:, :] * (-(b_ + psi_Ez_y[:, 1:, :]))
+            apply_update(vterms_E)
 
             # -------- E-component sources -------- #
             E_map = {"Ex": Ex, "Ey": Ey, "Ez": Ez}
