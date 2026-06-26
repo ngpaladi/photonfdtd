@@ -30,6 +30,7 @@ extensions = [
     "sphinx.ext.viewcode",      # "[source]" links
     "sphinx.ext.intersphinx",
     "sphinx.ext.mathjax",       # math in docstrings
+    "sphinx_rtd_theme",         # Read the Docs HTML theme
 ]
 
 templates_path = ["_templates"]
@@ -56,6 +57,10 @@ intersphinx_mapping = {
 }
 
 # -- HTML output -------------------------------------------------------------
-html_theme = "furo"
+html_theme = "sphinx_rtd_theme"
 html_title = f"photonfdtd {release}"
 html_static_path = ["_static"]
+html_theme_options = {
+    "navigation_depth": 3,
+    "collapse_navigation": False,
+}

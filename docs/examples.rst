@@ -11,10 +11,6 @@ at each step. Each script saves the figure shown below; run them with, e.g.::
 
 The figures here were produced by exactly these scripts.
 
-.. contents:: On this page
-   :local:
-   :depth: 1
-
 
 1. A pulse in 1D vacuum
 -----------------------

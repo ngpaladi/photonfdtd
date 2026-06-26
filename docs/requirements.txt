@@ -2,4 +2,4 @@
 # CI installs the package itself with `pip install .[docs]`; this file exists so
 # the docs can also be built standalone with `pip install -r docs/requirements.txt`.
 sphinx>=7
-furo
+sphinx-rtd-theme>=3

@@ -29,7 +29,7 @@ dependencies = [
 # numba is included so CI exercises the JIT backend's parity tests (the GPU
 # parity test still skips - no CUDA device in CI).
 test = ["pytest>=7.4", "numba>=0.59"]
-docs = ["sphinx>=7", "furo"]
+docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"
