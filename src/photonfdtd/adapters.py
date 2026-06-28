@@ -58,6 +58,7 @@ def from_gdsfactory(
     use_gpu: bool = False,
     use_numba: bool = False,
     precision: str = "float64",
+    xy_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> Simulation:
     """Build a 3D photonfdtd Simulation from a gdsfactory Component.
 
@@ -103,11 +104,19 @@ def from_gdsfactory(
     """
     polys_by_layer = _component_polygons_um(component)
 
-    # Component bounding box in microns -> centre and extent in metres. The
-    # kfactory-era DBox exposes .left/.right/.bottom/.top in microns.
-    bb = component.bbox()
-    x_lo_um, x_hi_um = float(bb.left), float(bb.right)
-    y_lo_um, y_hi_um = float(bb.bottom), float(bb.top)
+    # XY domain in microns -> centre and extent in metres. Normally the whole
+    # component bounding box (the kfactory-era DBox exposes .left/.right/
+    # .bottom/.top in microns); xy_bounds (x_lo, x_hi, y_lo, y_hi in metres)
+    # restricts it to a sub-region instead, so only that window is gridded.
+    # Polygons outside the grid simply don't rasterise, so the structure is
+    # clipped to the region automatically.
+    if xy_bounds is not None:
+        x_lo_um, x_hi_um = xy_bounds[0] * 1e6, xy_bounds[1] * 1e6
+        y_lo_um, y_hi_um = xy_bounds[2] * 1e6, xy_bounds[3] * 1e6
+    else:
+        bb = component.bbox()
+        x_lo_um, x_hi_um = float(bb.left), float(bb.right)
+        y_lo_um, y_hi_um = float(bb.bottom), float(bb.top)
     x_center = 0.5 * (x_lo_um + x_hi_um) * 1e-6
     y_center = 0.5 * (y_lo_um + y_hi_um) * 1e-6
     x_extent = (x_hi_um - x_lo_um) * 1e-6 + 2.0 * padding[0]
