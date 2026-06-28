@@ -489,6 +489,7 @@ class Simulation:
         rec_fields: Dict[str, Dict[str, list]] = {}
         rec_times: Dict[str, list] = {}
         rec_step_list: Dict[str, set] = {}
+        rec_zslice: Dict[str, slice] = {}  # single-plane restriction (plane_z), else whole z
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
                 rec_fields[m.name] = {c: [] for c in m.components}
@@ -497,6 +498,11 @@ class Simulation:
                     rec_step_list[m.name] = {int(round(t / dt)) for t in m.times}
                 else:
                     rec_step_list[m.name] = set(range(0, n_steps, m.interval))
+                if m.plane_z is not None:
+                    zi = int(np.argmin(np.abs(np.asarray(self.grid.coords[2]) - m.plane_z)))
+                    rec_zslice[m.name] = slice(zi, zi + 1)  # size-1 z axis kept
+                else:
+                    rec_zslice[m.name] = slice(None)
             elif isinstance(m, FluxMonitor):
                 result.flux[m.name] = 0.0
 
@@ -673,9 +679,12 @@ class Simulation:
                             comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
                                      "Hx": Hx, "Hy": Hy, "Hz": Hz}
                             ds = m.downsample
+                            zsl = rec_zslice[m.name]
                             for c in m.components:
                                 snap = comps[c]
-                                if ds > 1:
+                                if zsl != slice(None):
+                                    snap = snap[::ds, ::ds, zsl]
+                                elif ds > 1:
                                     snap = snap[::ds, ::ds, ::ds]
                                 rec_fields[m.name][c].append(snap.copy())
                             rec_times[m.name].append(step * dt)
@@ -716,13 +725,17 @@ class Simulation:
                         comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
                                  "Hx": Hx, "Hy": Hy, "Hz": Hz}
                         ds = m.downsample
+                        zsl = rec_zslice[m.name]
                         for c in m.components:
                             snap = comps[c]
-                            if ds > 1:
+                            if zsl != slice(None):
+                                snap = snap[::ds, ::ds, zsl]
+                            elif ds > 1:
                                 snap = snap[::ds, ::ds, ::ds]
                             # Pull to CPU before storing so monitors are always
                             # plain numpy arrays regardless of the backend. On the
-                            # GPU backend this transfers only the strided subset.
+                            # GPU backend this transfers only the strided subset
+                            # (or single plane).
                             rec_fields[m.name][c].append(to_cpu(snap).copy())
                         rec_times[m.name].append(step * dt)
                 elif isinstance(m, FluxMonitor):

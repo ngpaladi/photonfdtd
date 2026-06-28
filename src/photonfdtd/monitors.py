@@ -32,6 +32,12 @@ class FieldMonitor:
         ``downsample**ndim`` and, on the GPU backend, the host transfer too.
         The stored array aligns to ``grid.coords[axis][::downsample]`` on each
         axis. Snapshots are stored in the simulation's working dtype.
+    plane_z : float, optional
+        If given, record only the single z-plane nearest this z-coordinate (m)
+        instead of the whole volume. The stored array keeps a size-1 z axis so
+        downstream indexing is unchanged. For a top-down field movie this cuts
+        snapshot memory — and the GPU host transfer — by the full z-cell count
+        (often 30-100x), since only the one displayed plane is kept.
     name : str
         Identifier used to retrieve results from sim.run().
     """
@@ -40,6 +46,7 @@ class FieldMonitor:
     interval: Optional[int] = None
     times: Optional[Sequence[float]] = None
     downsample: int = 1
+    plane_z: Optional[float] = None
 
     def __post_init__(self):
         if self.interval is None and self.times is None:
