@@ -31,7 +31,7 @@ updated at integer times from backward differences of H.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import math
 import warnings
 import numpy as np
@@ -396,6 +396,13 @@ class Simulation:
         self.courant = float(courant)
         self.cpml_params = cpml_params
         self.verbose = verbose
+        # Optional progress hook called as progress_callback(step, n_steps)
+        # periodically during run() (and once more at completion). Left as a
+        # settable attribute rather than a constructor arg so callers can attach
+        # it to an already-built Simulation (e.g. one made by from_gdsfactory).
+        # A None callback is simply skipped; exceptions from it are not caught,
+        # so keep it cheap and non-throwing.
+        self.progress_callback: Optional[Callable[[int, int], None]] = None
 
         # Per-cell relative permittivity (background = 1) – always on CPU first
         # so geometry primitives can stamp into it, then moved to the backend.
@@ -789,7 +796,14 @@ class Simulation:
         # ============================================================== #
         # Main time loop
         # ============================================================== #
+        # ~100 progress ticks over the whole run (cheap, and fine-grained enough
+        # for a smooth UI bar without flooding a callback that may hop threads or
+        # processes). Done at the loop top so it covers both the Numba and the
+        # NumPy/CuPy branches (the Numba path `continue`s before the bottom).
+        progress_interval = max(n_steps // 100, 1)
         for step in range(n_steps):
+            if self.progress_callback is not None and step % progress_interval == 0:
+                self.progress_callback(step, n_steps)
             t_h = (step + 0.5) * dt
             t_e = (step + 1.0) * dt
 
@@ -866,6 +880,9 @@ class Simulation:
             if self.verbose and step % max(n_steps // 20, 1) == 0:
                 emax = float(max(float(xp.abs(Ex).max()), float(xp.abs(Ey).max()), float(xp.abs(Ez).max())))
                 print(f"  step {step}/{n_steps}  t={step*dt*1e15:6.1f} fs  |E|max={emax:.3e}")
+
+        if self.progress_callback is not None:
+            self.progress_callback(n_steps, n_steps)  # 100% on completion
 
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
