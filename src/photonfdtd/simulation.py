@@ -234,6 +234,89 @@ def _contig_nonzero_blocks(arr1d):
     return blocks
 
 
+# ---------------------------------------------------------------------------- #
+# Per-array precision control.
+#
+# `precision` may be a single dtype string applied to everything (the common
+# case, fully back-compatible), or a dict that sets the dtype of individual
+# arrays. Addressable array keys:
+#
+#     'Ex','Ey','Ez','Hx','Hy','Hz'  - the six field components
+#     'eps_r'                        - per-cell permittivity / E-update coeff
+#     'psi'                          - CPML convolutional state + coefficients
+#     'monitors'                     - stored monitor snapshots
+#
+# plus group aliases that fan out to several arrays at once (most specific key
+# wins: individual > e_fields/h_fields > fields > compute > default):
+#
+#     'default'  - fallback for any key not otherwise set (default 'float64')
+#     'compute'  - every stepping array (all fields + eps_r + psi); the natural
+#                  "compute precision" knob, paired with 'monitors' for storage
+#     'fields'   - all six field components
+#     'e_fields' / 'h_fields' - the E or H components only
+#
+# Example - run the solver in double precision but halve monitor memory:
+#     precision={'compute': 'float64', 'monitors': 'float32'}
+# Example - mixed fields:
+#     precision={'default': 'float32', 'Ez': 'float64'}
+# ---------------------------------------------------------------------------- #
+_FIELD_KEYS = ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")
+_E_KEYS = ("Ex", "Ey", "Ez")
+_H_KEYS = ("Hx", "Hy", "Hz")
+_ARRAY_KEYS = _FIELD_KEYS + ("eps_r", "psi", "monitors")
+_COMPUTE_KEYS = _FIELD_KEYS + ("eps_r", "psi")   # all arrays except monitor storage
+_GROUP_ALIASES = ("default", "compute", "fields", "e_fields", "h_fields")
+_VALID_DTYPES = {"float32": np.float32, "float64": np.float64}
+
+
+def _resolve_precision(precision) -> Dict[str, np.dtype]:
+    """Resolve the `precision` argument to a {array_key: numpy dtype} map.
+
+    `precision` is either a dtype string (applied to every array) or a dict
+    keyed by individual array names and/or group aliases (see module notes).
+    """
+    if isinstance(precision, str):
+        if precision not in _VALID_DTYPES:
+            raise ValueError("precision must be 'float32' or 'float64'")
+        d = _VALID_DTYPES[precision]
+        return {k: d for k in _ARRAY_KEYS}
+
+    if not isinstance(precision, dict):
+        raise TypeError(
+            "precision must be a str ('float32'/'float64') or a dict mapping "
+            "array keys to dtype strings"
+        )
+
+    allowed = set(_ARRAY_KEYS) | set(_GROUP_ALIASES)
+    unknown = set(precision) - allowed
+    if unknown:
+        raise ValueError(
+            f"unknown precision key(s) {sorted(unknown)}; "
+            f"allowed keys: {sorted(allowed)}"
+        )
+    for k, v in precision.items():
+        if v not in _VALID_DTYPES:
+            raise ValueError(
+                f"precision[{k!r}] must be 'float32' or 'float64', got {v!r}"
+            )
+
+    def pick(*keys, fallback):
+        for k in keys:                       # first listed key present wins
+            if k in precision:
+                return _VALID_DTYPES[precision[k]]
+        return fallback
+
+    default = _VALID_DTYPES[precision.get("default", "float64")]
+    out: Dict[str, np.dtype] = {}
+    for k in _FIELD_KEYS:
+        grp = "e_fields" if k in _E_KEYS else "h_fields"
+        out[k] = pick(k, grp, "fields", "compute", fallback=default)
+    out["eps_r"] = pick("eps_r", "compute", fallback=default)
+    out["psi"] = pick("psi", "compute", fallback=default)
+    out["monitors"] = pick("monitors", fallback=default)
+    return out
+
+
 @dataclass
 class Result:
     times: np.ndarray
@@ -255,17 +338,29 @@ class Simulation:
         verbose: bool = False,
         use_gpu: bool = False,
         use_numba: bool = False,
-        precision: str = "float64",
+        precision="float64",
     ) -> None:
-        if precision not in ("float32", "float64"):
-            raise ValueError("precision must be 'float32' or 'float64'")
-        # Working dtype for fields, CPML state and coefficients. float32 halves
-        # memory and roughly doubles throughput (FDTD is memory-bandwidth bound)
-        # at single precision; the default float64 is bit-for-bit unchanged.
+        # Working dtype(s) for fields, CPML state, coefficients and monitor
+        # storage. float32 halves memory and roughly doubles throughput (FDTD is
+        # memory-bandwidth bound) at single precision; the default float64 is
+        # bit-for-bit unchanged. `precision` may be a single dtype string or a
+        # per-array dict - see _resolve_precision / module notes above.
         self.precision = precision
-        self.dtype = np.float32 if precision == "float32" else np.float64
+        self.dtypes = _resolve_precision(precision)
+        # Representative compute dtype, kept for back-compat (== the Ex dtype).
+        self.dtype = self.dtypes["Ex"]
         self.use_gpu = use_gpu and _GPU_AVAILABLE
         self.use_numba = use_numba and _NUMBA_AVAILABLE and not self.use_gpu
+        # The fused Numba kernel is a single specialization over all stepping
+        # arrays; mixing dtypes among them has no real use case and unclear
+        # promotion semantics, so require one compute dtype there. Monitor
+        # storage precision may still differ (it is handled outside the kernel).
+        if self.use_numba and len({self.dtypes[k] for k in _COMPUTE_KEYS}) > 1:
+            raise ValueError(
+                "use_numba=True requires a single precision for all stepping "
+                "arrays (fields, eps_r, psi); only 'monitors' may differ. "
+                "Use a uniform 'compute' precision or drop use_numba."
+            )
         if self.use_numba and grid.ndim < 3:
             warnings.warn(
                 "use_numba: the JIT field-update kernel is intended for large "
@@ -304,7 +399,11 @@ class Simulation:
 
         # Per-cell relative permittivity (background = 1) – always on CPU first
         # so geometry primitives can stamp into it, then moved to the backend.
-        self.eps_r = np.ones(grid.shape, dtype=np.float64)
+        # Stored in the 'eps_r' working dtype: at float64 this is bit-for-bit the
+        # same float64 grid as before; at float32 it halves what is otherwise the
+        # single largest array (eps_r outlives the ce_field build and was
+        # previously kept at float64 regardless of precision).
+        self.eps_r = np.ones(grid.shape, dtype=self.dtypes["eps_r"])
         for s in self.structures:
             s.stamp(grid, self.eps_r)
 
@@ -457,21 +556,26 @@ class Simulation:
             print(f"[photonfdtd] GPU backend (CuPy {xp.__version__}), "
                   f"device: {devname}", file=sys.stderr, flush=True)
 
-        dtype = self.dtype
+        # Per-array dtypes (a single string `precision` makes them all equal).
+        dt_ = self.dtypes
+        dtype = self.dtype          # representative compute dtype (== Ex's)
+        psi_dtype = dt_["psi"]
+        eps_dtype = dt_["eps_r"]
+        mon_dtype = dt_["monitors"]
 
-        # Field arrays allocated on the chosen backend
-        Ex = xp.zeros((nx, ny, nz), dtype=dtype)
-        Ey = xp.zeros((nx, ny, nz), dtype=dtype)
-        Ez = xp.zeros((nx, ny, nz), dtype=dtype)
-        Hx = xp.zeros((nx, ny, nz), dtype=dtype)
-        Hy = xp.zeros((nx, ny, nz), dtype=dtype)
-        Hz = xp.zeros((nx, ny, nz), dtype=dtype)
+        # Field arrays allocated on the chosen backend, each in its own dtype.
+        Ex = xp.zeros((nx, ny, nz), dtype=dt_["Ex"])
+        Ey = xp.zeros((nx, ny, nz), dtype=dt_["Ey"])
+        Ez = xp.zeros((nx, ny, nz), dtype=dt_["Ez"])
+        Hx = xp.zeros((nx, ny, nz), dtype=dt_["Hx"])
+        Hy = xp.zeros((nx, ny, nz), dtype=dt_["Hy"])
+        Hz = xp.zeros((nx, ny, nz), dtype=dt_["Hz"])
 
         # CPML convolutional state (psi). The Numba kernel uses dense, full-domain
         # psi arrays; the vectorized numpy/cupy path instead stores psi only in
         # the PML slabs (built below) to cut peak memory on large volumes.
         if self.use_numba:
-            z = lambda: xp.zeros((nx, ny, nz), dtype=dtype)
+            z = lambda: xp.zeros((nx, ny, nz), dtype=psi_dtype)
             psi_Ex_y = z(); psi_Ex_z = z()
             psi_Ey_z = z(); psi_Ey_x = z()
             psi_Ez_x = z(); psi_Ez_y = z()
@@ -479,25 +583,38 @@ class Simulation:
             psi_Hy_z = z(); psi_Hy_x = z()
             psi_Hz_x = z(); psi_Hz_y = z()
 
-        # Per-cell E-update coefficient dt/(eps_r*EPS_0). Computed in float64 for
-        # accuracy then cast; the float64 eps_r copy is released immediately.
-        ce_field = (dt / (xp.asarray(self.eps_r) * EPS_0)).astype(dtype)
-        ch_field = dtype(dt / MU_0)            # for H updates (mu_r = 1)
+        # Per-cell E-update coefficient dt/(eps_r*EPS_0), in the 'eps_r' dtype.
+        # eps_r already carries that dtype, so at float64 this evaluates exactly
+        # as before; at float32 the intermediates stay single-precision (no
+        # transient full-domain float64 temporaries).
+        ce_field = (dt / (xp.asarray(self.eps_r) * EPS_0)).astype(eps_dtype, copy=False)
+        ch_field = dt_["Hx"](dt / MU_0)        # for H updates (mu_r = 1)
 
         # Monitor bookkeeping.
         result = Result(times=np.arange(n_steps) * dt)
-        rec_fields: Dict[str, Dict[str, list]] = {}
+        # Snapshots are written straight into a preallocated (n_rec, *snap) array
+        # rather than appended to a Python list and np.stack-ed at the end - the
+        # final stack would briefly double the monitor's peak memory. The output
+        # array is allocated lazily on the first recorded step (when the snapshot
+        # shape/dtype is known) and filled by row index thereafter.
+        rec_fields: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
         rec_times: Dict[str, list] = {}
         rec_step_list: Dict[str, set] = {}
+        rec_n: Dict[str, int] = {}      # total rows to record (known up front)
+        rec_count: Dict[str, int] = {}  # rows recorded so far (next write index)
         rec_zslice: Dict[str, slice] = {}  # single-plane restriction (plane_z), else whole z
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
-                rec_fields[m.name] = {c: [] for c in m.components}
+                rec_fields[m.name] = {c: None for c in m.components}
                 rec_times[m.name] = []
+                rec_count[m.name] = 0
                 if m.times is not None:
                     rec_step_list[m.name] = {int(round(t / dt)) for t in m.times}
                 else:
                     rec_step_list[m.name] = set(range(0, n_steps, m.interval))
+                # Distinct in-range steps that will actually fire during the loop.
+                rec_n[m.name] = sum(1 for s in rec_step_list[m.name]
+                                    if 0 <= s < n_steps)
                 if m.plane_z is not None:
                     zi = int(np.argmin(np.abs(np.asarray(self.grid.coords[2]) - m.plane_z)))
                     rec_zslice[m.name] = slice(zi, zi + 1)  # size-1 z axis kept
@@ -514,6 +631,35 @@ class Simulation:
             if self.use_gpu:
                 return arr.get()         # cupy → numpy (np.asarray is rejected by cupy>=13)
             return arr
+
+        # Record one FieldMonitor snapshot into its preallocated output array.
+        # Shared by the NumPy/CuPy and Numba paths. The strided/plane slice is
+        # taken on the backend (so the GPU transfers only the kept subset), then
+        # copied into the destination row by assignment - no per-step list growth
+        # and no end-of-run np.stack.
+        def record_monitor(m, step):
+            comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez, "Hx": Hx, "Hy": Hy, "Hz": Hz}
+            ds = m.downsample
+            zsl = rec_zslice[m.name]
+            idx = rec_count[m.name]
+            store = rec_fields[m.name]
+            for c in m.components:
+                snap = comps[c]
+                if zsl != slice(None):
+                    snap = snap[::ds, ::ds, zsl]
+                elif ds > 1:
+                    snap = snap[::ds, ::ds, ::ds]
+                snap = to_cpu(snap)
+                arr = store[c]
+                if arr is None:
+                    # Stored in the 'monitors' dtype (independent of the field's
+                    # own precision), so monitor memory can be halved even on a
+                    # float64 run; the assignment below casts the snapshot.
+                    arr = np.empty((rec_n[m.name],) + snap.shape, dtype=mon_dtype)
+                    store[c] = arr
+                arr[idx] = snap      # assignment copies/casts into the preallocated row
+            rec_times[m.name].append(step * dt)
+            rec_count[m.name] += 1
 
         # ============================================================== #
         # Helpers for axis-aware finite differences (uniform-grid central)
@@ -602,11 +748,11 @@ class Simulation:
                         slab = [slice(None), slice(None), slice(None)]
                         slab[ax] = slice(s0, s1)
                         rs = [1, 1, 1]; rs[ax] = s1 - s0
-                        bb = xp.asarray(b1[s0:s1], dtype=dtype).reshape(rs)
-                        cc = xp.asarray(c1[s0:s1], dtype=dtype).reshape(rs)
+                        bb = xp.asarray(b1[s0:s1], dtype=psi_dtype).reshape(rs)
+                        cc = xp.asarray(c1[s0:s1], dtype=psi_dtype).reshape(rs)
                         pshape = list(rshape); pshape[ax] = s1 - s0
                         blocks.append((tuple(slab), bb, cc,
-                                       xp.zeros(tuple(pshape), dtype=dtype)))
+                                       xp.zeros(tuple(pshape), dtype=psi_dtype)))
                     terms.append((ax, src, other_ax, sign, blocks))
                 bucket.append((F, region, K_region, k_scalar, is_E, terms))
 
@@ -676,18 +822,7 @@ class Simulation:
                 for m in self.monitors:
                     if isinstance(m, FieldMonitor):
                         if step in rec_step_list[m.name]:
-                            comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
-                                     "Hx": Hx, "Hy": Hy, "Hz": Hz}
-                            ds = m.downsample
-                            zsl = rec_zslice[m.name]
-                            for c in m.components:
-                                snap = comps[c]
-                                if zsl != slice(None):
-                                    snap = snap[::ds, ::ds, zsl]
-                                elif ds > 1:
-                                    snap = snap[::ds, ::ds, ::ds]
-                                rec_fields[m.name][c].append(snap.copy())
-                            rec_times[m.name].append(step * dt)
+                            record_monitor(m, step)
                 if self.verbose and step % max(n_steps // 20, 1) == 0:
                     emax = float(max(abs(Ex).max(), abs(Ey).max(), abs(Ez).max()))
                     print(f"  step {step}/{n_steps}  t={step*dt*1e15:6.1f} fs  |E|max={emax:.3e}")
@@ -722,22 +857,7 @@ class Simulation:
             for m in self.monitors:
                 if isinstance(m, FieldMonitor):
                     if step in rec_step_list[m.name]:
-                        comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez,
-                                 "Hx": Hx, "Hy": Hy, "Hz": Hz}
-                        ds = m.downsample
-                        zsl = rec_zslice[m.name]
-                        for c in m.components:
-                            snap = comps[c]
-                            if zsl != slice(None):
-                                snap = snap[::ds, ::ds, zsl]
-                            elif ds > 1:
-                                snap = snap[::ds, ::ds, ::ds]
-                            # Pull to CPU before storing so monitors are always
-                            # plain numpy arrays regardless of the backend. On the
-                            # GPU backend this transfers only the strided subset
-                            # (or single plane).
-                            rec_fields[m.name][c].append(to_cpu(snap).copy())
-                        rec_times[m.name].append(step * dt)
+                        record_monitor(m, step)
                 elif isinstance(m, FluxMonitor):
                     result.flux[m.name] += _flux_through_plane(
                         m, self.grid, Ex, Ey, Ez, Hx, Hy, Hz
@@ -749,9 +869,9 @@ class Simulation:
 
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
-                if rec_fields[m.name][m.components[0]]:
+                if rec_count[m.name] > 0:
                     result.fields[m.name] = {
-                        c: np.stack(rec_fields[m.name][c], axis=0) for c in m.components
+                        c: rec_fields[m.name][c] for c in m.components
                     }
                     result.monitor_times[m.name] = np.array(rec_times[m.name])
                 else:

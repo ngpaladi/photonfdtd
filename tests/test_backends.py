@@ -123,6 +123,54 @@ def test_float32_matches_float64():
         pf.Simulation(grid, precision="float16")
 
 
+def test_per_array_precision():
+    """`precision` accepts a per-array dict: monitor storage can be downcast
+    independently of the (here float64) compute arrays, and individual field
+    components can carry their own dtype.
+    """
+    freq0 = pf.C_0 / 1.0e-6
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=60e-9, pml_layers=(10, 10, 0))
+    src = pf.PointDipole(position=(0.0, 0.0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
+
+    def run(precision):
+        mon = pf.FieldMonitor(name="s", components=("Ez",), times=[16e-15])
+        sim = pf.Simulation(grid, sources=[src], monitors=[mon],
+                            run_time=18e-15, precision=precision)
+        return sim, sim.run().fields["s"]["Ez"]
+
+    sim64, ez64 = run("float64")
+    # Compute in float64 but store monitor snapshots in float32.
+    sim_split, ez_split = run({"compute": "float64", "monitors": "float32"})
+    assert sim_split.dtypes["Ex"] == np.float64        # fields still double
+    assert ez64.dtype == np.float64
+    assert ez_split.dtype == np.float32                 # storage halved
+    # Only the stored copy is downcast - the field evolution is identical, so
+    # the difference is bounded by float32 representation of the float64 result.
+    rel = np.abs(ez64 - ez_split.astype(np.float64)).max() / np.abs(ez64).max()
+    assert rel < 1e-6, f"monitor downcast changed the field: rel.diff={rel:.2e}"
+
+    # Mixed field-component precision runs and stays finite.
+    sim_mix, ez_mix = run({"default": "float32", "Ez": "float64"})
+    assert sim_mix.dtypes["Ez"] == np.float64
+    assert sim_mix.dtypes["Ex"] == np.float32
+    assert np.isfinite(ez_mix).all()
+
+    # Bad dtype values / unknown keys are rejected.
+    with pytest.raises(ValueError):
+        pf.Simulation(grid, precision={"Ez": "float16"})
+    with pytest.raises(ValueError):
+        pf.Simulation(grid, precision={"nonsense": "float32"})
+
+    # The fused Numba kernel needs a single compute precision (only fires when
+    # Numba is actually available; otherwise use_numba is silently downgraded).
+    pytest.importorskip("numba")
+    g3 = pf.Grid(size=(2e-6, 2e-6, 2e-6), cell_size=200e-9, pml_layers=(2, 2, 2))
+    with pytest.raises(ValueError):
+        pf.Simulation(g3, precision={"Ex": "float32", "Ez": "float64"},
+                      use_numba=True)
+
+
 def test_numba_warns_below_3d():
     """Requesting the numba backend on a sub-3D grid emits an advisory warning."""
     pytest.importorskip("numba")

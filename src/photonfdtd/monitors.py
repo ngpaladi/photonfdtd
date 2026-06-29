@@ -31,7 +31,9 @@ class FieldMonitor:
         on every axis (default 1 = full resolution). Cuts snapshot memory by
         ``downsample**ndim`` and, on the GPU backend, the host transfer too.
         The stored array aligns to ``grid.coords[axis][::downsample]`` on each
-        axis. Snapshots are stored in the simulation's working dtype.
+        axis. Snapshots are stored in the simulation's ``'monitors'`` dtype
+        (``precision={'monitors': 'float32'}`` halves snapshot memory even on a
+        float64 run).
     plane_z : float, optional
         If given, record only the single z-plane nearest this z-coordinate (m)
         instead of the whole volume. The stored array keeps a size-1 z axis so
