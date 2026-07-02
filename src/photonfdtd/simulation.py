@@ -205,9 +205,11 @@ def _get_backend(use_gpu: bool):
     if use_gpu:
         if not _GPU_AVAILABLE:
             raise RuntimeError(
-                "use_gpu=True but CuPy is not installed or has a CUDA version "
-                "mismatch with the running driver.  "
-                "Install: pip install cupy-cuda12x"
+                "use_gpu=True but CuPy is not installed or its build does not "
+                "match the running driver. Install the CuPy build for your GPU: "
+                "'pip install cupy-cuda12x' for an NVIDIA/CUDA GPU, or "
+                "'pip install cupy-rocm-5-0' for an AMD/ROCm GPU. Only generic "
+                "CuPy array ops are used, so either backend works."
             )
         return _cp
     return np

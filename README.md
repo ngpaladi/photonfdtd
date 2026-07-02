@@ -92,6 +92,11 @@ print(result.n_eff)            # array of effective indices
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout
   `Component`, maps its layers onto user-supplied materials, and returns a
   pre-built `Simulation`.
+- **Optional acceleration backends** for time-stepping: a Numba JIT path and
+  a CuPy GPU path (`use_gpu=True`). The GPU path uses only generic CuPy array
+  ops, so it runs on either an **NVIDIA** GPU (CuPy's CUDA build,
+  `cupy-cuda12x`) or an **AMD** GPU (CuPy's ROCm build, `cupy-rocm-5-0`).
+  Both are optional; without them the plain NumPy core runs.
 
 ## What v0.2 does *not* do (yet)
 
@@ -104,8 +109,6 @@ tracker:
 - Anisotropic media.
 - Sub-cell averaging for polygon edges.
 - Total-field / scattered-field plane wave injection.
-- GPU or JIT-compiled time-stepping. The NumPy core is correct but slow;
-  expect to wait minutes for moderate 3D problems.
 
 ## Roadmap
 
