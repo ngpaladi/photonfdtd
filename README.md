@@ -87,7 +87,26 @@ print(result.n_eff)            # array of effective indices
   $h\,\nu$ of total electromagnetic energy, and a moving-charge
   `ChargedParticle` current source that emits **Cherenkov radiation** when
   it outruns the local phase velocity (see `examples/04_cherenkov.py`).
-- **Field-snapshot and flux monitors.**
+- **Monitors**: time-domain field snapshots (`FieldMonitor`), Poynting flux
+  (`FluxMonitor`), and a frequency-domain `DFTMonitor` that accumulates a
+  running Fourier transform at chosen frequencies so storage scales with the
+  number of frequencies rather than the number of timesteps (routinely
+  50-1000x smaller than an equivalent time-domain monitor, exact at those
+  frequencies).
+- **Memory efficiency for large volumes**: per-array `float32`/`float64`
+  precision, the permittivity grid released during stepping, a shared curl
+  scratch buffer that avoids per-step full-domain temporaries, and
+  `FieldMonitor(compression=...)`, which streams snapshots to disk as
+  per-frame-scaled, quantised, compressed blocks - keeping RAM flat regardless
+  of recording length and shrinking stored data ~10-30x (8-bit) or ~5-7x
+  (16-bit) versus an uncompressed float64 monitor.
+- **Out-of-core stepping** (`sim.run(out_of_core=True, tile_cells=...)`): for a
+  volume whose fields do not fit in RAM, the six field arrays, `ce_field` and
+  the CPML state are memory-mapped to disk and each timestep sweeps the domain
+  in slabs along one axis, so **peak RAM is bounded by the tile size, not the
+  grid**. Reproduces the in-core result to machine precision. NumPy backend,
+  point sources and `FieldMonitor` (incl. `compression=`) supported; see
+  `photonfdtd.outofcore`.
 - **2D scalar Helmholtz mode solver** (eigenvalue problem in beta^2).
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout
   `Component`, maps its layers onto user-supplied materials, and returns a

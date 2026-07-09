@@ -28,8 +28,11 @@ dependencies = [
 [project.optional-dependencies]
 # numba is included so CI exercises the JIT backend's parity tests (the GPU
 # parity test still skips - no CUDA device in CI).
-test = ["pytest>=7.4", "numba>=0.59"]
+test = ["pytest>=7.4", "numba>=0.59", "zstandard>=0.21"]
 docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
+# Faster/better ratios for FieldMonitor(compression=...) than the stdlib zlib
+# fallback. Optional: without it, compression='zstd' raises but True/'zlib' work.
+compress = ["zstandard>=0.21"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"

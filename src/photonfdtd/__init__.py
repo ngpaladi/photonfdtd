@@ -22,7 +22,8 @@ from .sources import (
     GaussianPulse, PointDipole, ModeSource, SinglePhotonSource,
     ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
-from .monitors import FieldMonitor, FluxMonitor
+from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+from .storage import CompressedFieldSeries
 from .simulation import Simulation
 from .mode import ModeSolver
 from . import adapters
@@ -33,7 +34,8 @@ __all__ = [
     "Grid", "Medium", "Box", "PolySlab",
     "GaussianPulse", "PointDipole", "ModeSource", "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
-    "FieldMonitor", "FluxMonitor",
+    "FieldMonitor", "FluxMonitor", "DFTMonitor",
+    "CompressedFieldSeries",
     "Simulation", "ModeSolver",
     "adapters", "from_gdsfactory",
 ]

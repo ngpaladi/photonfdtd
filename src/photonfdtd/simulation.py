@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import math
+import os
 import warnings
 import numpy as np
 
@@ -40,7 +41,8 @@ from .constants import C_0, EPS_0, MU_0
 from .grid import Grid
 from .geometry import Box
 from .sources import PointDipole, ChargedParticle
-from .monitors import FieldMonitor, FluxMonitor
+from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+from .storage import CompressedFieldSeries, get_codec
 
 from .boundaries import cpml_coeffs_1axis, CPMLParams
 
@@ -325,6 +327,10 @@ class Result:
     fields: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     monitor_times: Dict[str, np.ndarray] = field(default_factory=dict)
     flux: Dict[str, float] = field(default_factory=dict)
+    # DFTMonitor output: dft[name][component] is a complex array of shape
+    # (n_freq, *snapshot_shape); dft_freqs[name] holds the frequencies (Hz).
+    dft: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
+    dft_freqs: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 class Simulation:
@@ -412,9 +418,19 @@ class Simulation:
         # same float64 grid as before; at float32 it halves what is otherwise the
         # single largest array (eps_r outlives the ce_field build and was
         # previously kept at float64 regardless of precision).
-        self.eps_r = np.ones(grid.shape, dtype=self.dtypes["eps_r"])
-        for s in self.structures:
-            s.stamp(grid, self.eps_r)
+        #
+        # eps_r is a full-domain array that the time loop reads exactly once (to
+        # build the E-update coefficient ce_field) and never again. It is fully
+        # determined by grid + structures, so rather than keep it resident
+        # alongside ce_field for the whole run we release it after ce_field is
+        # built and regenerate it on demand (deterministic re-stamp) via the
+        # `eps_r` property. This keeps one fewer full-domain array live during
+        # stepping on large volumes.
+        self._eps_r: Optional[np.ndarray] = None
+        # True once a caller assigns a custom eps_r grid that cannot be
+        # regenerated from `structures`; such a grid is never released.
+        self._eps_r_custom = False
+        self._materialize_eps_r()
 
         # Time step from the Courant condition.
         inv_dl2 = 0.0
@@ -425,6 +441,34 @@ class Simulation:
         self.n_steps = int(math.ceil(self.run_time / self.dt))
 
         self._build_cpml()
+
+    # ------------------------------------------------------------------ #
+    # Relative permittivity grid. Held as a private array that run() releases
+    # once the E-update coefficient has been derived from it (see __init__);
+    # the property regenerates it from grid + structures if accessed while
+    # released, so `sim.eps_r` behaves as a plain attribute to callers while
+    # not sitting resident alongside ce_field during a large-volume run.
+    # ------------------------------------------------------------------ #
+    def _materialize_eps_r(self) -> np.ndarray:
+        eps = np.ones(self.grid.shape, dtype=self.dtypes["eps_r"])
+        for s in self.structures:
+            s.stamp(self.grid, eps)
+        self._eps_r = eps
+        return eps
+
+    @property
+    def eps_r(self) -> np.ndarray:
+        if self._eps_r is None:
+            self._materialize_eps_r()
+        return self._eps_r
+
+    @eps_r.setter
+    def eps_r(self, value) -> None:
+        # Allow callers to stamp a custom permittivity grid. Once set
+        # explicitly it is no longer regenerated from `structures`, and run()
+        # will not release it (there would be no way to reconstruct it).
+        self._eps_r = value
+        self._eps_r_custom = True
 
     # ------------------------------------------------------------------ #
     # Attach sources / monitors after construction. Useful when the
@@ -552,7 +596,32 @@ class Simulation:
         self._b_h = bh; self._c_h = ch
 
     # ------------------------------------------------------------------ #
-    def run(self) -> Result:
+    def run(self, out_of_core: bool = False, tile_cells: Optional[int] = None,
+            ooc_workdir: Optional[str] = None) -> Result:
+        """Time-step the simulation and return the recorded monitor data.
+
+        Parameters
+        ----------
+        out_of_core : bool
+            If True, stream the field arrays to disk and step the domain in
+            slabs along axis 0 so peak RAM is bounded by ``tile_cells`` planes
+            rather than the whole grid (see :mod:`photonfdtd.outofcore`). Only
+            the NumPy backend, a single uniform precision, point/soft sources
+            and ``FieldMonitor`` (incl. ``compression=``) are supported in this
+            mode; other backends / monitors / sources raise a clear error.
+        tile_cells : int, optional
+            Planes held in RAM per tile when ``out_of_core`` (default: ~1/8 of
+            the x-extent, at least 1). Smaller = less RAM, more sweeps.
+        ooc_workdir : str, optional
+            Directory for the temporary memmap files (default: a fresh temp dir
+            removed at the end).
+        """
+        if out_of_core:
+            from .outofcore import run_out_of_core
+            if tile_cells is None:
+                tile_cells = max(self.grid.shape[0] // 8, 1)
+            return run_out_of_core(self, tile_cells, workdir=ooc_workdir)
+
         xp = self._xp          # numpy or cupy
         nx, ny, nz = self.grid.shape
         dx, dy, dz = (d if d > 0 else 1.0 for d in self.grid.cell_size)
@@ -599,6 +668,15 @@ class Simulation:
         ce_field = (dt / (xp.asarray(self.eps_r) * EPS_0)).astype(eps_dtype, copy=False)
         ch_field = dt_["Hx"](dt / MU_0)        # for H updates (mu_r = 1)
 
+        # eps_r is not referenced again in the time loop - ce_field carries all
+        # the per-cell material information the stepper needs. Release the
+        # full-domain eps_r array so it does not remain resident alongside
+        # ce_field (and the six field arrays) for the whole run; it is
+        # regenerated from grid + structures on demand via the eps_r property.
+        # A caller-supplied custom grid cannot be reconstructed, so keep it.
+        if not self._eps_r_custom:
+            self._eps_r = None
+
         # Monitor bookkeeping.
         result = Result(times=np.arange(n_steps) * dt)
         # Snapshots are written straight into a preallocated (n_rec, *snap) array
@@ -612,11 +690,14 @@ class Simulation:
         rec_n: Dict[str, int] = {}      # total rows to record (known up front)
         rec_count: Dict[str, int] = {}  # rows recorded so far (next write index)
         rec_zslice: Dict[str, slice] = {}  # single-plane restriction (plane_z), else whole z
+        rec_codec: Dict[str, object] = {}  # compression codec for streamed monitors
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
                 rec_fields[m.name] = {c: None for c in m.components}
                 rec_times[m.name] = []
                 rec_count[m.name] = 0
+                if m.compression is not None:
+                    rec_codec[m.name] = get_codec(m.compression)
                 if m.times is not None:
                     rec_step_list[m.name] = {int(round(t / dt)) for t in m.times}
                 else:
@@ -632,6 +713,25 @@ class Simulation:
             elif isinstance(m, FluxMonitor):
                 result.flux[m.name] = 0.0
 
+        # DFTMonitor bookkeeping: a running Fourier transform accumulated in
+        # complex128 on the backend. Storage is (n_freq, *snap) per component -
+        # independent of the number of timesteps, unlike a FieldMonitor.
+        dft_accum: Dict[str, Dict[str, Optional[object]]] = {}
+        dft_omega: Dict[str, np.ndarray] = {}      # angular frequencies (rad/s)
+        dft_steps: Dict[str, set] = {}
+        dft_zslice: Dict[str, slice] = {}
+        for m in self.monitors:
+            if isinstance(m, DFTMonitor):
+                dft_accum[m.name] = {c: None for c in m.components}
+                dft_omega[m.name] = 2.0 * np.pi * np.asarray(m.freqs, dtype=np.float64)
+                dft_steps[m.name] = set(range(0, n_steps, m.interval))
+                result.dft_freqs[m.name] = np.asarray(m.freqs, dtype=np.float64)
+                if m.plane_z is not None:
+                    zi = int(np.argmin(np.abs(np.asarray(self.grid.coords[2]) - m.plane_z)))
+                    dft_zslice[m.name] = slice(zi, zi + 1)
+                else:
+                    dft_zslice[m.name] = slice(None)
+
         # Pre-locate source cells.
         source_cells = [(src, *self.grid.index_at(src.position)) for src in self.sources]
 
@@ -646,20 +746,37 @@ class Simulation:
         # taken on the backend (so the GPU transfers only the kept subset), then
         # copied into the destination row by assignment - no per-step list growth
         # and no end-of-run np.stack.
+        comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez, "Hx": Hx, "Hy": Hy, "Hz": Hz}
+
+        # Backend (possibly strided/plane-restricted) view of one component,
+        # shared by the time-domain and DFT recording paths.
+        def snap_view(field, ds, zsl):
+            if zsl != slice(None):
+                return field[::ds, ::ds, zsl]
+            if ds > 1:
+                return field[::ds, ::ds, ::ds]
+            return field
+
         def record_monitor(m, step):
-            comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez, "Hx": Hx, "Hy": Hy, "Hz": Hz}
             ds = m.downsample
             zsl = rec_zslice[m.name]
             idx = rec_count[m.name]
             store = rec_fields[m.name]
+            compressed = m.compression is not None
             for c in m.components:
-                snap = comps[c]
-                if zsl != slice(None):
-                    snap = snap[::ds, ::ds, zsl]
-                elif ds > 1:
-                    snap = snap[::ds, ::ds, ::ds]
-                snap = to_cpu(snap)
+                snap = to_cpu(snap_view(comps[c], ds, zsl))
                 arr = store[c]
+                if compressed:
+                    # Stream this frame to a disk-backed compressed series so
+                    # snapshots never accumulate in RAM. The series is created
+                    # lazily on the first frame (snapshot shape now known).
+                    if arr is None:
+                        arr = CompressedFieldSeries(snap.shape, mon_dtype,
+                                                    rec_codec[m.name],
+                                                    bits=m.compression_bits)
+                        store[c] = arr
+                    arr.append(snap)
+                    continue
                 if arr is None:
                     # Stored in the 'monitors' dtype (independent of the field's
                     # own precision), so monitor memory can be halved even on a
@@ -669,6 +786,31 @@ class Simulation:
                 arr[idx] = snap      # assignment copies/casts into the preallocated row
             rec_times[m.name].append(step * dt)
             rec_count[m.name] += 1
+
+        # Accumulate one step into a DFTMonitor's running transform. Each
+        # component is sampled at its own Yee time (E at t_e, H at t_h) so the
+        # E/H relative phase is physical. Kept on the backend (stays on-device
+        # for CuPy) and in complex128 to bound accumulation drift over long runs.
+        # The (n_freq, *snap) accumulator holds all spectral information in place
+        # of the O(n_steps) snapshots a FieldMonitor would store.
+        def record_dft(m, t_e, t_h):
+            ds = m.downsample
+            zsl = dft_zslice[m.name]
+            omega = dft_omega[m.name]
+            store = dft_accum[m.name]
+            for c in m.components:
+                snap = snap_view(comps[c], ds, zsl)
+                t = t_e if c[0] == "E" else t_h
+                # exp(+i*omega*t) per frequency, broadcast over the snapshot axes.
+                phase = xp.asarray(np.exp(1j * omega * t))
+                phase = phase.reshape((-1,) + (1,) * snap.ndim)
+                acc = store[c]
+                if acc is None:
+                    acc = xp.zeros((omega.size,) + tuple(snap.shape),
+                                   dtype=xp.complex128)
+                    store[c] = acc
+                # F(omega) += f(t) * exp(i*omega*t) * dt  (trapezoid-free Riemann sum)
+                acc += phase * snap[None, ...] * dt
 
         # ============================================================== #
         # Helpers for axis-aware finite differences (uniform-grid central)
@@ -765,6 +907,24 @@ class Simulation:
                     terms.append((ax, src, other_ax, sign, blocks))
                 bucket.append((F, region, K_region, k_scalar, is_E, terms))
 
+        # Shared scratch for the bulk curl, reused across all six component
+        # updates and every timestep, so the vectorized path allocates no
+        # per-step full-domain `curl` / `K*curl` temporaries - only the two
+        # forward-difference derivatives (needed as views by the PML slab
+        # correction) are transient. On a large volume this trims the stepper's
+        # peak by roughly one full-domain array and eliminates per-step
+        # allocation churn. Enabled only when every stepping array shares one
+        # dtype (the common case - a string `precision`); a mixed-precision
+        # dict falls back to the allocating path. The scratch path is
+        # bit-for-bit identical to it: cbuf = dA - dB == dA + (-dB), then
+        # cbuf *= K reproduces K*curl exactly.
+        # Set PHOTONFDTD_NO_SCRATCH=1 to force the allocating path (benchmarking
+        # / parity debugging); results are identical either way.
+        _compute_dtypes = {dt_[k] for k in _FIELD_KEYS} | {eps_dtype}
+        use_scratch = (not self.use_numba) and len(_compute_dtypes) == 1 \
+            and not os.environ.get("PHOTONFDTD_NO_SCRATCH")
+        curl_scratch = xp.empty(gshape, dtype=dt_["Ex"]) if use_scratch else None
+
         def apply_update(vlist):
             for F, region, K_region, k_scalar, is_E, terms in vlist:
                 derivs = []
@@ -776,17 +936,46 @@ class Simulation:
                         d = d[tuple(osl)]
                     derivs.append(d)
                 # bulk curl (no psi)
-                curl = None
-                for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
-                    if d is None:
+                if use_scratch:
+                    # Accumulate dA - dB in place into a shared buffer, then fold
+                    # in the E/H coefficient and add to the field - no new
+                    # full-domain temporaries.
+                    cbuf = curl_scratch[region]
+                    empty = True
+                    for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
+                        if d is None:
+                            continue
+                        if empty:
+                            if sign > 0:
+                                xp.copyto(cbuf, d)
+                            else:
+                                xp.negative(d, out=cbuf)
+                            empty = False
+                        elif sign > 0:
+                            xp.add(cbuf, d, out=cbuf)
+                        else:
+                            xp.subtract(cbuf, d, out=cbuf)
+                    if empty:
                         continue
-                    contrib = d if sign > 0 else -d
-                    curl = contrib if curl is None else curl + contrib
-                if curl is None:
-                    continue
-                Freg = F[region]
-                Freg += (K_region * curl) if is_E else (k_scalar * curl)
-                # PML correction on the thin slabs only
+                    Freg = F[region]
+                    if is_E:
+                        xp.multiply(cbuf, K_region, out=cbuf)
+                    else:
+                        xp.multiply(cbuf, k_scalar, out=cbuf)
+                    Freg += cbuf
+                else:
+                    curl = None
+                    for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
+                        if d is None:
+                            continue
+                        contrib = d if sign > 0 else -d
+                        curl = contrib if curl is None else curl + contrib
+                    if curl is None:
+                        continue
+                    Freg = F[region]
+                    Freg += (K_region * curl) if is_E else (k_scalar * curl)
+                # PML correction on the thin slabs only (uses the derivative
+                # views and psi state; independent of the bulk-curl temporary).
                 for (ax, src, other_ax, sign, blocks), d in zip(terms, derivs):
                     if d is None:
                         continue
@@ -839,6 +1028,9 @@ class Simulation:
                     if isinstance(m, FieldMonitor):
                         if step in rec_step_list[m.name]:
                             record_monitor(m, step)
+                    elif isinstance(m, DFTMonitor):
+                        if step in dft_steps[m.name]:
+                            record_dft(m, t_e, t_h)
                 if self.verbose and step % max(n_steps // 20, 1) == 0:
                     emax = float(max(abs(Ex).max(), abs(Ey).max(), abs(Ez).max()))
                     print(f"  step {step}/{n_steps}  t={step*dt*1e15:6.1f} fs  |E|max={emax:.3e}")
@@ -874,6 +1066,9 @@ class Simulation:
                 if isinstance(m, FieldMonitor):
                     if step in rec_step_list[m.name]:
                         record_monitor(m, step)
+                elif isinstance(m, DFTMonitor):
+                    if step in dft_steps[m.name]:
+                        record_dft(m, t_e, t_h)
                 elif isinstance(m, FluxMonitor):
                     result.flux[m.name] += _flux_through_plane(
                         m, self.grid, Ex, Ey, Ez, Hx, Hy, Hz
@@ -889,6 +1084,9 @@ class Simulation:
         for m in self.monitors:
             if isinstance(m, FieldMonitor):
                 if rec_count[m.name] > 0:
+                    if m.compression is not None:
+                        for c in m.components:          # flush disk-backed frames
+                            rec_fields[m.name][c].finalize()
                     result.fields[m.name] = {
                         c: rec_fields[m.name][c] for c in m.components
                     }
@@ -897,6 +1095,13 @@ class Simulation:
                     result.fields[m.name] = {c: np.zeros((0,) + self.grid.shape)
                                              for c in m.components}
                     result.monitor_times[m.name] = np.array([])
+            elif isinstance(m, DFTMonitor):
+                out = {}
+                for c in m.components:
+                    acc = dft_accum[m.name][c]
+                    out[c] = to_cpu(acc) if acc is not None else \
+                        np.zeros((len(m.freqs),) + self.grid.shape, dtype=np.complex128)
+                result.dft[m.name] = out
         return result
 
 
