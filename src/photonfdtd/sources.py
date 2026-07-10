@@ -337,6 +337,102 @@ class ModeSource:
         return dipoles
 
 
+@dataclass
+class UniModeSource:
+    """Unidirectional waveguide-mode source (equivalence-principle current sheets).
+
+    Launches a solved waveguide mode in ONE direction by co-locating an electric
+    and a magnetic surface-current sheet on the injection plane (Love / Huygens
+    equivalence): with electric current ``J = n_hat x H_m`` and magnetic current
+    ``M = -n_hat x E_m`` the forward radiation adds and the backward radiation
+    cancels, unlike the bidirectional soft :class:`ModeSource`. Clean one-way
+    launch is what makes a reflection (S11) measurement well posed.
+
+    The sheets are emitted as additive soft sources (electric on the transverse
+    E components, magnetic on the transverse H components a half Yee-cell / half
+    time-step downstream, which the stepper already staggers). For propagation
+    along x (n_hat = x_hat):
+
+        A(Ey) =  C/(eps0*eps_r) * H_mz     A(Ez) = -C/(eps0*eps_r) * H_my
+        A(Hy) = -s * C/mu0 * E_mz          A(Hz) =  s * C/mu0 * E_my
+
+    with ``s=+1`` for +x and ``s=-1`` for -x. The eps0/mu0 factors set the
+    electric-vs-magnetic ratio that produces the cancellation; ``C`` is an
+    overall scale (S-parameters normalise it out by also measuring the input).
+
+    Parameters
+    ----------
+    center, size : 3-tuples (m)
+        Injection-plane geometry; the zero-size axis is the propagation axis.
+    waveform : GaussianPulse
+        Temporal pulse.
+    mode : ModeResult
+        A full-vectorial mode solved on the SAME transverse (y, z) grid as the
+        plane (same cell size and extent, centred). Provides Ey/Ez/Hy/Hz and the
+        cross-section eps_r.
+    mode_index : int
+        Which solved mode to launch.
+    direction : str
+        '+x' or '-x' (only x propagation is supported).
+    amplitude : float
+        Overall scale ``C``.
+    """
+    center: Tuple[float, float, float]
+    size: Tuple[float, float, float]
+    waveform: GaussianPulse
+    mode: "object"
+    mode_index: int = 0
+    direction: str = "+x"
+    amplitude: float = 1.0
+
+    def expand(self, grid: "Grid") -> List[PointDipole]:
+        if self.direction not in ("+x", "-x"):
+            raise ValueError("UniModeSource supports direction '+x' or '-x'")
+        s = 1.0 if self.direction == "+x" else -1.0
+        center = list(self.center) + [0.0] * (3 - len(self.center))
+        m = self.mode
+        i = self.mode_index
+
+        # Transverse mode fields, phase-aligned so the transverse components are
+        # (essentially) real and in phase - as they are for a lossless
+        # propagating mode - then taken real for a real-valued time source.
+        Ey, Ez = np.asarray(m.Ey[i]), np.asarray(m.Ez[i])
+        Hy, Hz = np.asarray(m.Hy[i]), np.asarray(m.Hz[i])
+        k = int(np.argmax(np.abs(Ey) + np.abs(Ez)))
+        phase = np.exp(-1j * np.angle((Ey.ravel() + Ez.ravel())[k]))
+        Ey, Ez, Hy, Hz = (np.real(f * phase) for f in (Ey, Ez, Hy, Hz))
+        eps = np.asarray(m.eps_r)
+        my, mz = np.asarray(m.y), np.asarray(m.z)          # mode transverse coords
+
+        # Map each mode cell to the nearest sim plane cell (grids expected to
+        # match; nearest-cell tolerates small offsets).
+        yc, zc = grid.coords[1], grid.coords[2]
+        xc = grid.coords[0]
+        i_x = 0 if xc.size == 1 else int(np.argmin(np.abs(xc - center[0])))
+
+        C = float(self.amplitude)
+        specs = [
+            ("Ey", C / (EPS_0 * eps) * Hz),
+            ("Ez", -C / (EPS_0 * eps) * Hy),
+            ("Hy", -s * C / MU_0 * Ez),
+            ("Hz", s * C / MU_0 * Ey),
+        ]
+        dipoles: List[PointDipole] = []
+        for jy in range(my.size):
+            iy = 0 if yc.size == 1 else int(np.argmin(np.abs(yc - (center[1] + my[jy]))))
+            for jz in range(mz.size):
+                iz = 0 if zc.size == 1 else int(np.argmin(np.abs(zc - (center[2] + mz[jz]))))
+                pos = (float(xc[i_x] if xc.size > 1 else center[0]),
+                       float(yc[iy] if yc.size > 1 else center[1]),
+                       float(zc[iz] if zc.size > 1 else center[2]))
+                for comp, amp in specs:
+                    a = float(amp[jy, jz])
+                    if a != 0.0:
+                        dipoles.append(PointDipole(position=pos, component=comp,
+                                                   waveform=self.waveform, amplitude=a))
+        return dipoles
+
+
 def _profile_l2(profile: np.ndarray,
                 profile_coords: Tuple[np.ndarray, ...]) -> float:
     r"""Integral of \|profile\|^2 over the spatial coords.

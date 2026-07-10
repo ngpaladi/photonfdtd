@@ -116,3 +116,34 @@ def test_waveguide_s21_energy_conserving():
     a1p, _ = pf.s_parameters(res, "p1", mr, 0, dA)
     a2p, _ = pf.s_parameters(res, "p2", mr, 0, dA)
     assert abs(a2p[0] / a1p[0]) == pytest.approx(1.0, abs=0.05)
+
+
+@pytest.mark.slow
+def test_unidirectional_source_extinction():
+    """UniModeSource launches predominantly one way: backward amplitude is far
+    below forward, unlike the bidirectional soft ModeSource (~0 dB)."""
+    pytest.importorskip("jax")
+    lam = 1.55e-6
+    f0 = pf.C_0 / lam
+    dy = dz = 40e-9
+    Ly, Lz = 2.0e-6, 1.4e-6
+    _, mr = _wg_mode(dy, dz, Ly, Lz)
+    core = pf.Box(center=(0, 0, 0), size=(12e-6, 0.45e-6, 0.22e-6),
+                  medium=pf.Medium.from_index(3.48))
+    grid = pf.Grid(size=(8e-6, Ly, Lz), cell_size=(dy, dy, dz),
+                   pml_layers=(10, 10, 10))
+    src = pf.UniModeSource(center=(0, 0, 0), size=(0, Ly, Lz),
+                           waveform=pf.GaussianPulse(freq0=f0, fwhm=10e-15),
+                           mode=mr, direction="+x")
+    up = pf.DFTMonitor(name="up", components=("Ey", "Ez", "Hy", "Hz"),
+                       freqs=[f0], plane_axis="x", plane_position=-1.5e-6)
+    dn = pf.DFTMonitor(name="dn", components=("Ey", "Ez", "Hy", "Hz"),
+                       freqs=[f0], plane_axis="x", plane_position=1.5e-6)
+    sim = pf.Simulation(grid, structures=[core], sources=[src],
+                        monitors=[up, dn], run_time=220e-15, use_jax=True)
+    res = sim.run()
+    dA = dy * dz
+    fwd, _ = pf.s_parameters(res, "dn", mr, 0, dA)   # forward, downstream
+    _, back = pf.s_parameters(res, "up", mr, 0, dA)  # backward, upstream
+    # Backward amplitude at least ~10 dB below forward (bidirectional is 0 dB).
+    assert abs(back[0]) / abs(fwd[0]) < 0.3

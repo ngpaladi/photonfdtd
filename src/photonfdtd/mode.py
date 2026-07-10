@@ -120,6 +120,9 @@ class ModeResult:
     Hy: Optional[np.ndarray] = None
     Hz: Optional[np.ndarray] = None
     fields: Optional[dict] = None
+    #: Cross-section relative permittivity (ny, nz) - used by a unidirectional
+    #: mode source to weight the equivalence electric-current sheet by 1/eps.
+    eps_r: Optional[np.ndarray] = None
 
 
 class ModeSolver:
@@ -343,6 +346,7 @@ class ModeSolver:
             wavelength=self.wavelength, n_eff=n_eff, psi=psi,
             y=self.y, z=self.z,
             Ex=Ex, Ey=Ey, Ez=Ez, Hx=Hx, Hy=Hy, Hz=Hz, fields=fields,
+            eps_r=self.eps_r.copy(),
         )
 
     # ------------------------------------------------------------------ #

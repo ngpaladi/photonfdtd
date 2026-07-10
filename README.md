@@ -120,6 +120,13 @@ print(result.n_eff)            # array of effective indices
   grid**. Reproduces the in-core result to machine precision. NumPy backend,
   point sources and `FieldMonitor` (incl. `compression=`) supported; see
   `photonfdtd.outofcore`.
+- **Differentiable PIC inverse design.** A substrate/etched-core/cladding stack
+  driven by a 2-D etch density `ρ(x,y)` (`EtchedCore`) maps — conic filter →
+  `tanh` projection → anisotropic subpixel sidewalls → 3-D ε — entirely in JAX,
+  so `value_and_grad_density` returns `d(loss)/d(ρ)` through the full time
+  evolution (topology optimization; gradient matches finite differences to
+  ~1e-8). Ports are launched one-way with `UniModeSource` (equivalence-principle
+  current sheets). See [`docs/accuracy.rst`](docs/accuracy.rst).
 - **Mode-decomposition S-parameters** (`s_parameters`, `mode_amplitudes`):
   project the frequency-domain fields on a memory-light port plane (any axis via
   `DFTMonitor(plane_axis=..., plane_position=...)`) onto a solved mode to get

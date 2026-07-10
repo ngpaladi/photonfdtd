@@ -138,6 +138,36 @@ runs on NumPy/CuPy/JAX and — evaluated on JAX DFT outputs inside a loss — ma
 ``|S_ij|**2`` **differentiable** through the time-domain adjoint (the mode is a
 constant), which is the figure of merit for inverse design.
 
+Inverse design (differentiable etched-core PIC)
+-----------------------------------------------
+
+The pieces above compose into gradient-based photonic-integrated-circuit
+design. The device is a substrate / etched-core / cladding stack whose *design
+variable is a 2-D density* ``rho(x, y)`` extruded through the fixed core
+thickness (:class:`~photonfdtd.EtchedCore`): ``rho`` is passed through a conic
+density filter (minimum feature size), a ``tanh`` projection (toward a binary,
+fabricable pattern), and anisotropic subpixel-smoothed vertical sidewalls to a
+3-D permittivity tensor — all in JAX.
+
+A waveguide port is launched one-way with a :class:`~photonfdtd.UniModeSource`
+(equivalence-principle electric + magnetic current sheets; validated backward
+extinction well below the bidirectional soft source), and the objective is a
+mode-overlap S-parameter (above). Because every stage is differentiable,
+:func:`~photonfdtd.value_and_grad_density` returns ``d(loss)/d(rho)`` through
+the whole time evolution — a topology-optimization gradient validated against
+finite differences to ~1e-8 (``tests/test_design.py``) — with adjoint memory
+bounded by the gradient checkpointing below. The design variable is 2-D, so the
+gradient reduces over the core z-layers to ``(nx, ny)``, orders of magnitude
+smaller than a 3-D design grid.
+
+.. code-block:: python
+
+   ec = pf.EtchedCore(eps_solid=3.48**2, eps_void=1.44**2,
+                      eps_sub=1.44**2, eps_clad=1.0, core_z=(-0.11e-6, 0.11e-6),
+                      filter_radius=140e-9, beta=8.0)
+   loss = lambda out: -abs(mode_overlap(out))**2          # e.g. -|S21|^2
+   value, grad = pf.value_and_grad_density(sim, ec, rho, loss)  # grad is (nx, ny)
+
 Memory notes
 ------------
 

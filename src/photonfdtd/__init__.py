@@ -27,7 +27,7 @@ from .materials import (
 from . import materials
 from .geometry import Box, PolySlab
 from .sources import (
-    GaussianPulse, PointDipole, ModeSource, SinglePhotonSource,
+    GaussianPulse, PointDipole, ModeSource, UniModeSource, SinglePhotonSource,
     ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
 from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
@@ -38,6 +38,9 @@ from .simulation import Simulation
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
+from .design import (
+    EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
+)
 from . import adapters
 from .adapters import from_gdsfactory
 
@@ -46,13 +49,15 @@ __all__ = [
     "Grid", "Medium", "DispersiveMedium", "Pole", "materials",
     "silica", "silicon", "silicon_nitride", "lithium_niobate", "gold", "silver",
     "Box", "PolySlab",
-    "GaussianPulse", "PointDipole", "ModeSource", "SinglePhotonSource",
+    "GaussianPulse", "PointDipole", "ModeSource", "UniModeSource",
+    "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "CompressedFieldSeries",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "mode_amplitudes", "port_fields", "s_parameters",
+    "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

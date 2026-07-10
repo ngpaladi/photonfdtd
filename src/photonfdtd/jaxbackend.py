@@ -720,3 +720,54 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)
     return float(val), np.asarray(grad)
+
+
+def _out_dict(sf, sd, sfx, plans):
+    """Assemble the loss-facing monitor-output dict (JAX arrays)."""
+    n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
+    return {
+        "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},
+        "dft": {n: {c: sd[n][c] for c in sd[n]} for n in sd},
+        "flux": {n: sfx[n] for n in sfx},
+    }
+
+
+def value_and_grad_params(sim, ce_of_params, params, loss,
+                          remat="nested", checkpoint_levels=2):
+    """Differentiate a monitor loss w.r.t. arbitrary design ``params``.
+
+    ``ce_of_params(params)`` must return a dict ``{'Ex','Ey','Ez'}`` of
+    per-component E-update coefficients (JAX arrays) built symbolically from
+    ``params`` - e.g. a density field mapped through filtering, projection and
+    subpixel smoothing to a permittivity tensor (see
+    :mod:`photonfdtd.design`). ``jax.grad`` then flows the loss back through the
+    whole time evolution to ``params`` - true topology / shape optimization,
+    not just per-cell eps. Returns ``(value, grad_params)`` (``grad_params`` a
+    JAX array matching ``params``).
+
+    The subpixel per-component coefficient path is used, so a plain
+    ``Simulation`` (``subpixel=False``) is fine; dispersion is not supported here
+    (the pole state is not parameterized by ``params``).
+    """
+    import jax
+    import jax.numpy as jnp
+
+    _validate(sim)
+    if getattr(sim, "_has_dispersion", False):
+        raise NotImplementedError(
+            "value_and_grad_params does not support dispersive media.")
+    _enable_x64_if_needed(sim)
+    static = _build_static(sim)
+    plans = _monitor_plan(sim)
+    pplans = _particle_plan(sim, static)
+
+    def loss_of_params(params):
+        ce_e = ce_of_params(params)
+        sf, sd, sfx = _device_simulate(
+            sim, static, plans, ce_e, pplans, ade=None,
+            ce_particle=ce_e["Ex"], remat=remat,
+            checkpoint_levels=checkpoint_levels)
+        return loss(_out_dict(sf, sd, sfx, plans))
+
+    val, grad = jax.value_and_grad(loss_of_params)(params)
+    return float(val), grad
