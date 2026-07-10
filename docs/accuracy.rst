@@ -198,9 +198,13 @@ intrinsic size:
   returns to machine precision, the gradient matches the plain reverse pass to
   ~1e-15, and peak memory measured **14x below the plain adjoint and ~4x below
   checkpointing** on a ~1800-step 3-D run (``tests/test_reversible.py``).
-  Absorbing-boundary (PML) support - reconstruct the interior while storing only
-  the thin PML shell per step - is designed and is the next extension for
-  waveguide-port PIC runs.
+  A PML variant (:func:`~photonfdtd.jax_value_and_grad_eps_reversible_pml`)
+  reconstructs the interior while replaying a per-step PML-shell tape; it is
+  validated to give the exact gradient WITH CPML, but note the honest caveat:
+  the shell tape is O(shell * n_steps), so it only beats checkpointing when the
+  PML shell is a small fraction of the volume (roughly <5%), which realistic 3-D
+  geometries (~14-60% shell) rarely satisfy - for a typical PML PIC run,
+  ``remat="nested"`` checkpointing is the practical memory tool.
 * **Planning large runs.** :func:`~photonfdtd.estimate_memory` /
   :func:`~photonfdtd.recommend_mode` / :func:`~photonfdtd.format_report`
   estimate the peak bytes of each execution mode (forward, the three adjoints,

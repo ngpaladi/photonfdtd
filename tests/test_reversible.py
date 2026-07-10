@@ -60,6 +60,48 @@ def test_reversible_gradient_matches_plain():
     assert np.abs(g_ref - g_rev).max() / np.abs(g_ref).max() < 1e-10
 
 
+def test_reversible_pml_gradient_matches_plain():
+    """The PML-shell reversible adjoint (forward-then-reverse reconstructs the
+    interior; the PML shell is replayed from a per-step tape) gives the exact
+    gradient WITH CPML - validated against the plain reverse pass. (This path is
+    correct but only saves memory for a thin PML shell; see module docstring.)"""
+    from photonfdtd import reversible_pml as rp
+    lam = 1e-6
+    f0 = pf.C_0 / lam
+    dx = lam / 12
+    grid = pf.Grid(size=(2e-6, 2e-6, 1.2e-6), cell_size=dx, pml_layers=(6, 6, 6))
+    box = pf.Box(center=(0, 0, 0), size=(0.7e-6, 0.7e-6, 0.4e-6),
+                 medium=pf.Medium.from_index(2.5))
+    src = pf.PointDipole(position=(-0.4e-6, 0, 0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))
+    mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0])
+    sim = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
+                        run_time=45e-15, use_jax=True)
+
+    # forward-then-reverse returns to the initial state at machine precision.
+    from photonfdtd.jaxbackend import _build_static, _monitor_plan
+    static, plans = _build_static(sim), _monitor_plan(sim)
+    ce = sim.dt / (np.asarray(sim.eps_r) * pf.EPS_0)
+    ce_e = {c: jnp.asarray(ce) for c in ("Ex", "Ey", "Ez")}
+    init, fwd, rev_step, shell_of = rp.make_pml_reversible(sim, static, plans, ce_e)
+    N = sim.n_steps
+    c = init()
+    tape = []
+    for n in range(N):
+        tape.append(shell_of(c))
+        c = fwd(c, ce_e, n)
+    peak = max(float(jnp.abs(c[0][k]).max()) for k in c[0])
+    for n in range(N - 1, -1, -1):
+        c = rev_step(c, tape[n], ce_e, n)
+    assert max(float(jnp.abs(c[0][k]).max()) for k in c[0]) / peak < 1e-11
+
+    loss = lambda out: jnp.sum(jnp.abs(out["dft"]["d"]["Ez"]) ** 2)
+    v_ref, g_ref = pf.jax_value_and_grad_eps(sim, loss, remat="none")
+    v_rev, g_rev = pf.jax_value_and_grad_eps_reversible_pml(sim, loss)
+    assert np.isclose(v_ref, v_rev)
+    assert np.abs(g_ref - g_rev).max() / np.abs(g_ref).max() < 1e-10
+
+
 def test_reversible_gating():
     """The reversible adjoint refuses cases it cannot handle exactly (PML)."""
     lam = 1e-6

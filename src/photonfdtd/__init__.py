@@ -39,6 +39,9 @@ from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .reversible import (
     value_and_grad_eps_reversible as jax_value_and_grad_eps_reversible,
 )
+from .reversible_pml import (
+    value_and_grad_eps_reversible_pml as jax_value_and_grad_eps_reversible_pml,
+)
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
 from .design import (
@@ -60,10 +63,11 @@ __all__ = [
     "CompressedFieldSeries",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "jax_value_and_grad_eps_reversible",
+    "jax_value_and_grad_eps_reversible_pml",
     "mode_amplitudes", "port_fields", "s_parameters",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
     "estimate_memory", "recommend_mode", "format_report",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
