@@ -30,27 +30,27 @@ class Box:
         s = _to3(self.size)
         return tuple((ci - si / 2, ci + si / 2) for ci, si in zip(c, s))
 
-    def stamp(self, grid: Grid, eps_r: np.ndarray) -> None:
-        """Write self.medium.eps_r into the cells whose centres fall inside."""
+    def region_mask(self, grid: Grid) -> np.ndarray:
+        """Boolean array (grid.shape) of cells whose centre falls inside the box."""
         bounds = self._bounds()
-        idx = []
+        mask = np.ones(grid.shape, dtype=bool)
         for axis in range(3):
             coord = grid.coords[axis]
             lo, hi = bounds[axis]
             if coord.size == 1:
-                # collapsed axis: the box must overlap the slice (z=0 plane)
-                if lo <= 0.0 <= hi or (lo == hi == 0.0):
-                    idx.append(np.array([0]))
-                else:
-                    return
+                if not (lo <= 0.0 <= hi or (lo == hi == 0.0)):
+                    return np.zeros(grid.shape, dtype=bool)
+                axis_mask = np.array([True])
             else:
-                mask = (coord >= lo) & (coord <= hi)
-                idx.append(np.flatnonzero(mask))
-                if idx[-1].size == 0:
-                    return
-        # Outer-product indexing
-        ii, jj, kk = np.ix_(idx[0], idx[1], idx[2])
-        eps_r[ii, jj, kk] = self.medium.eps_r
+                axis_mask = (coord >= lo) & (coord <= hi)
+            shape = [1, 1, 1]
+            shape[axis] = axis_mask.size
+            mask &= axis_mask.reshape(shape)
+        return mask
+
+    def stamp(self, grid: Grid, eps_r: np.ndarray) -> None:
+        """Write self.medium.eps_r into the cells whose centres fall inside."""
+        eps_r[self.region_mask(grid)] = self.medium.eps_r
 
 
 @dataclass(frozen=True)
@@ -72,6 +72,38 @@ class PolySlab:
     vertices: Tuple[Tuple[float, float], ...]
     z_bounds: Tuple[float, float]
     medium: Medium
+
+    def region_mask(self, grid: Grid) -> np.ndarray:
+        """Boolean array (grid.shape) of cells whose centre falls inside the slab."""
+        mask = np.zeros(grid.shape, dtype=bool)
+        verts = np.asarray(self.vertices, dtype=float)
+        if verts.ndim != 2 or verts.shape[1] != 2 or verts.shape[0] < 3:
+            raise ValueError("PolySlab.vertices must be a (N>=3, 2) array")
+        z_lo, z_hi = float(self.z_bounds[0]), float(self.z_bounds[1])
+        if z_lo > z_hi:
+            z_lo, z_hi = z_hi, z_lo
+        zc = grid.coords[2]
+        if zc.size == 1:
+            if not (z_lo <= 0.0 <= z_hi):
+                return mask
+            k_idx = np.array([0])
+        else:
+            mz = (zc >= z_lo) & (zc <= z_hi)
+            if not mz.any():
+                return mask
+            k_idx = np.flatnonzero(mz)
+        xc, yc = grid.coords[0], grid.coords[1]
+        nx, ny = xc.size, yc.size
+        from matplotlib.path import Path
+        XX, YY = np.meshgrid(xc, yc, indexing="ij")
+        inside = Path(verts).contains_points(
+            np.column_stack([XX.ravel(), YY.ravel()])).reshape(nx, ny)
+        if not inside.any():
+            return mask
+        ii, jj = np.where(inside)
+        for k in k_idx:
+            mask[ii, jj, k] = True
+        return mask
 
     def stamp(self, grid: Grid, eps_r: np.ndarray) -> None:
         verts = np.asarray(self.vertices, dtype=float)

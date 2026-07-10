@@ -15,7 +15,10 @@ Numerical details
 - The time step is set to 0.99 of the Courant limit by default.
 - Absorbing boundaries are CPML with kappa=1 (Roden & Gedney 2000).
 - Sources are soft additive: they add to one field component at one cell.
-- Materials are non-dispersive isotropic dielectrics (eps_r per cell).
+- Materials are isotropic dielectrics: non-dispersive (eps_r per cell) or
+  dispersive (Lorentz/Drude/Sellmeier poles advanced by the ADE method; see
+  _build_ade / photonfdtd.materials). Anisotropic subpixel smoothing of
+  interfaces is available via Simulation(subpixel=True) (photonfdtd.smoothing).
 
 Yee staggering (all six components live on different sub-grids):
 
@@ -348,6 +351,8 @@ class Simulation:
         use_numba: bool = False,
         use_jax: bool = False,
         precision="float64",
+        subpixel: bool = False,
+        subpixel_factor: int = 3,
     ) -> None:
         # Working dtype(s) for fields, CPML state, coefficients and monitor
         # storage. float32 halves memory and roughly doubles throughput (FDTD is
@@ -384,9 +389,43 @@ class Simulation:
                 "faster for sub-3D grids.",
                 stacklevel=2,
             )
+        # Anisotropic subpixel smoothing of material interfaces (see
+        # photonfdtd.smoothing). Off by default so results are bit-for-bit
+        # unchanged. When on, the E-update uses a per-component (diagonal
+        # permittivity tensor) coefficient instead of one shared scalar; this
+        # is supported on the vectorized NumPy/CuPy path only.
+        self.subpixel = bool(subpixel)
+        self.subpixel_factor = int(subpixel_factor)
+        if self.subpixel and (self.use_numba or self.use_jax):
+            raise ValueError(
+                "subpixel=True is not supported with the Numba or JAX backends "
+                "(their fused kernels assume one scalar per-cell coefficient). "
+                "Use the default NumPy backend or the CuPy GPU backend."
+            )
         self._xp = _get_backend(self.use_gpu)
         self.grid = grid
         self.structures = list(structures)
+        # Dispersive media: any structure whose medium carries poles activates
+        # the auxiliary-differential-equation (ADE) polarization stepping. Only
+        # the vectorized NumPy/CuPy path supports it (the fused Numba/JAX kernels
+        # assume a single instantaneous per-cell coefficient).
+        self._has_dispersion = any(
+            getattr(getattr(s, "medium", None), "is_dispersive", False)
+            for s in self.structures
+        )
+        if self._has_dispersion:
+            if self.use_numba or self.use_jax:
+                raise ValueError(
+                    "Dispersive media are not supported with the Numba or JAX "
+                    "backends; use the default NumPy backend or the CuPy GPU "
+                    "backend."
+                )
+            if self.subpixel:
+                raise NotImplementedError(
+                    "Subpixel smoothing combined with dispersive media is not "
+                    "yet supported. Use one or the other."
+                )
+        self._ade: List[dict] = []
         # Moving current sources (e.g. ChargedParticle) are stepped specially in
         # the time loop rather than expanded into fixed-cell soft dipoles.
         self.particle_sources: List[ChargedParticle] = []
@@ -461,6 +500,131 @@ class Simulation:
             s.stamp(self.grid, eps)
         self._eps_r = eps
         return eps
+
+    def _smoothed_eps_components(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Anisotropic subpixel-smoothed diagonal permittivity (eps_xx, eps_yy,
+        eps_zz), one array per E-field component. Requires structures; a
+        caller-supplied custom scalar eps_r cannot be smoothed (there is no
+        geometry to super-sample) and falls back to that scalar for all three.
+        """
+        from .smoothing import smooth_permittivity
+        if self._eps_r_custom:
+            eps = self.eps_r
+            return (eps, eps, eps)
+        return smooth_permittivity(
+            self.grid, self.structures, background_eps=1.0,
+            factor=self.subpixel_factor, dtype=self.dtypes["eps_r"],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Dispersive-media (ADE) state.
+    #
+    # Each dispersive material occupies a set of cells (built by stamping the
+    # structures in order, later structures overwriting earlier ones). For that
+    # material we hold, over those cells only, the auxiliary polarization P of
+    # every pole at the current and previous time step. Each step advances P by
+    # the central-difference recursion  P^{n+1} = a P^n + b P^{n-1} + c E^n  and
+    # corrects E by the polarization increment (see _ade_apply). This is the
+    # standard ADE-FDTD scheme (Taflove & Hagness, ch. 9).
+    # ------------------------------------------------------------------ #
+    def _build_ade(self, dt: float, xp, eps_dtype) -> None:
+        self._ade = []
+        if not self._has_dispersion:
+            return
+        grid = self.grid
+        # Per-cell dispersive-material id (-1 = background / non-dispersive).
+        id_grid = np.full(grid.shape, -1, dtype=np.int32)
+        media: List = []
+        med_id: Dict[int, int] = {}
+        for s in self.structures:
+            med = getattr(s, "medium", None)
+            mask = s.region_mask(grid)
+            if getattr(med, "is_dispersive", False):
+                key = id(med)
+                if key not in med_id:
+                    med_id[key] = len(media)
+                    media.append(med)
+                id_grid[mask] = med_id[key]
+            else:
+                id_grid[mask] = -1        # a later plain medium overrides
+
+        max_w0dt = 0.0
+        for mid, med in enumerate(media):
+            max_w0dt = max(max_w0dt, med.max_pole_omega() * dt)
+        # Explicit ADE poles are stable only while omega0 * dt < 2 (the discrete
+        # pole stays on the unit circle). Deep-UV Sellmeier / high-energy Lorentz
+        # poles violate this on a grid tuned for near-IR/optical work.
+        if max_w0dt >= 2.0:
+            raise ValueError(
+                f"A dispersive medium has a pole with omega0*dt = {max_w0dt:.2f} "
+                ">= 2, which makes the explicit ADE update unstable at this "
+                "resolution. That pole is too high in frequency for the grid to "
+                "resolve. Options: use a much finer grid (smaller dt), restrict "
+                "the medium to poles inside the simulation band, or if you only "
+                "need the correct index at one wavelength use "
+                "DispersiveMedium.at_wavelength(lambda) to get a fixed-index "
+                "Medium instead."
+            )
+
+        for mid, med in enumerate(media):
+            idx = np.nonzero(id_grid == mid)
+            if idx[0].size == 0:
+                continue
+            n_cells = idx[0].size
+            abc = []
+            for p in med.poles:
+                denom = 1.0 + p.gamma * dt
+                a = (2.0 - p.omega0 ** 2 * dt ** 2) / denom
+                b = (p.gamma * dt - 1.0) / denom
+                c = (EPS_0 * p.strength * dt ** 2) / denom
+                abc.append((a, b, c))
+            bidx = tuple(xp.asarray(i) for i in idx)
+            npole = len(med.poles)
+            Pcur = [[xp.zeros(n_cells, dtype=eps_dtype) for _ in range(3)]
+                    for _ in range(npole)]
+            Pprev = [[xp.zeros(n_cells, dtype=eps_dtype) for _ in range(3)]
+                     for _ in range(npole)]
+            self._ade.append({
+                "idx": bidx,
+                "abc": abc,
+                "Pcur": Pcur,
+                "Pprev": Pprev,
+                "inv_eps": 1.0 / (EPS_0 * med.eps_inf),
+                "En": [None, None, None],
+            })
+
+    def _ade_capture_E(self, E_comps) -> None:
+        """Snapshot E^n over each dispersive region before the curl E-update."""
+        for st in self._ade:
+            idx = st["idx"]
+            for c in range(3):
+                st["En"][c] = E_comps[c][idx].copy()
+
+    def _ade_apply(self, E_comps) -> None:
+        """Advance each pole's polarization and correct E by its increment.
+
+        Runs after the curl E-update, using the captured E^n so the recursion is
+        the intended  P^{n+1} = a P^n + b P^{n-1} + c E^n.
+        """
+        for st in self._ade:
+            idx = st["idx"]
+            inv = st["inv_eps"]
+            abc = st["abc"]
+            Pcur = st["Pcur"]
+            Pprev = st["Pprev"]
+            for c in range(3):
+                En = st["En"][c]
+                delta = None
+                for p, (a, b, cc) in enumerate(abc):
+                    pc = Pcur[p][c]
+                    pp = Pprev[p][c]
+                    pnew = a * pc + b * pp + cc * En
+                    incr = pnew - pc
+                    delta = incr if delta is None else delta + incr
+                    Pprev[p][c] = pc
+                    Pcur[p][c] = pnew
+                if delta is not None:
+                    E_comps[c][idx] -= inv * delta
 
     @property
     def eps_r(self) -> np.ndarray:
@@ -623,6 +787,14 @@ class Simulation:
             removed at the end).
         """
         if out_of_core:
+            if self.subpixel:
+                raise NotImplementedError(
+                    "subpixel=True is not yet supported with out_of_core=True."
+                )
+            if self._has_dispersion:
+                raise NotImplementedError(
+                    "Dispersive media are not yet supported with out_of_core=True."
+                )
             from .outofcore import run_out_of_core
             if tile_cells is None:
                 tile_cells = max(self.grid.shape[0] // 8, 1)
@@ -677,6 +849,28 @@ class Simulation:
         # transient full-domain float64 temporaries).
         ce_field = (dt / (xp.asarray(self.eps_r) * EPS_0)).astype(eps_dtype, copy=False)
         ch_field = dt_["Hx"](dt / MU_0)        # for H updates (mu_r = 1)
+
+        # Per-component E-update coefficients. Without subpixel smoothing all
+        # three reference the one scalar ce_field, so the vectorized update is
+        # bit-for-bit identical to the historical single-coefficient path. With
+        # smoothing on, each E component gets the coefficient built from its own
+        # diagonal permittivity tensor entry (eps_xx -> Ex, eps_yy -> Ey,
+        # eps_zz -> Ez); see photonfdtd.smoothing.
+        if self.subpixel:
+            exx, eyy, ezz = self._smoothed_eps_components()
+            ce_comp = tuple(
+                (dt / (xp.asarray(e) * EPS_0)).astype(eps_dtype, copy=False)
+                for e in (exx, eyy, ezz)
+            )
+        else:
+            ce_comp = (ce_field, ce_field, ce_field)
+
+        # Dispersive-media auxiliary state (empty unless a structure is
+        # dispersive). Built here because the pole recursion coefficients depend
+        # on dt. ce_field/ce_comp already carry eps_inf for these cells, so the
+        # curl update is the instantaneous response and the ADE only adds the
+        # pole polarization increment each step.
+        self._build_ade(dt, xp, eps_dtype)
 
         # eps_r is not referenced again in the time loop - ce_field carries all
         # the per-cell material information the stepper needs. Release the
@@ -889,7 +1083,11 @@ class Simulation:
                 region[axB] = _crop(axB, is_E)
                 region = tuple(region)
                 rshape = F[region].shape
-                K_region = ce_field[region] if is_E else None
+                # For E terms the aligned axis _aax is the component index
+                # (Ex->0, Ey->1, Ez->2), so ce_comp[_aax] is that component's
+                # own coefficient (equal to the shared ce_field unless subpixel
+                # smoothing is on).
+                K_region = ce_comp[_aax][region] if is_E else None
                 k_scalar = None if is_E else -ch_field
                 b_src = self._b_e if is_E else self._b_h
                 c_src = self._c_e if is_E else self._c_h
@@ -1058,7 +1256,14 @@ class Simulation:
                 H_map[src.component][i, j, k] += val
 
             # -------- E update (backward differences of H) -------- #
+            if self._ade:
+                # Capture E^n over dispersive regions before the curl update,
+                # so the pole recursion uses the pre-update field.
+                self._ade_capture_E((Ex, Ey, Ez))
             apply_update(vterms_E)
+            if self._ade:
+                # Advance polarization and subtract its increment (dispersion).
+                self._ade_apply((Ex, Ey, Ez))
 
             # -------- E-component sources -------- #
             E_map = {"Ex": Ex, "Ey": Ey, "Ez": Ez}

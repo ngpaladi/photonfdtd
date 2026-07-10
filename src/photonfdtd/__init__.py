@@ -3,11 +3,15 @@
 Capabilities:
 
 - 1D / 2D / 3D Yee-grid FDTD with CPML absorbing boundaries
-- Isotropic non-dispersive dielectric media (per-cell epsilon_r)
+- Isotropic dielectric media, non-dispersive or dispersive (Lorentz / Drude /
+  Sellmeier poles stepped by the ADE method), with a cited material library
+  (SiO2, Si, Si3N4, LiNbO3, Au, Ag)
+- Anisotropic subpixel (sub-cell) smoothing of material interfaces for
+  second-order accuracy at boundaries (``Simulation(subpixel=True)``)
 - Axis-aligned Box and arbitrary-polygon PolySlab geometry primitives
 - Point-dipole, distributed mode, and energy-normalised single-photon sources
 - Field snapshot monitors and a flux monitor through a coordinate plane
-- 2D scalar (Helmholtz) waveguide mode solver
+- Full-vectorial (FDFD) waveguide mode solver
 - :func:`from_gdsfactory` adapter that turns a gdsfactory Component into a
   fully-built Simulation
 
@@ -16,7 +20,11 @@ runs of large 3D problems a compiled or GPU backend is on the roadmap.
 """
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
-from .materials import Medium
+from .materials import (
+    Medium, DispersiveMedium, Pole,
+    silica, silicon, silicon_nitride, lithium_niobate, gold, silver,
+)
+from . import materials
 from .geometry import Box, PolySlab
 from .sources import (
     GaussianPulse, PointDipole, ModeSource, SinglePhotonSource,
@@ -34,7 +42,9 @@ from .adapters import from_gdsfactory
 
 __all__ = [
     "C_0", "EPS_0", "MU_0", "ETA_0", "Q_E", "PLANCK_H",
-    "Grid", "Medium", "Box", "PolySlab",
+    "Grid", "Medium", "DispersiveMedium", "Pole", "materials",
+    "silica", "silicon", "silicon_nitride", "lithium_niobate", "gold", "silver",
+    "Box", "PolySlab",
     "GaussianPulse", "PointDipole", "ModeSource", "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor", "DFTMonitor",

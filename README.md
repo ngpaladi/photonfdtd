@@ -2,8 +2,9 @@
 
 A small, fully-local open-source FDTD + waveguide mode solver written in
 Python/NumPy. It implements a Yee-grid FDTD time-stepper with CPML
-absorbing boundaries and a 2D scalar Helmholtz mode solver, with an API
-intentionally similar in spirit to Tidy3D.
+absorbing boundaries, dispersive materials, anisotropic subpixel smoothing,
+and a full-vectorial waveguide mode solver, with an API intentionally similar
+in spirit to Tidy3D.
 
 This is alpha-stage software (v0.1). The pieces that exist are tested and
 correct; the pieces that don't, don't. See *Status* below.
@@ -78,7 +79,19 @@ print(result.n_eff)            # array of effective indices
   selected automatically.
 - **CPML** absorbing boundaries (Roden & Gedney 2000, kappa = 1) on any
   number of axes.
-- **Isotropic non-dispersive dielectric media** stamped per cell.
+- **Isotropic dielectric media, non-dispersive or dispersive.** Non-dispersive
+  media stamp a single `eps_r` per cell; dispersive media (`DispersiveMedium`,
+  with `.lorentz` / `.drude` / `.sellmeier` constructors) carry Lorentz, Drude
+  and Sellmeier poles advanced by the auxiliary-differential-equation (ADE)
+  method during stepping. A cited material library (`pf.silica()`,
+  `pf.silicon()`, `pf.silicon_nitride()`, `pf.lithium_niobate()`, `pf.gold()`,
+  `pf.silver()`) reproduces each source's published index — see
+  [`docs/material_data.md`](docs/material_data.md).
+- **Anisotropic subpixel smoothing** (`Simulation(subpixel=True)`): partially
+  filled interface cells get an effective diagonal permittivity tensor
+  (harmonic mean normal to the interface, arithmetic mean tangential), removing
+  the staircase error and restoring second-order boundary accuracy
+  (Farjadpour et al. 2006). See [`docs/accuracy.rst`](docs/accuracy.rst).
 - **Geometry primitives**: axis-aligned `Box` and arbitrary-polygon
   `PolySlab` (a polygon in xy extruded between two z bounds).
 - **Sources**: soft point-dipole (`PointDipole`), distributed line/area
@@ -107,7 +120,11 @@ print(result.n_eff)            # array of effective indices
   grid**. Reproduces the in-core result to machine precision. NumPy backend,
   point sources and `FieldMonitor` (incl. `compression=`) supported; see
   `photonfdtd.outofcore`.
-- **2D scalar Helmholtz mode solver** (eigenvalue problem in beta^2).
+- **Full-vectorial waveguide mode solver** (`ModeSolver`): a finite-difference
+  eigenproblem for the transverse fields on the Yee grid that distinguishes TE
+  from TM and captures high-index-contrast boundary effects. Validated against
+  the exact symmetric-slab dispersion to better than 0.01% on both TE0 and TM0
+  (Zhu & Brown 2002; Fallahkhair et al. 2008).
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout
   `Component`, maps its layers onto user-supplied materials, and returns a
   pre-built `Simulation`.
