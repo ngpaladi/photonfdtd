@@ -158,19 +158,22 @@ print(result.n_eff)            # array of effective indices
 
 ### Running on GPU
 
-All three GPU capabilities are validated on an NVIDIA RTX 4080 (CUDA 12):
+**JAX is the GPU backend.** With `use_jax=True` the forward run and the
+differentiable / reversible adjoints run on the GPU automatically once a CUDA
+`jaxlib` is present — no code change: `pip install "jax[cuda12]"`. Validated on
+an NVIDIA RTX 4080 (CUDA 12): forward matches NumPy to ~1e-16, and both adjoints
+run on-device. If JAX falls back to CPU with a "cuSPARSE not found"-style error,
+the nvidia CUDA libraries just aren't on the loader path — add them, e.g.
+`export LD_LIBRARY_PATH=$(python -c "import nvidia,glob,os;print(':'.join(glob.glob(os.path.dirname(nvidia.__file__)+'/*/lib')))")`.
+Large differentiable runs fit in GPU memory thanks to gradient checkpointing and
+the O(1)-memory reversible adjoint (`photonfdtd.reversible`).
 
-- **CuPy backend** (`use_gpu=True`) — in-core stepping on the GPU, bit-identical
-  to CPU. `pip install cupy-cuda12x`.
-- **JAX on GPU** (`use_jax=True`) — the forward run and the differentiable /
-  reversible adjoints run on the GPU automatically once a CUDA `jaxlib` is
-  present (no code change): `pip install "jax[cuda12]"`. If JAX falls back to
-  CPU with a "cuSPARSE not found"-style error, the nvidia CUDA libraries just
-  aren't on the loader path — add them, e.g.
-  `export LD_LIBRARY_PATH=$(python -c "import nvidia,glob,os;print(':'.join(glob.glob(os.path.dirname(nvidia.__file__)+'/*/lib')))")`.
-- **GPU / host / disk out-of-core** (`use_gpu=True` + `run(out_of_core=True)`) —
-  fields live on disk, each tile is processed on the GPU, so peak device memory
-  is one tile: a volume larger than GPU memory still runs.
+The **CuPy backend** (`use_gpu=True`) is a deprecated legacy path — superseded by
+JAX for GPU work, but retained (optional; `pip install cupy-cuda12x`) for
+AMD/ROCm GPUs and for **GPU/host/disk out-of-core** (`use_gpu=True` +
+`run(out_of_core=True)`), where fields live on disk and each tile is processed on
+the GPU so peak device memory is one tile — a volume larger than GPU memory still
+runs (JAX cannot stream to disk).
 
 ## What v0.2 does *not* do (yet)
 

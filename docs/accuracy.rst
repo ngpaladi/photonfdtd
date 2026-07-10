@@ -40,7 +40,7 @@ physical change — the Farjadpour convergence signature.
 References:
 
 * A. Farjadpour *et al.*, "Improving accuracy by subpixel smoothing in the
-  finite-difference time domain," *Opt. Lett.* **31**(20), 2972 (2006).
+  finite-difference time domain," *Opt. Lett.* **31**\ (20), 2972 (2006).
   DOI: 10.1364/OL.31.002972
 * C. A. Kottke, A. Farjadpour, S. G. Johnson, *Phys. Rev. E* **77**, 036611
   (2008). DOI: 10.1103/PhysRevE.77.036611
@@ -222,10 +222,10 @@ intrinsic size:
 References:
 
 * Z. Zhu & T. G. Brown, "Full-vectorial finite-difference analysis of
-  microstructured optical fibers," *Opt. Express* **10**(17), 853 (2002).
+  microstructured optical fibers," *Opt. Express* **10**\ (17), 853 (2002).
   DOI: 10.1364/OE.10.000853
 * A. B. Fallahkhair, K. S. Li, T. E. Murphy, "Vector Finite Difference
   Modesolver for Anisotropic Dielectric Waveguides," *J. Lightwave Technol.*
-  **26**(11), 1423 (2008). DOI: 10.1109/JLT.2008.923643
+  **26**\ (11), 1423 (2008). DOI: 10.1109/JLT.2008.923643
 * R. C. Rumpf, *Electromagnetic and Photonic Simulation for the Beginner:
   FDFD in MATLAB* (Artech House, 2022).

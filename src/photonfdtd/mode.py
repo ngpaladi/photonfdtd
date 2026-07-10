@@ -151,7 +151,7 @@ class ModeSolver:
         Number of modes to return (sorted by descending n_eff).
     polarization : {None, "te", "tm"}, optional
         If given, filter the returned modes to the dominant polarization
-        ("te" -> |Ey| dominant, "tm" -> |Ez| dominant for this y/z convention).
+        ("te" -> ``Ey`` dominant, "tm" -> ``Ez`` dominant for this y/z convention).
         ``None`` (default) returns modes purely by descending n_eff.
     """
 

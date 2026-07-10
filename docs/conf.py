@@ -49,6 +49,11 @@ autodoc_default_options = {
 }
 autodoc_typehints = "description"
 napoleon_use_rtype = False
+# Render "Attributes:" sections as inline :ivar: fields rather than separate
+# attribute directives, so a dataclass's documented attributes don't collide
+# with the autodoc entries for the same fields (duplicate-description warnings,
+# which the -W docs build treats as errors).
+napoleon_use_ivar = True
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),

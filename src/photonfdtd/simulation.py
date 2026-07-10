@@ -363,6 +363,17 @@ class Simulation:
         self.dtypes = _resolve_precision(precision)
         # Representative compute dtype, kept for back-compat (== the Ex dtype).
         self.dtype = self.dtypes["Ex"]
+        # The CuPy in-core GPU backend is superseded by the JAX backend, which
+        # runs on the GPU (via XLA) *and* is differentiable. Prefer use_jax=True
+        # for GPU work; use_gpu (CuPy) is retained as an optional legacy path
+        # (e.g. AMD/ROCm, or GPU out-of-core) and deprecated.
+        if use_gpu:
+            warnings.warn(
+                "use_gpu (CuPy backend) is deprecated in favour of use_jax=True, "
+                "which runs on the GPU through XLA and is differentiable. CuPy is "
+                "kept as an optional legacy path (AMD/ROCm, GPU out-of-core).",
+                DeprecationWarning, stacklevel=2,
+            )
         self.use_gpu = use_gpu and _GPU_AVAILABLE
         self.use_numba = use_numba and _NUMBA_AVAILABLE and not self.use_gpu
         # The JAX backend is a separate functional stepper (see jaxbackend.py);
