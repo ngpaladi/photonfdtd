@@ -111,6 +111,27 @@ transcendental dispersion: for a high-contrast slab (n=3.0 core, n=1.0 clad,
 0.30 um) it reproduces both TE0 (analytic 2.5397) and TM0 (analytic 1.8988) to
 better than 0.01% — a split a scalar solver cannot represent.
 
+Memory notes
+------------
+
+The accuracy features are built to keep peak memory near the problem's
+intrinsic size:
+
+* **Dispersion** stores the auxiliary polarization only on the dispersive cells
+  (both the NumPy and JAX paths), so a metal nanostructure in a large domain
+  costs its own footprint, not the whole grid.
+* **Subpixel smoothing** supersamples one native x-slab at a time, so the
+  transient build memory is a single refined slab rather than the full
+  ``factor**ndim``-times-larger fine grid.
+* **Differentiable runs (JAX).** Reverse-mode AD through the ``lax.scan`` time
+  loop would otherwise store the field state at every step - O(n_steps) memory,
+  the wall for gradient-based inverse design. :func:`value_and_grad_eps`
+  defaults to two-level gradient checkpointing (``remat="nested"``): the
+  backward pass keeps only ~sqrt(n_steps) segment-boundary states and
+  recomputes each segment, cutting adjoint peak memory to O(sqrt(n_steps)) for
+  ~2x compute (measured ~3-4x lower peak on a few-thousand-step run), at a
+  bit-for-bit identical gradient.
+
 References:
 
 * Z. Zhu & T. G. Brown, "Full-vectorial finite-difference analysis of

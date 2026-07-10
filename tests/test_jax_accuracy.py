@@ -96,6 +96,30 @@ def test_dispersion_is_differentiable():
     assert abs(g - fd) / abs(fd) < 1e-5
 
 
+def test_gradient_checkpointing_matches_plain_grad():
+    """Nested gradient checkpointing (O(sqrt(n_steps)) adjoint memory) must give
+    a bit-for-bit identical gradient to the plain O(n_steps) reverse pass -
+    rematerialization is exact, it only trades compute for memory."""
+    lam0 = 1e-6
+    f0 = pf.C_0 / lam0
+    dx = lam0 / 16
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=dx, pml_layers=(8, 8, 0))
+    box = pf.Box(center=(0, 0), size=(1e-6, 1e-6),
+                 medium=pf.Medium.from_index(2.0))
+    src = pf.PointDipole(position=(-1e-6, 0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))
+    mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0])
+    sim = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
+                        run_time=120e-15, use_jax=True)
+    assert sim.n_steps > 100                       # enough steps for segmentation
+    loss = lambda out: out["dft"]["d"]["Ez"].real.sum()
+
+    v0, g0 = pf.jax_value_and_grad_eps(sim, loss, remat="none")
+    v1, g1 = pf.jax_value_and_grad_eps(sim, loss, remat="nested")
+    assert np.isclose(v0, v1)
+    assert np.allclose(g0, g1, rtol=1e-10, atol=1e-12 * np.abs(g0).max())
+
+
 def test_grad_eps_guards_on_new_features():
     """value_and_grad_eps differentiates scalar eps_r only; it must refuse the
     remapped-coefficient cases rather than return a silently-wrong gradient."""

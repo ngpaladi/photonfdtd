@@ -84,29 +84,36 @@ def _fine_grid(grid: Grid, factor: int) -> Grid:
     return Grid(size=size, cell_size=cs, pml_layers=(0, 0, 0))
 
 
-def _supersampled_eps(grid: Grid, structures, background_eps: float,
-                      factor: int) -> np.ndarray:
-    """Rasterise `structures` onto a `factor`x-refined grid (float64)."""
-    fg = _fine_grid(grid, factor)
-    eps = np.full(fg.shape, float(background_eps), dtype=np.float64)
-    for s in structures:
-        s.stamp(fg, eps)
-    return eps
+def _slab_means(grid: Grid, structures, background_eps: float, factor: int):
+    """Arithmetic and harmonic per-cell permittivity means, built one native
+    x-slab at a time so peak memory is a single refined slab rather than the
+    whole ``factor**ndim``-times-larger fine grid.
 
-
-def _block_reduce_mean(fine: np.ndarray, shape: Tuple[int, int, int],
-                       factor: int) -> np.ndarray:
-    """Mean of `fine` over each (factor x factor x factor) native-cell block.
-
-    Active axes were refined by `factor`; collapsed axes have size 1 in both
-    `fine` and `shape` and are reduced by a trivial 1-wide block.
+    Bit-identical to refining the entire domain and block-reducing it: each
+    native cell maps to a fixed contiguous block of fine cells, reduced here in
+    the slab that contains it.
     """
-    nx, ny, nz = shape
+    from types import SimpleNamespace
+    nx, ny, nz = grid.shape
+    fg = _fine_grid(grid, factor)                 # fine coords / spacing only
+    xf, yf, zf = fg.coords
     fx = factor if nx > 1 else 1
     fy = factor if ny > 1 else 1
     fz = factor if nz > 1 else 1
-    r = fine.reshape(nx, fx, ny, fy, nz, fz)
-    return r.mean(axis=(1, 3, 5))
+
+    eps_a = np.empty(grid.shape, dtype=np.float64)
+    eps_h = np.empty(grid.shape, dtype=np.float64)
+    for i in range(nx):
+        xs = xf[i * fx:(i + 1) * fx]
+        duck = SimpleNamespace(shape=(xs.size, yf.size, zf.size),
+                               coords=(xs, yf, zf), cell_size=fg.cell_size)
+        sub = np.full(duck.shape, float(background_eps), dtype=np.float64)
+        for s in structures:
+            sub[s.region_mask(duck)] = s.medium.eps_r
+        r = sub.reshape(1, fx, ny, fy, nz, fz)
+        eps_a[i] = r.mean(axis=(1, 3, 5))[0]
+        eps_h[i] = (1.0 / (1.0 / r).mean(axis=(1, 3, 5)))[0]
+    return eps_a, eps_h
 
 
 def smooth_permittivity(
@@ -127,21 +134,17 @@ def smooth_permittivity(
     Parameters
     ----------
     factor : int
-        Sub-cell supersampling factor per active axis (>= 1). The build cost and
-        transient memory scale as ``factor ** ndim``; 2-4 is plenty for
-        axis-aligned geometry, more only sharpens oblique interfaces. ``1``
-        disables refinement and reproduces plain stamping.
+        Sub-cell supersampling factor per active axis (>= 1). The build cost
+        scales as ``factor ** ndim`` but peak memory only as a single refined
+        x-slab; 2-4 is plenty for axis-aligned geometry, more only sharpens
+        oblique interfaces. ``1`` disables refinement and reproduces plain
+        stamping.
     """
     if factor < 1:
         raise ValueError("factor must be >= 1")
     shape = grid.shape
 
-    fine = _supersampled_eps(grid, structures, background_eps, factor)
-    inv_fine = 1.0 / fine
-
-    eps_a = _block_reduce_mean(fine, shape, factor)          # arithmetic mean
-    eps_h = 1.0 / _block_reduce_mean(inv_fine, shape, factor)  # harmonic mean
-    del fine, inv_fine
+    eps_a, eps_h = _slab_means(grid, structures, background_eps, factor)
 
     # Surface normal from the gradient of the volume-averaged permittivity.
     # In uniform regions eps_a == eps_h so the normal is irrelevant (the tensor
