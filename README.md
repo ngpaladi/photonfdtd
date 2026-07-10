@@ -156,6 +156,22 @@ print(result.n_eff)            # array of effective indices
   gradient-based inverse design / topology optimization**. See
   `photonfdtd.jaxbackend`. (`pip install "photonfdtd[jax]"`.)
 
+### Running on GPU
+
+All three GPU capabilities are validated on an NVIDIA RTX 4080 (CUDA 12):
+
+- **CuPy backend** (`use_gpu=True`) — in-core stepping on the GPU, bit-identical
+  to CPU. `pip install cupy-cuda12x`.
+- **JAX on GPU** (`use_jax=True`) — the forward run and the differentiable /
+  reversible adjoints run on the GPU automatically once a CUDA `jaxlib` is
+  present (no code change): `pip install "jax[cuda12]"`. If JAX falls back to
+  CPU with a "cuSPARSE not found"-style error, the nvidia CUDA libraries just
+  aren't on the loader path — add them, e.g.
+  `export LD_LIBRARY_PATH=$(python -c "import nvidia,glob,os;print(':'.join(glob.glob(os.path.dirname(nvidia.__file__)+'/*/lib')))")`.
+- **GPU / host / disk out-of-core** (`use_gpu=True` + `run(out_of_core=True)`) —
+  fields live on disk, each tile is processed on the GPU, so peak device memory
+  is one tile: a volume larger than GPU memory still runs.
+
 ## What v0.2 does *not* do (yet)
 
 Items below are intentional out-of-scope and tracked in the issue
