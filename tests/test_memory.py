@@ -184,6 +184,29 @@ def _ooc_case():
     return grid, srcs, comps
 
 
+def test_gpu_out_of_core_matches_in_core():
+    """GPU/host/disk hierarchy: with use_gpu the disk-backed tiles are processed
+    on the GPU (CuPy); the result matches the in-core CPU run to ~machine
+    precision. Peak GPU memory is bounded by the tile, so a grid larger than GPU
+    memory still runs. Skipped without a working CuPy/GPU."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        int((cupy.arange(3) + 1).sum())
+    except Exception:                                  # cupy present but no GPU
+        pytest.skip("no working CUDA GPU")
+    grid, srcs, comps = _ooc_case()
+    ref = pf.Simulation(grid, sources=srcs,
+                        monitors=[pf.FieldMonitor(name="m", components=comps, interval=6)],
+                        run_time=30e-15).run()
+    got = pf.Simulation(grid, sources=srcs,
+                        monitors=[pf.FieldMonitor(name="m", components=comps, interval=6)],
+                        run_time=30e-15, use_gpu=True).run(out_of_core=True, tile_cells=4)
+    escale = max(np.abs(ref.fields["m"][c]).max() for c in ("Ex", "Ey", "Ez"))
+    for c in comps:
+        rel = np.abs(ref.fields["m"][c] - got.fields["m"][c]).max() / escale
+        assert rel < 1e-10, f"{c}: GPU-OOC vs in-core rel={rel:.2e}"
+
+
 @pytest.mark.parametrize("tile_cells", [3, 1])
 def test_out_of_core_matches_in_core(tile_cells):
     """Disk-backed tiled stepping reproduces the in-core result to ~machine

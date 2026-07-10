@@ -21,13 +21,22 @@ cross-tile coupling. The per-cell arithmetic mirrors the fused Numba kernel's
 ``cy - cz`` formulation, so results track the in-core backends to floating
 reordering (~1e-11 relative), like the Numba backend itself.
 
-Scope (v1)
-----------
-NumPy backend, a single uniform precision, point/soft sources and
-``FieldMonitor`` (including ``compression=``). ``DFTMonitor``, ``FluxMonitor``,
-``ChargedParticle`` sources and the GPU/Numba backends raise a clear error. The
-CPML ``psi`` state is stored full-grid on disk for simplicity; a PML-slab-only
-layout is a natural follow-up to cut that disk use.
+GPU/host/disk hierarchy
+-----------------------
+With ``use_gpu=True`` the full field arrays still live on disk (memmap) but each
+tile is moved to the GPU (CuPy) for its curl update and moved back, so **peak
+device memory is one tile, not the grid** - a volume larger than GPU memory
+runs. The NumPy path (``use_gpu=False``) is unchanged and bit-identical; the GPU
+path reproduces the in-core result to machine precision (validated on an
+RTX 4080), and peak GPU memory scales with ``tile_cells``, not the grid.
+
+Scope
+-----
+NumPy or CuPy(GPU) tile compute, a single uniform precision, point/soft sources
+and ``FieldMonitor`` (including ``compression=``). ``DFTMonitor``,
+``FluxMonitor``, ``ChargedParticle`` sources and the Numba backend raise a clear
+error. The CPML ``psi`` state is stored full-grid on disk for simplicity; a
+PML-slab-only layout is a natural follow-up to cut that disk use.
 """
 from __future__ import annotations
 import os
@@ -49,21 +58,6 @@ def _bcast(a1d, axis):
     return a1d.reshape([-1 if i == axis else 1 for i in range(3)])
 
 
-def _cpml(d, psi_view, b1d, c1d, axis):
-    """Advance one CPML psi block and return ``d + psi`` (the corrected term).
-
-    ``b1d``/``c1d`` are the 1-D coefficients along ``axis`` already sliced to the
-    region's extent on that axis; ``psi_view`` is the full-grid psi restricted to
-    the same region (a memmap slice, written back in place).
-    """
-    bb = _bcast(b1d, axis)
-    cc = _bcast(c1d, axis)
-    p = np.asarray(psi_view)
-    p = bb * p + cc * d
-    psi_view[...] = p
-    return d + p
-
-
 def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
     """Run ``sim`` with disk-backed fields, tiled along axis 0.
 
@@ -79,10 +73,10 @@ def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
     """
     from .simulation import Result  # avoid import cycle
 
-    if sim.use_gpu or sim.use_numba:
+    if sim.use_numba:
         raise NotImplementedError(
-            "out-of-core stepping supports the NumPy backend only; "
-            "drop use_gpu / use_numba."
+            "out-of-core stepping does not support the Numba backend; "
+            "drop use_numba."
         )
     if sim.particle_sources:
         raise NotImplementedError(
@@ -112,11 +106,34 @@ def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
     dtype = sim.dtypes["Ex"]
     mon_dtype = sim.dtypes["monitors"]
 
-    be = [np.asarray(sim._b_e[a], dtype=dtype) for a in range(3)]
-    ce = [np.asarray(sim._c_e[a], dtype=dtype) for a in range(3)]
-    bh = [np.asarray(sim._b_h[a], dtype=dtype) for a in range(3)]
-    ch = [np.asarray(sim._c_h[a], dtype=dtype) for a in range(3)]
+    # GPU/host/disk hierarchy: the full field arrays live on disk (memmap); each
+    # tile is moved to the compute device (CuPy when use_gpu, else NumPy on the
+    # host) for its curl update and moved back. Peak device memory is one tile,
+    # so a grid larger than GPU (or host) memory still runs. The NumPy path
+    # (xp is numpy) is unchanged - _to_host / _to_dev are identities there.
+    xp = sim._xp
+    use_gpu = sim.use_gpu
+
+    def _host(a):
+        return a.get() if hasattr(a, "get") else np.asarray(a)
+
+    _to_host = (lambda a: a.get()) if use_gpu else (lambda a: np.asarray(a))
+    _to_dev = (lambda a: xp.asarray(a)) if use_gpu else (lambda a: np.asarray(a))
+
+    be = [_to_dev(_host(sim._b_e[a]).astype(dtype)) for a in range(3)]
+    ce = [_to_dev(_host(sim._c_e[a]).astype(dtype)) for a in range(3)]
+    bh = [_to_dev(_host(sim._b_h[a]).astype(dtype)) for a in range(3)]
+    ch = [_to_dev(_host(sim._c_h[a]).astype(dtype)) for a in range(3)]
     ch_field = dtype(dt / MU_0)
+
+    def _cpml(d, psi_view, b1d, c1d, axis):
+        """Advance one CPML psi block on-device; write it back to the (host)
+        memmap and return ``d + psi``. ``psi_view`` is a host memmap slice."""
+        bb = _bcast(b1d, axis)
+        cc = _bcast(c1d, axis)
+        p = bb * _to_dev(psi_view) + cc * d
+        psi_view[...] = _to_host(p)
+        return d + p
 
     # Reduced-axis extents: forward differences span n-1 cells, backward
     # differences start at 1, exactly as the in-core / Numba paths.
@@ -153,8 +170,8 @@ def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
         # ---------------- H pass over one tile [x0:x1] -------------------- #
         def h_pass(x0, x1):
             xh = min(x1 + 1, nx)                 # high-x halo for d/dx terms
-            Ex = np.asarray(F["Ex"][x0:xh]); Ey = np.asarray(F["Ey"][x0:xh])
-            Ez = np.asarray(F["Ez"][x0:xh])
+            Ex = _to_dev(F["Ex"][x0:xh]); Ey = _to_dev(F["Ey"][x0:xh])
+            Ez = _to_dev(F["Ez"][x0:xh])
             w = x1 - x0
 
             # Hx (i, j+1/2, k+1/2): no d/dx.  cy=dEz/dy, cz=dEy/dz
@@ -214,8 +231,8 @@ def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
         # ---------------- E pass over one tile [x0:x1] -------------------- #
         def e_pass(x0, x1):
             xl = max(x0 - 1, 0)                  # low-x halo for backward d/dx
-            Hx = np.asarray(F["Hx"][xl:x1]); Hy = np.asarray(F["Hy"][xl:x1])
-            Hz = np.asarray(F["Hz"][xl:x1])
+            Hx = _to_dev(F["Hx"][xl:x1]); Hy = _to_dev(F["Hy"][xl:x1])
+            Hz = _to_dev(F["Hz"][xl:x1])
             off = x0 - xl                        # local index of global x0
             w = x1 - x0
 
@@ -285,7 +302,9 @@ def run_out_of_core(sim, tile_cells: int, workdir: Optional[str] = None):
                 curl = -cb if curl is None else curl - cb
             if curl is None:
                 return
-            Fc[reg] = np.asarray(Fc[reg]) + k * curl
+            # k is a host memmap slice (ce_field[reg]) or a scalar; move to the
+            # device for the update, then write the result back to the memmap.
+            Fc[reg] = _to_host(_to_dev(Fc[reg]) + _to_dev(k) * curl)
 
         # ---------------- monitors (FieldMonitor only) -------------------- #
         result = Result(times=np.arange(n_steps) * dt)

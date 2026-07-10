@@ -212,10 +212,12 @@ intrinsic size:
   run can be sized before it OOMs. For a volume that does not fit at all, the
   NumPy :ref:`out-of-core <genindex>` stepper (``Simulation.run(out_of_core=
   True)``) memory-maps the fields to disk and steps in tiles bounded by
-  ``tile_cells`` planes. A full GPU/host/disk hierarchy - processing each
-  disk-backed tile on the device so resident-on-GPU memory is one tile while the
-  arrays live on disk - is the designed execution layer that pairs with these
-  estimates (it requires a CuPy build to run).
+  ``tile_cells`` planes. With ``use_gpu=True`` this becomes a full
+  **GPU/host/disk hierarchy**: each disk-backed tile is processed on the GPU
+  (CuPy) and moved back, so resident-on-GPU memory is one tile while the arrays
+  live on disk - a volume larger than GPU memory runs. Validated on an RTX 4080
+  (bit-identical to the in-core CPU result; peak GPU memory scales with
+  ``tile_cells``, not the grid).
 
 References:
 

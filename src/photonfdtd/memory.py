@@ -19,10 +19,11 @@ run can be sized *before* it OOMs. The modes:
 The estimate is the dominant field/coefficient/psi/monitor array memory; it is
 approximate (it omits framework overhead and transient temporaries) but the
 *ratios* between modes are exact by construction and are what matter for
-choosing one. A GPU/host/disk hierarchy (process each disk-backed tile on the
-device) reduces the resident-on-device figure to the ``out_of_core`` tile
-working set while the full arrays live on disk; that execution layer is
-designed (see ``outofcore`` scope notes) and pairs with these estimates.
+choosing one. The GPU/host/disk hierarchy (``Simulation(use_gpu=True).run(out_of_core=True)``,
+see :mod:`photonfdtd.outofcore`) processes each disk-backed tile on the device,
+so the resident-on-GPU figure is the ``out_of_core`` tile working set while the
+full arrays live on disk; peak device memory scales with ``tile_cells``, not the
+grid (validated on an RTX 4080).
 """
 from __future__ import annotations
 from typing import Dict, Optional

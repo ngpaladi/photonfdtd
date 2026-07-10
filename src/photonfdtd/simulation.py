@@ -774,10 +774,12 @@ class Simulation:
         out_of_core : bool
             If True, stream the field arrays to disk and step the domain in
             slabs along axis 0 so peak RAM is bounded by ``tile_cells`` planes
-            rather than the whole grid (see :mod:`photonfdtd.outofcore`). Only
-            the NumPy backend, a single uniform precision, point/soft sources
-            and ``FieldMonitor`` (incl. ``compression=``) are supported in this
-            mode; other backends / monitors / sources raise a clear error.
+            rather than the whole grid (see :mod:`photonfdtd.outofcore`). With
+            ``use_gpu=True`` each disk-backed tile is processed on the GPU so
+            peak *device* memory is one tile, not the grid (GPU/host/disk
+            hierarchy). A single uniform precision, point/soft sources and
+            ``FieldMonitor`` (incl. ``compression=``) are supported; other
+            monitors / sources / the Numba backend raise a clear error.
         tile_cells : int, optional
             Planes held in RAM per tile when ``out_of_core`` (default: ~1/8 of
             the x-extent, at least 1). Smaller = less RAM, more sweeps.
