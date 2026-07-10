@@ -116,6 +116,14 @@ print(result.n_eff)            # array of effective indices
   ops, so it runs on either an **NVIDIA** GPU (CuPy's CUDA build,
   `cupy-cuda12x`) or an **AMD** GPU (CuPy's ROCm build, `cupy-rocm-5-0`).
   Both are optional; without them the plain NumPy core runs.
+- **Differentiable JAX backend** (`use_jax=True`): a pure-functional
+  reimplementation of the Yee + CPML step under `jax.lax.scan`, JIT-compiled
+  through XLA (CPU/GPU/TPU from one path) and matching the in-core solver to
+  machine precision. Because the stepper is a pure function of the
+  permittivity, `pf.jax_value_and_grad_eps(sim, loss)` returns the gradient of
+  any monitor-based scalar w.r.t. `eps_r` — a **time-domain adjoint for
+  gradient-based inverse design / topology optimization**. See
+  `photonfdtd.jaxbackend`. (`pip install "photonfdtd[jax]"`.)
 
 ## What v0.2 does *not* do (yet)
 

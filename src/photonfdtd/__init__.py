@@ -25,6 +25,9 @@ from .sources import (
 from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
 from .storage import CompressedFieldSeries
 from .simulation import Simulation
+# Differentiable JAX entry point (import is lazy - jax is an optional dep;
+# accessing the name only fails if jax is missing when actually called).
+from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .mode import ModeSolver
 from . import adapters
 from .adapters import from_gdsfactory
@@ -36,8 +39,8 @@ __all__ = [
     "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "CompressedFieldSeries",
-    "Simulation", "ModeSolver",
+    "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

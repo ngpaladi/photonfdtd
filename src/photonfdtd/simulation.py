@@ -346,6 +346,7 @@ class Simulation:
         verbose: bool = False,
         use_gpu: bool = False,
         use_numba: bool = False,
+        use_jax: bool = False,
         precision="float64",
     ) -> None:
         # Working dtype(s) for fields, CPML state, coefficients and monitor
@@ -359,6 +360,11 @@ class Simulation:
         self.dtype = self.dtypes["Ex"]
         self.use_gpu = use_gpu and _GPU_AVAILABLE
         self.use_numba = use_numba and _NUMBA_AVAILABLE and not self.use_gpu
+        # The JAX backend is a separate functional stepper (see jaxbackend.py);
+        # it is exclusive of the CuPy/Numba paths and dispatched from run().
+        self.use_jax = bool(use_jax)
+        if self.use_jax and (self.use_gpu or self.use_numba):
+            raise ValueError("use_jax is exclusive of use_gpu / use_numba.")
         # The fused Numba kernel is a single specialization over all stepping
         # arrays; mixing dtypes among them has no real use case and unclear
         # promotion semantics, so require one compute dtype there. Monitor
@@ -621,6 +627,10 @@ class Simulation:
             if tile_cells is None:
                 tile_cells = max(self.grid.shape[0] // 8, 1)
             return run_out_of_core(self, tile_cells, workdir=ooc_workdir)
+
+        if self.use_jax:
+            from .jaxbackend import run_jax
+            return run_jax(self)
 
         xp = self._xp          # numpy or cupy
         nx, ny, nz = self.grid.shape

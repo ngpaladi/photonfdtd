@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonfdtd"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local-only FDTD + waveguide mode solver for integrated photonics, in pure Python/NumPy."
 readme = "README.md"
 license = { text = "MIT" }
@@ -33,6 +33,10 @@ docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
 # Faster/better ratios for FieldMonitor(compression=...) than the stdlib zlib
 # fallback. Optional: without it, compression='zstd' raises but True/'zlib' work.
 compress = ["zstandard>=0.21"]
+# Differentiable / XLA-compiled backend (Simulation(use_jax=True) and
+# jax_value_and_grad_eps). CPU wheel by default; install a CUDA/TPU jaxlib for
+# GPU/TPU. Optional: without it, use_jax raises on run().
+jax = ["jax>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"

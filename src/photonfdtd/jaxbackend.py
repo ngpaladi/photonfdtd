@@ -1,0 +1,498 @@
+"""JAX backend: a pure-functional FDTD time step under ``jax.lax.scan``.
+
+This is a functional reimplementation of the Yee + CPML update the NumPy/Numba
+backends run imperatively. JAX arrays are immutable, so every field/psi update
+is expressed functionally (``x.at[region].add(...)``) and the whole time loop is
+a ``lax.scan`` over a carry of (fields, psi, monitor accumulators). That makes
+the solver:
+
+* **JIT-compiled** through XLA (CPU / GPU / TPU from one code path), and
+* **differentiable**: the stepper is a pure function of the E-update coefficient
+  ``ce_field`` (hence of ``eps_r``), so ``jax.grad`` of any scalar built from the
+  monitor outputs flows back to the permittivity - a time-domain adjoint, the
+  engine of gradient-based inverse design. See :func:`value_and_grad_eps`.
+
+The per-cell arithmetic mirrors the fused Numba kernel's ``cy - cz`` form (dense
+CPML psi), so results track the in-core backends to floating reordering
+(~1e-6 single / ~1e-11 double), like the Numba backend.
+
+Sources: soft point/dipole sources (so expanded ModeSource / SinglePhoton
+sources work too) and moving ``ChargedParticle`` charges (Cherenkov). The
+particle trajectory is deterministic and field-independent, so its Gaussian
+current cloud is precomputed per step on host and injected inside the scan via
+``dynamic_slice`` / ``dynamic_update_slice``; only the ``ce_field`` factor stays
+symbolic, so gradients still flow through it.
+
+Monitors: ``FieldMonitor`` / ``DFTMonitor`` / ``FluxMonitor``. CPML, 1D/2D/3D,
+float32/float64. The disk-side ``FieldMonitor(compression=)`` / ``out_of_core``
+machinery is not part of the JAX device path and raises a clear error.
+"""
+from __future__ import annotations
+import math
+from typing import Dict, List
+import numpy as np
+
+from .constants import EPS_0, MU_0
+from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+
+# Component update table, identical in structure to Simulation.run's _table:
+# (F, aligned_axis, (axA, srcA), (axB, srcB), is_E). curl = termA - termB.
+_TABLE = [
+    ("Hx", 0, (1, "Ez"), (2, "Ey"), False),
+    ("Hy", 1, (2, "Ex"), (0, "Ez"), False),
+    ("Hz", 2, (0, "Ey"), (1, "Ex"), False),
+    ("Ex", 0, (1, "Hz"), (2, "Hy"), True),
+    ("Ey", 1, (2, "Hx"), (0, "Hz"), True),
+    ("Ez", 2, (0, "Hy"), (1, "Hx"), True),
+]
+_AXNAME = {0: "x", 1: "y", 2: "z"}
+_FLUX_AXIS = {"x": 0, "y": 1, "z": 2}
+
+
+def _crop(n, is_E):
+    """Region slice on a derivative axis: [1:] for E, [:-1] for H, all if flat."""
+    if n <= 1:
+        return slice(None)
+    return slice(1, None) if is_E else slice(0, -1)
+
+
+def _region_shape(region, shape):
+    out = []
+    for i in range(3):
+        s = region[i]
+        if isinstance(s, slice) and s != slice(None):
+            lo, hi, _ = s.indices(shape[i])
+            out.append(hi - lo)
+        else:
+            out.append(shape[i])
+    return tuple(out)
+
+
+def _build_static(sim):
+    """Fixed-for-the-run data: regions, per-term coeff slices, source tables."""
+    grid = sim.grid
+    shape = tuple(grid.shape)
+    cell = tuple(d if d > 0 else 1.0 for d in grid.cell_size)
+    dt = sim.dt
+    n_steps = sim.n_steps
+    npdt = np.dtype(sim.dtypes["Ex"])
+
+    be = [np.asarray(sim._b_e[a]) for a in range(3)]
+    ce = [np.asarray(sim._c_e[a]) for a in range(3)]
+    bh = [np.asarray(sim._b_h[a]) for a in range(3)]
+    ch = [np.asarray(sim._c_h[a]) for a in range(3)]
+
+    comps = []
+    for Fkey, aligned, (axA, srcA), (axB, srcB), is_E in _TABLE:
+        region = [slice(None), slice(None), slice(None)]
+        region[axA] = _crop(shape[axA], is_E)
+        region[axB] = _crop(shape[axB], is_E)
+        region = tuple(region)
+        b_src = be if is_E else bh
+        c_src = ce if is_E else ch
+        rshape = _region_shape(region, shape)
+        terms = []
+        for (ax, src, other_ax, sign) in ((axA, srcA, axB, +1.0),
+                                          (axB, srcB, axA, -1.0)):
+            if shape[ax] <= 1:
+                continue
+            osl = [slice(None), slice(None), slice(None)]
+            osl[other_ax] = _crop(shape[other_ax], is_E)
+            ridx = region[ax]
+            b1 = b_src[ax][ridx].astype(npdt).reshape(
+                [-1 if i == ax else 1 for i in range(3)])
+            c1 = c_src[ax][ridx].astype(npdt).reshape(
+                [-1 if i == ax else 1 for i in range(3)])
+            terms.append(dict(ax=ax, src=src, sign=sign, osl=tuple(osl),
+                              b1=b1, c1=c1, key=f"{Fkey}_{_AXNAME[ax]}",
+                              dl=cell[ax], pshape=rshape))
+        comps.append(dict(Fkey=Fkey, region=region, is_E=is_E, terms=terms))
+
+    src_H, src_E = [], []
+    steps = np.arange(n_steps)
+    for src in sim.sources:
+        i, j, k = grid.index_at(src.position)
+        t = (steps + (0.5 if src.component[0] == "H" else 1.0)) * dt
+        vals = np.asarray(src.amplitude * src.waveform(t), dtype=npdt)
+        entry = (src.component, int(i), int(j), int(k), vals)
+        (src_H if src.component[0] == "H" else src_E).append(entry)
+
+    return dict(shape=shape, cell=cell, dt=dt, n_steps=n_steps, npdt=npdt,
+                comps=comps, ch_field=float(dt / MU_0), src_H=src_H, src_E=src_E)
+
+
+def _particle_plan(sim, static):
+    """Precompute each moving charge's per-step Gaussian-cloud deposition.
+
+    The trajectory is deterministic and field-independent, so the stencil
+    location and the normalised weights are fully known on host - only the
+    ``ce_field`` factor stays symbolic (kept in the kernel via a dynamic slice),
+    so gradients w.r.t. ``eps_r`` still flow through the deposit. Reproduces the
+    in-core :meth:`Simulation._inject_particle_currents` exactly: each step's
+    deposit is embedded in a fixed-size window ``R`` (so ``lax.dynamic_slice``
+    can place it), zero-padded outside the actual [i0,i1) stencil, and zero on
+    steps where the particle centre is outside the physical interior / time
+    window.
+    """
+    grid = sim.grid
+    shape = static["shape"]
+    dt = static["dt"]
+    n_steps = static["n_steps"]
+    npdt = static["npdt"]
+    if not sim.particle_sources:
+        return []
+    dV = 1.0
+    for a in range(3):
+        if shape[a] > 1:
+            dV *= grid.cell_size[a]
+
+    plans = []
+    for p in sim.particle_sources:
+        radius = max(1, int(math.ceil(3.0 * p.cloud_cells)))
+        R = tuple(min(2 * radius + 1, shape[a]) if shape[a] > 1 else 1
+                  for a in range(3))
+        coef3 = np.zeros(3, dtype=npdt)
+        for a in range(3):
+            if p.velocity3[a] != 0.0 and shape[a] > 1:
+                coef3[a] = -(p.charge * p.velocity3[a]) / dV
+        starts = np.zeros((n_steps, 3), dtype=np.int32)
+        wblocks = np.zeros((n_steps,) + R, dtype=npdt)
+
+        for si in range(n_steps):
+            t_now = (si + 1.0) * dt                       # E-time, as in-core
+            if not (p.t_start <= t_now <= p.t_stop):
+                continue
+            pos = p.position_at(t_now)
+            wvecs = [None, None, None]
+            inside = True
+            for a in range(3):
+                n = shape[a]
+                coord = np.asarray(grid.coords[a])
+                if n == 1:
+                    wvecs[a] = np.array([1.0]); starts[si, a] = 0
+                    continue
+                npml = grid.pml_layers[a]
+                if pos[a] < coord[npml] or pos[a] > coord[n - 1 - npml]:
+                    inside = False
+                    break
+                dl = grid.cell_size[a]
+                sigma = max(p.cloud_cells, 1e-6) * dl
+                ic = int(round((pos[a] - coord[0]) / dl))
+                i0 = max(0, ic - radius)
+                i1 = min(n, ic + radius + 1)
+                w = np.exp(-0.5 * ((coord[i0:i1] - pos[a]) / sigma) ** 2)
+                wsum = w.sum()
+                if wsum == 0.0:
+                    inside = False
+                    break
+                w = w / wsum
+                start = int(np.clip(i0, 0, n - R[a]))     # window fits [i0,i1)
+                vec = np.zeros(R[a])
+                vec[i0 - start:i0 - start + (i1 - i0)] = w
+                wvecs[a] = vec
+                starts[si, a] = start
+            if not inside:
+                continue
+            wblocks[si] = (wvecs[0].reshape(-1, 1, 1)
+                           * wvecs[1].reshape(1, -1, 1)
+                           * wvecs[2].reshape(1, 1, -1)).astype(npdt)
+
+        plans.append(dict(R=R, coef3=coef3, starts=starts, wblocks=wblocks,
+                          axes=[a for a in range(3) if coef3[a] != 0.0]))
+    return plans
+
+
+def _monitor_plan(sim):
+    grid = sim.grid
+    dt = sim.dt
+    n_steps = sim.n_steps
+    plans = []
+    for m in sim.monitors:
+        if isinstance(m, FieldMonitor):
+            if m.compression is not None:
+                raise NotImplementedError(
+                    "FieldMonitor(compression=) is a host-side store, not part "
+                    "of the JAX device path; drop compression for use_jax.")
+            rec = (sorted({int(round(t / dt)) for t in m.times
+                           if 0 <= int(round(t / dt)) < n_steps})
+                   if m.times is not None else list(range(0, n_steps, m.interval)))
+            zsl = slice(None)
+            if m.plane_z is not None:
+                zi = int(np.argmin(np.abs(np.asarray(grid.coords[2]) - m.plane_z)))
+                zsl = slice(zi, zi + 1)
+            plans.append(dict(kind="field", m=m, rec=rec, zsl=zsl))
+        elif isinstance(m, DFTMonitor):
+            zsl = slice(None)
+            if m.plane_z is not None:
+                zi = int(np.argmin(np.abs(np.asarray(grid.coords[2]) - m.plane_z)))
+                zsl = slice(zi, zi + 1)
+            plans.append(dict(kind="dft", m=m, rec=list(range(0, n_steps, m.interval)),
+                              zsl=zsl, omega=2 * np.pi * np.asarray(m.freqs, float)))
+        elif isinstance(m, FluxMonitor):
+            plans.append(dict(kind="flux", m=m))
+    return plans
+
+
+def _snap(field, m, zsl):
+    ds = m.downsample
+    if zsl != slice(None):
+        return field[::ds, ::ds, zsl]
+    if ds > 1:
+        return field[::ds, ::ds, ::ds]
+    return field
+
+
+def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
+    """Pure device-side time loop. ``ce_field`` is a JAX array; returns the raw
+    monitor accumulators (field buffers, DFT accumulators, flux scalars) as JAX
+    arrays. Differentiable in ``ce_field``.
+    """
+    import jax.numpy as jnp
+    from jax import lax
+
+    shape = static["shape"]
+    dt = static["dt"]
+    n_steps = static["n_steps"]
+    jdt = ce_field.dtype
+    cdt = jnp.complex128 if jdt == jnp.float64 else jnp.complex64
+    neg_ch = jnp.asarray(-static["ch_field"], dtype=jdt)
+
+    fields = {c: jnp.zeros(shape, dtype=jdt)
+              for c in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")}
+    psis = {}
+    for comp in static["comps"]:
+        for t in comp["terms"]:
+            psis[t["key"]] = jnp.zeros(t["pshape"], dtype=jdt)
+
+    # Monitor accumulators + per-plan static schedules.
+    state_field, field_slot = {}, {}
+    state_dft, dft_mask = {}, {}
+    state_flux = {}
+    for p in plans:
+        m = p["m"]
+        if p["kind"] == "field":
+            n_rec = len(p["rec"])
+            slot = np.full(n_steps, n_rec, dtype=np.int32)
+            for r, s in enumerate(p["rec"]):
+                slot[s] = r
+            field_slot[m.name] = jnp.asarray(slot)
+            state_field[m.name] = {
+                c: jnp.zeros((n_rec + 1,) + _snap(fields[c], m, p["zsl"]).shape,
+                             dtype=jdt) for c in m.components}
+        elif p["kind"] == "dft":
+            mask = np.zeros(n_steps, dtype=np.float64)
+            for s in p["rec"]:
+                mask[s] = 1.0
+            dft_mask[m.name] = jnp.asarray(mask, dtype=jdt)
+            state_dft[m.name] = {
+                c: jnp.zeros((len(m.freqs),) + _snap(fields[c], m, p["zsl"]).shape,
+                             dtype=cdt) for c in m.components}
+        elif p["kind"] == "flux":
+            state_flux[m.name] = jnp.asarray(0.0, dtype=jdt)
+
+    def apply_pass(fields, psis, is_E_pass):
+        fields = dict(fields)
+        psis = dict(psis)
+        for comp in static["comps"]:
+            if comp["is_E"] != is_E_pass:
+                continue
+            curl = None
+            for t in comp["terms"]:
+                ax = t["ax"]
+                src = fields[t["src"]]
+                hi = [slice(None)] * 3; hi[ax] = slice(1, None)
+                lo = [slice(None)] * 3; lo[ax] = slice(0, -1)
+                d = (src[tuple(hi)] - src[tuple(lo)]) / t["dl"]
+                d = d[t["osl"]]
+                p = jnp.asarray(t["b1"]) * psis[t["key"]] + jnp.asarray(t["c1"]) * d
+                psis[t["key"]] = p
+                cterm = d + p
+                curl = (cterm if t["sign"] > 0 else -cterm) if curl is None \
+                    else (curl + cterm if t["sign"] > 0 else curl - cterm)
+            if curl is None:
+                continue
+            reg = comp["region"]
+            k = ce_field[reg] if comp["is_E"] else neg_ch
+            fields[comp["Fkey"]] = fields[comp["Fkey"]].at[reg].add(k * curl)
+        return fields, psis
+
+    # Source waveform tables on device so a traced step index can gather them.
+    src_H = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_H"]]
+    src_E = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_E"]]
+
+    # Moving-charge deposition tables (per particle), on device.
+    E_names = ("Ex", "Ey", "Ez")
+    pplans = [dict(R=pp["R"], axes=pp["axes"],
+                   coef3=[jnp.asarray(pp["coef3"][a]) for a in range(3)],
+                   starts=jnp.asarray(pp["starts"]),
+                   wblocks=jnp.asarray(pp["wblocks"]))
+              for pp in particle_plans]
+
+    def deposit_particles(fields, step_idx):
+        for pp in pplans:
+            R = pp["R"]
+            st = pp["starts"][step_idx]                   # (3,) traced ints
+            start = (st[0], st[1], st[2])
+            wb = pp["wblocks"][step_idx]
+            ce_blk = lax.dynamic_slice(ce_field, start, R)
+            for a in pp["axes"]:
+                comp = E_names[a]
+                add = pp["coef3"][a] * wb * ce_blk
+                cur = lax.dynamic_slice(fields[comp], start, R)
+                fields[comp] = lax.dynamic_update_slice(fields[comp], cur + add,
+                                                        start)
+        return fields
+
+    def step(carry, step_idx):
+        fields, psis, sf, sd, sfx = carry
+        fields, psis = apply_pass(fields, psis, is_E_pass=False)
+        for comp, i, j, k, vals in src_H:
+            fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
+        fields, psis = apply_pass(fields, psis, is_E_pass=True)
+        for comp, i, j, k, vals in src_E:
+            fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
+        # Moving-charge currents, injected at the E-time as in the in-core loop.
+        if pplans:
+            fields = deposit_particles(fields, step_idx)
+
+        for p in plans:
+            m = p["m"]
+            if p["kind"] == "field":
+                slot = field_slot[m.name][step_idx]
+                for c in m.components:
+                    sf[m.name][c] = sf[m.name][c].at[slot].set(
+                        _snap(fields[c], m, p["zsl"]))
+            elif p["kind"] == "dft":
+                active = dft_mask[m.name][step_idx]
+                for c in m.components:
+                    tt = (step_idx + (1.0 if c[0] == "E" else 0.5)) * dt
+                    ph = jnp.exp(1j * jnp.asarray(p["omega"]) * tt).astype(cdt)
+                    s = _snap(fields[c], m, p["zsl"]).astype(cdt)
+                    ph = ph.reshape((-1,) + (1,) * s.ndim)
+                    sd[m.name][c] = sd[m.name][c] + active * ph * s[None] * dt
+            elif p["kind"] == "flux":
+                sfx[m.name] = sfx[m.name] + _flux(fields, m, sim.grid, jnp) * dt
+        return (fields, psis, sf, sd, sfx), None
+
+    init = (fields, psis, state_field, state_dft, state_flux)
+    (fields, psis, sf, sd, sfx), _ = lax.scan(step, init, jnp.arange(n_steps))
+    return sf, sd, sfx
+
+
+def _flux(fields, m, grid, jnp):
+    axis = _FLUX_AXIS[m.plane_axis]
+    coord = grid.coords[axis]
+    idx = 0 if coord.size == 1 else int(np.argmin(np.abs(coord - m.plane_position)))
+    Ex, Ey, Ez = fields["Ex"], fields["Ey"], fields["Ez"]
+    Hx, Hy, Hz = fields["Hx"], fields["Hy"], fields["Hz"]
+    if axis == 0:
+        S = Ey[idx] * Hz[idx] - Ez[idx] * Hy[idx]
+        dA = (grid.cell_size[1] if grid.shape[1] > 1 else 1.0) * \
+             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
+    elif axis == 1:
+        S = Ez[:, idx] * Hx[:, idx] - Ex[:, idx] * Hz[:, idx]
+        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
+             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
+    else:
+        S = Ex[:, :, idx] * Hy[:, :, idx] - Ey[:, :, idx] * Hx[:, :, idx]
+        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
+             (grid.cell_size[1] if grid.shape[1] > 1 else 1.0)
+    return jnp.sum(S) * dA
+
+
+def _enable_x64_if_needed(sim):
+    import jax
+    if np.dtype(sim.dtypes["Ex"]) == np.float64:
+        jax.config.update("jax_enable_x64", True)
+
+
+def _validate(sim):
+    if sim.use_gpu or sim.use_numba:
+        raise NotImplementedError("use_jax is exclusive of use_gpu / use_numba.")
+    if len({sim.dtypes[k] for k in
+            ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz", "eps_r")}) > 1:
+        raise NotImplementedError(
+            "the JAX backend requires one uniform precision for the fields.")
+
+
+def run_jax(sim, jit: bool = True):
+    """Run ``sim`` on the JAX backend and return a Result (see module docstring)."""
+    import jax
+    import jax.numpy as jnp
+    from .simulation import Result
+
+    _validate(sim)
+    _enable_x64_if_needed(sim)
+    npdt = np.dtype(sim.dtypes["Ex"])
+    static = _build_static(sim)
+    plans = _monitor_plan(sim)
+    pplans = _particle_plan(sim, static)
+    shape = static["shape"]
+    dt = static["dt"]
+    n_steps = static["n_steps"]
+    ce_field_np = (dt / (np.asarray(sim.eps_r, dtype=npdt) * EPS_0)).astype(npdt)
+
+    fn = (lambda ce: _device_simulate(sim, static, plans, ce, pplans))
+    fn = jax.jit(fn) if jit else fn
+    sf, sd, sfx = fn(jnp.asarray(ce_field_np))
+
+    result = Result(times=np.arange(n_steps) * dt)
+    for p in plans:
+        m = p["m"]
+        if p["kind"] == "field":
+            n_rec = len(p["rec"])
+            if n_rec > 0:
+                result.fields[m.name] = {
+                    c: np.asarray(sf[m.name][c])[:n_rec].astype(sim.dtypes["monitors"])
+                    for c in m.components}
+                result.monitor_times[m.name] = np.asarray(p["rec"], float) * dt
+            else:
+                result.fields[m.name] = {c: np.zeros((0,) + shape)
+                                         for c in m.components}
+                result.monitor_times[m.name] = np.array([])
+        elif p["kind"] == "dft":
+            result.dft[m.name] = {c: np.asarray(sd[m.name][c]) for c in m.components}
+            result.dft_freqs[m.name] = np.asarray(m.freqs, float)
+        elif p["kind"] == "flux":
+            result.flux[m.name] = float(np.asarray(sfx[m.name]))
+    return result
+
+
+def value_and_grad_eps(sim, loss):
+    """Return ``(value, d value / d eps_r)`` for a scalar ``loss(out)``.
+
+    ``out`` is a dict of JAX arrays mirroring the monitor outputs::
+
+        {'fields': {name: {comp: (n_rec, *snap) real}},
+         'dft':    {name: {comp: (n_freq, *snap) complex}},
+         'flux':   {name: scalar}}
+
+    ``loss`` maps that to a scalar. The returned gradient w.r.t. the per-cell
+    permittivity ``eps_r`` propagates through ``ce_field = dt/(eps_r*EPS_0)`` and
+    the entire time evolution - a time-domain adjoint, i.e. exactly the gradient
+    an inverse-design / topology-optimization loop needs.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    _validate(sim)
+    _enable_x64_if_needed(sim)
+    npdt = np.dtype(sim.dtypes["Ex"])
+    static = _build_static(sim)
+    plans = _monitor_plan(sim)
+    pplans = _particle_plan(sim, static)
+
+    def loss_of_eps(eps_r):
+        ce = sim.dt / (eps_r * EPS_0)
+        sf, sd, sfx = _device_simulate(sim, static, plans, ce, pplans)
+        n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
+        out = {
+            "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},
+            "dft": {n: {c: sd[n][c] for c in sd[n]} for n in sd},
+            "flux": {n: sfx[n] for n in sfx},
+        }
+        return loss(out)
+
+    eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
+    val, grad = jax.value_and_grad(loss_of_eps)(eps0)
+    return float(val), np.asarray(grad)
