@@ -1,9 +1,9 @@
 API reference
 =============
 
-This page documents the full public API. Everything re-exported from the
-top-level :mod:`photonfdtd` namespace is documented here, grouped by the
-submodule it lives in.
+The full public API, one section per submodule. If you can reach it as
+``pf.something`` from the top-level :mod:`photonfdtd` namespace, it's documented
+somewhere below.
 
 Package overview
 ----------------

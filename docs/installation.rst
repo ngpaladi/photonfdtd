@@ -4,14 +4,14 @@ Installation
 From source
 -----------
 
-photonfdtd is not on PyPI yet, so ``pip install photonfdtd`` does not work.
-Install it from source instead — either directly from GitHub:
+photonfdtd isn't on PyPI yet, so ``pip install photonfdtd`` won't get you
+anywhere. Install it from source instead — either straight from GitHub:
 
 .. code-block:: bash
 
    pip install "git+https://github.com/ngpaladi/photonfdtd"
 
-or from a checkout:
+or from a checkout, which is what you want if you plan to poke at the code:
 
 .. code-block:: bash
 
@@ -19,7 +19,7 @@ or from a checkout:
    cd photonfdtd
    pip install -e .
 
-Once a release is published to PyPI, ``pip install photonfdtd`` will work too.
+Once there's a release on PyPI, plain ``pip install photonfdtd`` will work too.
 
 Optional extras
 ---------------
@@ -27,24 +27,41 @@ Optional extras
 .. code-block:: bash
 
    pip install -e ".[test]"   # pytest
-   pip install -e ".[docs]"   # sphinx + furo, to build these docs
+   pip install -e ".[docs]"   # sphinx + the Read the Docs theme, to build these docs
 
-photonfdtd requires Python 3.10+ and depends on NumPy, SciPy, and Matplotlib.
-The ``gdsfactory`` adapter and the optional Numba acceleration are imported
-lazily, so neither is required for a base install.
+photonfdtd needs Python 3.10+ and leans on NumPy, SciPy, and Matplotlib, and
+nothing else for the core. The ``gdsfactory`` adapter and the optional Numba
+acceleration are imported lazily, so you don't need either one for a base
+install — they only cost you anything if you actually reach for them.
 
 GPU acceleration
 ----------------
 
-Passing ``use_gpu=True`` to a simulation runs the time-stepping through
-`CuPy <https://cupy.dev>`_. Only generic CuPy array operations are used, so
-either GPU vendor works — install the CuPy build that matches your hardware:
+The GPU story is JAX. Pass ``use_jax=True`` to a simulation and, once a
+CUDA-enabled ``jaxlib`` is installed, the forward run *and* the differentiable /
+reversible adjoints run on the GPU through XLA — no code change on your end:
+
+.. code-block:: bash
+
+   pip install "jax[cuda12]"   # NVIDIA / CUDA 12 GPU
+
+This is validated on an NVIDIA RTX 4080: the GPU forward run matches the NumPy
+reference to floating-point rounding, and both adjoints run on-device. If JAX
+quietly falls back to CPU with a "cuSPARSE not found"-style error, the CUDA
+libraries just aren't on the loader path yet; point ``LD_LIBRARY_PATH`` at the
+``nvidia/*/lib`` directories the ``jax[cuda12]`` install dropped in your
+site-packages and it'll find them.
+
+There's also a legacy `CuPy <https://cupy.dev>`_ backend behind
+``use_gpu=True``. It's superseded by JAX for GPU work (and deprecated), but it's
+kept around for two things JAX can't do: AMD/ROCm hardware, and streaming
+disk-backed tiles through the GPU for a run that's larger than your VRAM. If you
+want either, install the CuPy build that matches your card:
 
 .. code-block:: bash
 
    pip install cupy-cuda12x    # NVIDIA / CUDA GPU
    pip install cupy-rocm-5-0   # AMD / ROCm GPU
 
-CuPy is optional and imported lazily; with none installed, ``use_gpu=True``
-raises a clear error and the NumPy core still runs. (CuPy's ROCm support is
-itself experimental, so match its version to your ROCm install.)
+CuPy is optional and imported lazily; with neither it nor a CUDA ``jaxlib``
+installed, the plain NumPy core still runs everything on the CPU.

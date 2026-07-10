@@ -1,8 +1,14 @@
 Quick start
 ===========
 
+Two small programs to get the feel of it: one that time-steps a field, and one
+that solves for a waveguide mode. Both run in a second or two on a laptop.
+
 A point dipole radiating in 2D vacuum
 -------------------------------------
+
+Drop a source in an empty box, wrap it in absorbing boundary, and watch it
+radiate:
 
 .. code-block:: python
 
@@ -23,11 +29,14 @@ A point dipole radiating in 2D vacuum
    sim = pf.Simulation(grid, sources=[src], monitors=[mon], run_time=200e-15)
    result = sim.run()
 
-``result.fields["snap"]["Ez"]`` is a ``(n_frames, ny, nz)`` array of field
-snapshots.
+``result.fields["snap"]["Ez"]`` comes back as a ``(n_frames, ny, nz)`` array of
+snapshots — one frame per recorded step, ready to plot or animate.
 
 Solving a slab waveguide mode
 -----------------------------
+
+No time-stepping this time. Hand the solver a cross-section and it returns the
+guided modes directly, as an eigenvalue problem:
 
 .. code-block:: python
 
@@ -47,5 +56,7 @@ Solving a slab waveguide mode
    result = ms.solve()
    print(result.n_eff)            # array of effective indices
 
-See the ``examples/`` directory in the repository for runnable scripts that
-also produce figures.
+From here, the :doc:`examples` walk through runnable scripts that produce
+figures, and the :doc:`accuracy` guide covers the parts that make the answers
+trustworthy — subpixel smoothing, dispersion, full-vectorial modes, and the
+differentiable inverse-design stack.

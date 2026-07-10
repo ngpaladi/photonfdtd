@@ -1,13 +1,15 @@
 photonfdtd
 ==========
 
-A small, fully-local open-source **FDTD + waveguide mode solver** written in
-Python/NumPy. It implements a Yee-grid FDTD time-stepper with CPML absorbing
-boundaries and a 2D scalar Helmholtz mode solver, with an API intentionally
-similar in spirit to Tidy3D.
+A small, fully-local, open-source **FDTD engine and waveguide mode solver**,
+written in Python and NumPy. Under the hood it's a Yee-grid time-stepper with
+CPML absorbing boundaries and a full-vectorial mode solver, with an API borrowed
+in spirit from Tidy3D — but the whole thing runs on your own machine. No cloud,
+no license server, no account.
 
-This is alpha-stage software. The pieces that exist are tested and correct;
-the pieces that don't, don't. See :doc:`api` for the full reference.
+This is alpha-stage software, and I'd rather be upfront about which parts are
+which: the pieces that exist are tested and correct; the pieces that don't,
+don't. See :doc:`api` for the full reference.
 
 .. toctree::
    :maxdepth: 2

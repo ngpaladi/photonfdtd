@@ -1,9 +1,11 @@
 # Reference material dispersion data
 
-This page documents the primary-source dispersion models and parameters used by
-`photonfdtd.materials` library media. Every Sellmeier equation is written as
-**n² − 1 = Σ Bᵢ λ²/(λ² − Cᵢ)** with **λ in micrometres** and **Cᵢ in µm²**.
-Metal models give the complex permittivity ε(ω) with photon energy ℏω in eV.
+These are the actual numbers behind the material library — the dispersion models
+and their coefficients — with each one traced back to the paper it came from, so
+you can check my work rather than take it on faith. Every Sellmeier equation is
+written as **n² − 1 = Σ Bᵢ λ²/(λ² − Cᵢ)** with **λ in micrometres** and
+**Cᵢ in µm²**; the metal models give the complex permittivity ε(ω) with photon
+energy ℏω in eV.
 
 ## Fused silica (SiO₂) — Malitson 1965
 
