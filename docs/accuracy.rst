@@ -28,8 +28,11 @@ by supersampling (``subpixel_factor``).
    sim = pf.Simulation(grid, structures=[...], sources=[...],
                        run_time=..., subpixel=True, subpixel_factor=3)
 
-Supported on the NumPy and CuPy (GPU) backends. Validated in
-``tests/test_smoothing.py``: as an interface is swept across one cell, a
+Supported on the NumPy, CuPy (GPU), and JAX backends (the JAX path uses a
+per-component coefficient, so the smoothed result is JIT-compiled and
+differentiable; it matches the NumPy reference to floating-point reordering).
+Validated in ``tests/test_smoothing.py`` and ``tests/test_jax_accuracy.py``: as
+an interface is swept across one cell, a
 transmitted-phase observable staircases (one abrupt jump at the cell crossing)
 without smoothing but ramps smoothly with it, both capturing the same net
 physical change — the Farjadpour convergence signature.
@@ -90,7 +93,11 @@ fitter does — is the natural next step.) The ADE stepper itself is validated i
 ``tests/test_dispersion.py`` against the analytic phase index of a Lorentz
 medium to within ~1%.
 
-Supported on the NumPy and CuPy backends.
+Supported on the NumPy, CuPy, and JAX backends. On the JAX path each pole's
+polarization is threaded through the ``lax.scan`` carry, so a dispersive run is
+JIT-compiled and **differentiable** — ``jax.grad`` of a monitor-derived loss
+flows back to the pole strengths (``tests/test_jax_accuracy.py`` checks this
+against finite differences), enabling inverse design over material dispersion.
 
 Full-vectorial mode solver
 --------------------------

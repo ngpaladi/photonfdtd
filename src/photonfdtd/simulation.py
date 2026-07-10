@@ -396,11 +396,11 @@ class Simulation:
         # is supported on the vectorized NumPy/CuPy path only.
         self.subpixel = bool(subpixel)
         self.subpixel_factor = int(subpixel_factor)
-        if self.subpixel and (self.use_numba or self.use_jax):
+        if self.subpixel and self.use_numba:
             raise ValueError(
-                "subpixel=True is not supported with the Numba or JAX backends "
-                "(their fused kernels assume one scalar per-cell coefficient). "
-                "Use the default NumPy backend or the CuPy GPU backend."
+                "subpixel=True is not supported with the Numba backend "
+                "(its fused kernel assumes one scalar per-cell coefficient). "
+                "Use the default NumPy backend, the CuPy GPU backend, or JAX."
             )
         self._xp = _get_backend(self.use_gpu)
         self.grid = grid
@@ -414,11 +414,10 @@ class Simulation:
             for s in self.structures
         )
         if self._has_dispersion:
-            if self.use_numba or self.use_jax:
+            if self.use_numba:
                 raise ValueError(
-                    "Dispersive media are not supported with the Numba or JAX "
-                    "backends; use the default NumPy backend or the CuPy GPU "
-                    "backend."
+                    "Dispersive media are not supported with the Numba backend; "
+                    "use the default NumPy backend, the CuPy GPU backend, or JAX."
                 )
             if self.subpixel:
                 raise NotImplementedError(

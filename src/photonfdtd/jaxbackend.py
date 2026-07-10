@@ -7,10 +7,18 @@ a ``lax.scan`` over a carry of (fields, psi, monitor accumulators). That makes
 the solver:
 
 * **JIT-compiled** through XLA (CPU / GPU / TPU from one code path), and
-* **differentiable**: the stepper is a pure function of the E-update coefficient
-  ``ce_field`` (hence of ``eps_r``), so ``jax.grad`` of any scalar built from the
-  monitor outputs flows back to the permittivity - a time-domain adjoint, the
-  engine of gradient-based inverse design. See :func:`value_and_grad_eps`.
+* **differentiable**: the stepper is a pure function of the per-component
+  E-update coefficients (hence of ``eps_r`` / the subpixel-smoothed tensor) and
+  of the dispersive-pole coefficients, so ``jax.grad`` of any scalar built from
+  the monitor outputs flows back to the permittivity, the smoothed geometry, or
+  the pole strengths - a time-domain adjoint, the engine of gradient-based
+  inverse design. See :func:`value_and_grad_eps` (scalar-eps case) and
+  ``tests/test_jax_accuracy.py`` (a pole-strength gradient).
+
+Accuracy features: anisotropic subpixel smoothing (``subpixel=True``, via a
+per-component coefficient) and dispersive media (Lorentz/Drude/Sellmeier poles
+advanced by the ADE recursion inside the ``lax.scan`` carry) both run on this
+path and match the NumPy reference to floating-point reordering.
 
 The per-cell arithmetic mirrors the fused Numba kernel's ``cy - cz`` form (dense
 CPML psi), so results track the in-core backends to floating reordering
@@ -202,6 +210,75 @@ def _particle_plan(sim, static):
     return plans
 
 
+def _build_ade_jax(sim, static):
+    """Dispersive-media (ADE) plan for the JAX device path, in full-domain form.
+
+    Every pole is given full-domain coefficient arrays that are zero outside its
+    material's cells, so the polarization recursion is a single elementwise
+    op over the whole grid (no gather/scatter in the scan) that keeps P == 0
+    where the material is absent. This is the XLA-friendly, fully-differentiable
+    shape; the trade is memory (polarization state is (npole, 3, *grid)).
+
+    Returns None if nothing is dispersive. The recursion coefficients a, b are
+    per-pole scalars (their value off-material is irrelevant since P stays 0
+    there); only the driving coefficient C and inv_eps need the spatial mask.
+    """
+    if not getattr(sim, "_has_dispersion", False):
+        return None
+    grid = sim.grid
+    shape = static["shape"]
+    npdt = static["npdt"]
+    dt = static["dt"]
+
+    id_grid = np.full(shape, -1, dtype=np.int32)
+    media: List = []
+    med_id: Dict[int, int] = {}
+    for s in sim.structures:
+        med = getattr(s, "medium", None)
+        mask = s.region_mask(grid)
+        if getattr(med, "is_dispersive", False):
+            key = id(med)
+            if key not in med_id:
+                med_id[key] = len(media)
+                media.append(med)
+            id_grid[mask] = med_id[key]
+        else:
+            id_grid[mask] = -1
+
+    max_w0dt = max((m.max_pole_omega() for m in media), default=0.0) * dt
+    if max_w0dt >= 2.0:
+        raise ValueError(
+            f"A dispersive medium has a pole with omega0*dt = {max_w0dt:.2f} "
+            ">= 2, unstable for the explicit ADE update at this resolution. Use "
+            "a finer grid, restrict the medium to in-band poles, or "
+            "DispersiveMedium.at_wavelength(lambda) for a fixed-index Medium."
+        )
+
+    a_list, b_list, c_arrs = [], [], []
+    inv_eps = np.zeros(shape, dtype=npdt)
+    for mid, med in enumerate(media):
+        cellmask = id_grid == mid
+        if not cellmask.any():
+            continue
+        inv_eps[cellmask] = 1.0 / (EPS_0 * med.eps_inf)
+        for p in med.poles:
+            denom = 1.0 + p.gamma * dt
+            a_list.append((2.0 - p.omega0 ** 2 * dt ** 2) / denom)
+            b_list.append((p.gamma * dt - 1.0) / denom)
+            cc = np.zeros(shape, dtype=npdt)
+            cc[cellmask] = (EPS_0 * p.strength * dt ** 2) / denom
+            c_arrs.append(cc)
+    if not a_list:
+        return None
+    return dict(
+        A=np.asarray(a_list, dtype=npdt),          # (npole,)
+        B=np.asarray(b_list, dtype=npdt),          # (npole,)
+        C=np.stack(c_arrs, axis=0),                # (npole, *grid)
+        inv_eps=inv_eps,                           # (*grid,)
+        npole=len(a_list),
+    )
+
+
 def _monitor_plan(sim):
     grid = sim.grid
     dt = sim.dt
@@ -242,10 +319,18 @@ def _snap(field, m, zsl):
     return field
 
 
-def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
-    """Pure device-side time loop. ``ce_field`` is a JAX array; returns the raw
-    monitor accumulators (field buffers, DFT accumulators, flux scalars) as JAX
-    arrays. Differentiable in ``ce_field``.
+def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
+                     ade=None, ce_particle=None):
+    """Pure device-side time loop. Returns the raw monitor accumulators (field
+    buffers, DFT accumulators, flux scalars) as JAX arrays.
+
+    ``ce_e`` is a dict ``{'Ex','Ey','Ez'}`` of per-component E-update
+    coefficients (equal arrays unless subpixel smoothing is on). ``ce_particle``
+    is the scalar coefficient used for moving-charge deposition (defaults to the
+    Ex coefficient). ``ade`` is the dispersive-media plan from
+    :func:`_build_ade_jax` (or None). The result is differentiable in ``ce_e``,
+    in ``ce_particle``, and in the ADE coefficient arrays (``ade['C']`` etc.),
+    so gradients flow to permittivity, the smoothed tensor, and pole strengths.
     """
     import jax.numpy as jnp
     from jax import lax
@@ -253,9 +338,19 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
     shape = static["shape"]
     dt = static["dt"]
     n_steps = static["n_steps"]
-    jdt = ce_field.dtype
+    jdt = ce_e["Ex"].dtype
     cdt = jnp.complex128 if jdt == jnp.float64 else jnp.complex64
     neg_ch = jnp.asarray(-static["ch_field"], dtype=jdt)
+    if ce_particle is None:
+        ce_particle = ce_e["Ex"]
+
+    # Dispersive-media coefficients on device (broadcast-ready).
+    if ade is not None:
+        ade_A = jnp.asarray(ade["A"]).reshape(-1, 1, 1, 1, 1)   # (npole,1,1,1,1)
+        ade_B = jnp.asarray(ade["B"]).reshape(-1, 1, 1, 1, 1)
+        ade_C = jnp.asarray(ade["C"])[:, None]                  # (npole,1,*grid)
+        ade_inv = jnp.asarray(ade["inv_eps"])                   # (*grid,)
+        npole = ade["npole"]
 
     fields = {c: jnp.zeros(shape, dtype=jdt)
               for c in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")}
@@ -263,6 +358,15 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
     for comp in static["comps"]:
         for t in comp["terms"]:
             psis[t["key"]] = jnp.zeros(t["pshape"], dtype=jdt)
+
+    # Dispersive polarization state: (Pcur, Pprev), each (npole, 3, *grid); an
+    # empty tuple when there is no dispersion (a valid, leaf-free pytree).
+    if ade is not None:
+        pol_shape = (npole, 3) + shape
+        ade_state = (jnp.zeros(pol_shape, dtype=jdt),
+                     jnp.zeros(pol_shape, dtype=jdt))
+    else:
+        ade_state = ()
 
     # Monitor accumulators + per-plan static schedules.
     state_field, field_slot = {}, {}
@@ -312,7 +416,7 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
             if curl is None:
                 continue
             reg = comp["region"]
-            k = ce_field[reg] if comp["is_E"] else neg_ch
+            k = ce_e[comp["Fkey"]][reg] if comp["is_E"] else neg_ch
             fields[comp["Fkey"]] = fields[comp["Fkey"]].at[reg].add(k * curl)
         return fields, psis
 
@@ -334,7 +438,7 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
             st = pp["starts"][step_idx]                   # (3,) traced ints
             start = (st[0], st[1], st[2])
             wb = pp["wblocks"][step_idx]
-            ce_blk = lax.dynamic_slice(ce_field, start, R)
+            ce_blk = lax.dynamic_slice(ce_particle, start, R)
             for a in pp["axes"]:
                 comp = E_names[a]
                 add = pp["coef3"][a] * wb * ce_blk
@@ -344,11 +448,24 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
         return fields
 
     def step(carry, step_idx):
-        fields, psis, sf, sd, sfx = carry
+        fields, psis, ade_state, sf, sd, sfx = carry
         fields, psis = apply_pass(fields, psis, is_E_pass=False)
         for comp, i, j, k, vals in src_H:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
+        # Capture E^n over the whole grid before the curl E-update, so the pole
+        # recursion uses the pre-update field (matches the in-core ADE).
+        if ade is not None:
+            En = jnp.stack([fields["Ex"], fields["Ey"], fields["Ez"]], axis=0)
         fields, psis = apply_pass(fields, psis, is_E_pass=True)
+        if ade is not None:
+            # P^{n+1} = a P^n + b P^{n-1} + c E^n; subtract the increment from E.
+            Pcur, Pprev = ade_state
+            Pnew = ade_A * Pcur + ade_B * Pprev + ade_C * En[None]
+            delta = jnp.sum(Pnew - Pcur, axis=0)           # (3, *grid)
+            fields["Ex"] = fields["Ex"] - ade_inv * delta[0]
+            fields["Ey"] = fields["Ey"] - ade_inv * delta[1]
+            fields["Ez"] = fields["Ez"] - ade_inv * delta[2]
+            ade_state = (Pnew, Pcur)
         for comp, i, j, k, vals in src_E:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
         # Moving-charge currents, injected at the E-time as in the in-core loop.
@@ -372,10 +489,11 @@ def _device_simulate(sim, static, plans, ce_field, particle_plans=()):
                     sd[m.name][c] = sd[m.name][c] + active * ph * s[None] * dt
             elif p["kind"] == "flux":
                 sfx[m.name] = sfx[m.name] + _flux(fields, m, sim.grid, jnp) * dt
-        return (fields, psis, sf, sd, sfx), None
+        return (fields, psis, ade_state, sf, sd, sfx), None
 
-    init = (fields, psis, state_field, state_dft, state_flux)
-    (fields, psis, sf, sd, sfx), _ = lax.scan(step, init, jnp.arange(n_steps))
+    init = (fields, psis, ade_state, state_field, state_dft, state_flux)
+    (fields, psis, ade_state, sf, sd, sfx), _ = lax.scan(
+        step, init, jnp.arange(n_steps))
     return sf, sd, sfx
 
 
@@ -427,14 +545,28 @@ def run_jax(sim, jit: bool = True):
     static = _build_static(sim)
     plans = _monitor_plan(sim)
     pplans = _particle_plan(sim, static)
+    ade = _build_ade_jax(sim, static)
     shape = static["shape"]
     dt = static["dt"]
     n_steps = static["n_steps"]
-    ce_field_np = (dt / (np.asarray(sim.eps_r, dtype=npdt) * EPS_0)).astype(npdt)
 
-    fn = (lambda ce: _device_simulate(sim, static, plans, ce, pplans))
+    # Scalar coefficient from eps_r (== eps_inf in dispersive cells); used for
+    # moving-charge deposition and as the E-update coefficient when smoothing is
+    # off.
+    ce_scalar = (dt / (np.asarray(sim.eps_r, dtype=npdt) * EPS_0)).astype(npdt)
+    if sim.subpixel:
+        exx, eyy, ezz = sim._smoothed_eps_components()
+        ce_e_np = {c: (dt / (np.asarray(e, dtype=npdt) * EPS_0)).astype(npdt)
+                   for c, e in zip(("Ex", "Ey", "Ez"), (exx, eyy, ezz))}
+    else:
+        ce_e_np = {c: ce_scalar for c in ("Ex", "Ey", "Ez")}
+
+    def fn(ce_e, ce_particle):
+        return _device_simulate(sim, static, plans, ce_e, pplans,
+                                ade=ade, ce_particle=ce_particle)
     fn = jax.jit(fn) if jit else fn
-    sf, sd, sfx = fn(jnp.asarray(ce_field_np))
+    ce_e = {c: jnp.asarray(v) for c, v in ce_e_np.items()}
+    sf, sd, sfx = fn(ce_e, jnp.asarray(ce_scalar))
 
     result = Result(times=np.arange(n_steps) * dt)
     for p in plans:
@@ -476,6 +608,15 @@ def value_and_grad_eps(sim, loss):
     import jax.numpy as jnp
 
     _validate(sim)
+    if sim.subpixel or getattr(sim, "_has_dispersion", False):
+        raise NotImplementedError(
+            "value_and_grad_eps differentiates the scalar per-cell eps_r, which "
+            "does not parameterize a subpixel-smoothed tensor or a dispersive "
+            "pole model. Both forward-run and are differentiable under the JAX "
+            "backend: build the coefficient / pole arrays symbolically and call "
+            "jax.grad on _device_simulate directly (see tests/test_jax_accuracy "
+            "for a worked pole-strength gradient)."
+        )
     _enable_x64_if_needed(sim)
     npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
@@ -484,7 +625,9 @@ def value_and_grad_eps(sim, loss):
 
     def loss_of_eps(eps_r):
         ce = sim.dt / (eps_r * EPS_0)
-        sf, sd, sfx = _device_simulate(sim, static, plans, ce, pplans)
+        ce_e = {c: ce for c in ("Ex", "Ey", "Ez")}
+        sf, sd, sfx = _device_simulate(sim, static, plans, ce_e, pplans,
+                                       ade=None, ce_particle=ce)
         n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
         out = {
             "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},
