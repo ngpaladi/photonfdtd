@@ -111,6 +111,33 @@ transcendental dispersion: for a high-contrast slab (n=3.0 core, n=1.0 clad,
 0.30 um) it reproduces both TE0 (analytic 2.5397) and TM0 (analytic 1.8988) to
 better than 0.01% — a split a scalar solver cannot represent.
 
+S-parameters (mode decomposition)
+---------------------------------
+
+Waveguide S-parameters — the objective for photonic-integrated-circuit device
+design — are extracted by projecting the frequency-domain port fields onto a
+solved mode. Record the four tangential components on a **port plane** with a
+plane-restricted :class:`~photonfdtd.DFTMonitor` (arbitrary axis via
+``plane_axis``/``plane_position``), which keeps only a 2-D slice — a PIC port is
+kilobytes, not the gigabytes a full-volume DFT would cost — then
+
+.. code-block:: python
+
+   port = pf.DFTMonitor(name="out", components=("Ey", "Ez", "Hy", "Hz"),
+                        freqs=freqs, plane_axis="x", plane_position=x_out)
+   # ... run ...
+   alpha_plus, alpha_minus = pf.s_parameters(result, "out", mode_result, mode_index=0,
+                                             dA=dy * dz)
+
+The forward/backward amplitudes come from the unconjugated/conjugated
+cross-product overlap; oppositely-propagating modes are orthogonal under it, so
+forward transmission and back-reflection separate on the same plane. A mode
+launched down a straight lossless waveguide gives ``|S21| ~= 1``
+(``tests/test_smatrix.py``). The overlap is written in plain array ops, so it
+runs on NumPy/CuPy/JAX and — evaluated on JAX DFT outputs inside a loss — makes
+``|S_ij|**2`` **differentiable** through the time-domain adjoint (the mode is a
+constant), which is the figure of merit for inverse design.
+
 Memory notes
 ------------
 

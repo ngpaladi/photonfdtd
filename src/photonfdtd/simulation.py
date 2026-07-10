@@ -922,18 +922,20 @@ class Simulation:
         dft_accum: Dict[str, Dict[str, Optional[object]]] = {}
         dft_omega: Dict[str, np.ndarray] = {}      # angular frequencies (rad/s)
         dft_steps: Dict[str, set] = {}
-        dft_zslice: Dict[str, slice] = {}
+        dft_plane: Dict[str, Optional[Tuple[int, int]]] = {}
         for m in self.monitors:
             if isinstance(m, DFTMonitor):
                 dft_accum[m.name] = {c: None for c in m.components}
                 dft_omega[m.name] = 2.0 * np.pi * np.asarray(m.freqs, dtype=np.float64)
                 dft_steps[m.name] = set(range(0, n_steps, m.interval))
                 result.dft_freqs[m.name] = np.asarray(m.freqs, dtype=np.float64)
-                if m.plane_z is not None:
-                    zi = int(np.argmin(np.abs(np.asarray(self.grid.coords[2]) - m.plane_z)))
-                    dft_zslice[m.name] = slice(zi, zi + 1)
+                pl = m.plane()
+                if pl is not None:
+                    ax, pos = pl
+                    ci = int(np.argmin(np.abs(np.asarray(self.grid.coords[ax]) - pos)))
+                    dft_plane[m.name] = (ax, ci)
                 else:
-                    dft_zslice[m.name] = slice(None)
+                    dft_plane[m.name] = None
 
         # Pre-locate source cells.
         source_cells = [(src, *self.grid.index_at(src.position)) for src in self.sources]
@@ -959,6 +961,17 @@ class Simulation:
             if ds > 1:
                 return field[::ds, ::ds, ::ds]
             return field
+
+        # General single-plane view on any axis (for DFTMonitor port planes).
+        # Keeps a size-1 axis so the reduced array stays 3-D. The slice is taken
+        # on the backend, so on the GPU only the plane is materialised/kept.
+        def snap_view_plane(field, ds, plane):
+            sl = [slice(None, None, ds) if ds > 1 else slice(None)
+                  for _ in range(3)]
+            if plane is not None:
+                ax, ci = plane
+                sl[ax] = slice(ci, ci + 1)
+            return field[tuple(sl)]
 
         def record_monitor(m, step):
             ds = m.downsample
@@ -998,11 +1011,11 @@ class Simulation:
         # of the O(n_steps) snapshots a FieldMonitor would store.
         def record_dft(m, t_e, t_h):
             ds = m.downsample
-            zsl = dft_zslice[m.name]
+            plane = dft_plane[m.name]
             omega = dft_omega[m.name]
             store = dft_accum[m.name]
             for c in m.components:
-                snap = snap_view(comps[c], ds, zsl)
+                snap = snap_view_plane(comps[c], ds, plane)
                 t = t_e if c[0] == "E" else t_h
                 # exp(+i*omega*t) per frequency, broadcast over the snapshot axes.
                 phase = xp.asarray(np.exp(1j * omega * t))

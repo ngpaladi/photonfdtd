@@ -297,30 +297,33 @@ def _monitor_plan(sim):
             rec = (sorted({int(round(t / dt)) for t in m.times
                            if 0 <= int(round(t / dt)) < n_steps})
                    if m.times is not None else list(range(0, n_steps, m.interval)))
-            zsl = slice(None)
+            plane = None
             if m.plane_z is not None:
                 zi = int(np.argmin(np.abs(np.asarray(grid.coords[2]) - m.plane_z)))
-                zsl = slice(zi, zi + 1)
-            plans.append(dict(kind="field", m=m, rec=rec, zsl=zsl))
+                plane = (2, zi)
+            plans.append(dict(kind="field", m=m, rec=rec, plane=plane))
         elif isinstance(m, DFTMonitor):
-            zsl = slice(None)
-            if m.plane_z is not None:
-                zi = int(np.argmin(np.abs(np.asarray(grid.coords[2]) - m.plane_z)))
-                zsl = slice(zi, zi + 1)
+            plane = None
+            pl = m.plane()
+            if pl is not None:
+                ax, pos = pl
+                ci = int(np.argmin(np.abs(np.asarray(grid.coords[ax]) - pos)))
+                plane = (ax, ci)
             plans.append(dict(kind="dft", m=m, rec=list(range(0, n_steps, m.interval)),
-                              zsl=zsl, omega=2 * np.pi * np.asarray(m.freqs, float)))
+                              plane=plane, omega=2 * np.pi * np.asarray(m.freqs, float)))
         elif isinstance(m, FluxMonitor):
             plans.append(dict(kind="flux", m=m))
     return plans
 
 
-def _snap(field, m, zsl):
+def _snap(field, m, plane):
+    """Strided, optionally single-plane (any axis) view of a component."""
     ds = m.downsample
-    if zsl != slice(None):
-        return field[::ds, ::ds, zsl]
-    if ds > 1:
-        return field[::ds, ::ds, ::ds]
-    return field
+    sl = [slice(None, None, ds) if ds > 1 else slice(None) for _ in range(3)]
+    if plane is not None:
+        ax, ci = plane
+        sl[ax] = slice(ci, ci + 1)
+    return field[tuple(sl)]
 
 
 def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
@@ -388,7 +391,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 slot[s] = r
             field_slot[m.name] = jnp.asarray(slot)
             state_field[m.name] = {
-                c: jnp.zeros((n_rec + 1,) + _snap(fields[c], m, p["zsl"]).shape,
+                c: jnp.zeros((n_rec + 1,) + _snap(fields[c], m, p["plane"]).shape,
                              dtype=jdt) for c in m.components}
         elif p["kind"] == "dft":
             mask = np.zeros(n_steps, dtype=np.float64)
@@ -396,7 +399,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 mask[s] = 1.0
             dft_mask[m.name] = jnp.asarray(mask, dtype=jdt)
             state_dft[m.name] = {
-                c: jnp.zeros((len(m.freqs),) + _snap(fields[c], m, p["zsl"]).shape,
+                c: jnp.zeros((len(m.freqs),) + _snap(fields[c], m, p["plane"]).shape,
                              dtype=cdt) for c in m.components}
         elif p["kind"] == "flux":
             state_flux[m.name] = jnp.asarray(0.0, dtype=jdt)
@@ -486,13 +489,13 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 slot = field_slot[m.name][step_idx]
                 for c in m.components:
                     sf[m.name][c] = sf[m.name][c].at[slot].set(
-                        _snap(fields[c], m, p["zsl"]))
+                        _snap(fields[c], m, p["plane"]))
             elif p["kind"] == "dft":
                 active = dft_mask[m.name][step_idx]
                 for c in m.components:
                     tt = (step_idx + (1.0 if c[0] == "E" else 0.5)) * dt
                     ph = jnp.exp(1j * jnp.asarray(p["omega"]) * tt).astype(cdt)
-                    s = _snap(fields[c], m, p["zsl"]).astype(cdt)
+                    s = _snap(fields[c], m, p["plane"]).astype(cdt)
                     ph = ph.reshape((-1,) + (1,) * s.ndim)
                     sd[m.name][c] = sd[m.name][c] + active * ph * s[None] * dt
             elif p["kind"] == "flux":

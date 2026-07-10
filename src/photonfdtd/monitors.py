@@ -137,6 +137,14 @@ class DFTMonitor:
     interval: int = 1
     downsample: int = 1
     plane_z: Optional[float] = None
+    # General single-plane restriction on any axis. ``plane_axis`` in
+    # {'x','y','z'} with ``plane_position`` (m) records only the nearest plane
+    # normal to that axis - essential for a memory-light port monitor on a
+    # waveguide (a y-z plane at a given x is KB, not the GB a full-volume DFT
+    # would cost). ``plane_z`` is the back-compatible shorthand for
+    # ``plane_axis='z'``.
+    plane_axis: Optional[str] = None
+    plane_position: Optional[float] = None
 
     def __post_init__(self):
         self.freqs = tuple(float(f) for f in self.freqs)
@@ -148,6 +156,21 @@ class DFTMonitor:
         if int(self.downsample) != self.downsample or self.downsample < 1:
             raise ValueError("downsample must be a positive integer")
         self.downsample = int(self.downsample)
+        # Normalise plane_z into the general (plane_axis, plane_position) form.
+        if self.plane_z is not None and self.plane_axis is None:
+            self.plane_axis = "z"
+            self.plane_position = self.plane_z
+        if self.plane_axis is not None:
+            if self.plane_axis not in ("x", "y", "z"):
+                raise ValueError("plane_axis must be 'x', 'y', or 'z'")
+            if self.plane_position is None:
+                raise ValueError("plane_axis requires plane_position")
+
+    def plane(self):
+        """Resolved ``(axis_index, position)`` for the plane restriction, or None."""
+        if self.plane_axis is None:
+            return None
+        return ({"x": 0, "y": 1, "z": 2}[self.plane_axis], float(self.plane_position))
 
 
 @dataclass

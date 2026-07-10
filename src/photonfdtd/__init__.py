@@ -37,6 +37,7 @@ from .simulation import Simulation
 # accessing the name only fails if jax is missing when actually called).
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .mode import ModeSolver
+from .smatrix import mode_amplitudes, port_fields, s_parameters
 from . import adapters
 from .adapters import from_gdsfactory
 
@@ -50,7 +51,8 @@ __all__ = [
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "CompressedFieldSeries",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
+    "mode_amplitudes", "port_fields", "s_parameters",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -120,6 +120,13 @@ print(result.n_eff)            # array of effective indices
   grid**. Reproduces the in-core result to machine precision. NumPy backend,
   point sources and `FieldMonitor` (incl. `compression=`) supported; see
   `photonfdtd.outofcore`.
+- **Mode-decomposition S-parameters** (`s_parameters`, `mode_amplitudes`):
+  project the frequency-domain fields on a memory-light port plane (any axis via
+  `DFTMonitor(plane_axis=..., plane_position=...)`) onto a solved mode to get
+  complex forward/backward modal amplitudes and hence S-parameters. A mode down
+  a straight lossless guide gives `|S21|≈1`; the overlap is backend-agnostic
+  (NumPy/CuPy/JAX) so `|S_ij|²` is differentiable through the adjoint — the PIC
+  inverse-design objective. See [`docs/accuracy.rst`](docs/accuracy.rst).
 - **Full-vectorial waveguide mode solver** (`ModeSolver`): a finite-difference
   eigenproblem for the transverse fields on the Yee grid that distinguishes TE
   from TM and captures high-index-contrast boundary effects. Validated against
