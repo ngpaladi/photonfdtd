@@ -188,6 +188,30 @@ intrinsic size:
   recomputes each segment, cutting adjoint peak memory to O(sqrt(n_steps)) for
   ~2x compute (measured ~3-4x lower peak on a few-thousand-step run), at a
   bit-for-bit identical gradient.
+* **Reversible adjoint (O(1) in timesteps).** For a *lossless, non-dispersive*
+  run with **no absorbing boundaries** (``pml_layers`` all zero: closed /
+  periodic domains - resonators, photonic crystals, periodic metasurfaces), the
+  Yee leapfrog is exactly time-reversible, so
+  :func:`~photonfdtd.jax_value_and_grad_eps_reversible` reconstructs the whole
+  forward field history by stepping backward instead of storing it - adjoint
+  memory independent of the number of steps. Validated: forward-then-reverse
+  returns to machine precision, the gradient matches the plain reverse pass to
+  ~1e-15, and peak memory measured **14x below the plain adjoint and ~4x below
+  checkpointing** on a ~1800-step 3-D run (``tests/test_reversible.py``).
+  Absorbing-boundary (PML) support - reconstruct the interior while storing only
+  the thin PML shell per step - is designed and is the next extension for
+  waveguide-port PIC runs.
+* **Planning large runs.** :func:`~photonfdtd.estimate_memory` /
+  :func:`~photonfdtd.recommend_mode` / :func:`~photonfdtd.format_report`
+  estimate the peak bytes of each execution mode (forward, the three adjoints,
+  and disk-tiled out-of-core) and pick one that fits a memory budget, so a large
+  run can be sized before it OOMs. For a volume that does not fit at all, the
+  NumPy :ref:`out-of-core <genindex>` stepper (``Simulation.run(out_of_core=
+  True)``) memory-maps the fields to disk and steps in tiles bounded by
+  ``tile_cells`` planes. A full GPU/host/disk hierarchy - processing each
+  disk-backed tile on the device so resident-on-GPU memory is one tile while the
+  arrays live on disk - is the designed execution layer that pairs with these
+  estimates (it requires a CuPy build to run).
 
 References:
 

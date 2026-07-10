@@ -36,11 +36,15 @@ from .simulation import Simulation
 # Differentiable JAX entry point (import is lazy - jax is an optional dep;
 # accessing the name only fails if jax is missing when actually called).
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
+from .reversible import (
+    value_and_grad_eps_reversible as jax_value_and_grad_eps_reversible,
+)
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
 from .design import (
     EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
 )
+from .memory import estimate_memory, recommend_mode, format_report
 from . import adapters
 from .adapters import from_gdsfactory
 
@@ -55,9 +59,11 @@ __all__ = [
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "CompressedFieldSeries",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
+    "jax_value_and_grad_eps_reversible",
     "mode_amplitudes", "port_fields", "s_parameters",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
+    "estimate_memory", "recommend_mode", "format_report",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
