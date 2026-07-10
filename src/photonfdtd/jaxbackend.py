@@ -324,7 +324,7 @@ def _snap(field, m, zsl):
 
 
 def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
-                     ade=None, ce_particle=None, remat="none"):
+                     ade=None, ce_particle=None, remat="none", checkpoint_levels=2):
     """Pure device-side time loop. Returns the raw monitor accumulators (field
     buffers, DFT accumulators, flux scalars) as JAX arrays.
 
@@ -500,24 +500,29 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         return (fields, psis, ade_state, sf, sd, sfx), None
 
     init = (fields, psis, ade_state, state_field, state_dft, state_flux)
-    final, _ = _run_time_loop(step, init, n_steps, remat)
+    final, _ = _run_time_loop(step, init, n_steps, remat, levels=checkpoint_levels)
     (fields, psis, ade_state, sf, sd, sfx) = final
     return sf, sd, sfx
 
 
-def _run_time_loop(step, init, n_steps, remat):
-    """Drive the time loop, optionally with gradient checkpointing.
+def _run_time_loop(step, init, n_steps, remat, levels=2):
+    """Drive the time loop, optionally with recursive gradient checkpointing.
 
     ``remat``:
 
     * ``"none"`` - a plain ``lax.scan``. Reverse-mode AD then stores the state
       trajectory for every step (O(n_steps) memory) - fine for forward runs and
       short gradients.
-    * ``"nested"`` - a two-level scan of ~sqrt(n_steps) segments, each wrapped in
-      ``jax.checkpoint``. The backward pass keeps only the ~sqrt(n_steps) segment
-      -boundary states and recomputes each segment's interior, cutting adjoint
-      memory from O(n_steps) to O(sqrt(n_steps)) for ~2x the compute - the
-      standard trade that makes long differentiable runs (inverse design) fit.
+    * ``"step"`` - ``jax.checkpoint`` the single step (recomputes each step's
+      interior in the backward pass; helps the constant factor only).
+    * ``"nested"`` - an ``L``-level tree of nested scans, each level's segment
+      wrapped in ``jax.checkpoint``. With ``levels`` equal factors of
+      ``n_steps`` the backward pass holds only ~``levels * n_steps**(1/levels)``
+      states and recomputes the rest, so adjoint memory drops from O(n_steps) to
+      O(levels * n_steps**(1/levels)) - i.e. O(sqrt(n_steps)) at ``levels=2``,
+      O(n_steps**(1/3)) at ``levels=3`` - for ~``levels``x the forward compute.
+      This is the Griewank/Volin-style multi-level checkpointing that lets long
+      differentiable runs (inverse design) fit in memory.
     """
     import jax
     from jax import lax
@@ -527,25 +532,39 @@ def _run_time_loop(step, init, n_steps, remat):
         step_fn = jax.checkpoint(step) if remat == "step" else step
         return lax.scan(step_fn, init, jnp.arange(n_steps))
 
-    n_in = max(1, int(round(math.sqrt(n_steps))))
-    n_out = -(-n_steps // n_in)                       # ceil division
+    levels = max(1, int(levels))
+    base = max(1, int(math.ceil(n_steps ** (1.0 / levels))))
+    factors = [base] * levels                         # product >= n_steps
+    strides = [1] * levels
+    acc = 1
+    for i in range(levels - 1, -1, -1):
+        strides[i] = acc
+        acc *= factors[i]
 
     def guarded(carry, g):
-        # Padded tail steps (g >= n_steps) are a no-op; the clamped index keeps
-        # the source/monitor table lookups in-bounds.
+        # Padded tail iterations (global index g >= n_steps) are a no-op; the
+        # clamped index keeps the source/monitor table lookups in-bounds.
         def do(c):
-            c2, _ = step(c, jnp.minimum(g, n_steps - 1))
-            return c2
-        carry = lax.cond(g < n_steps, do, lambda c: c, carry)
-        return carry, None
+            return step(c, jnp.minimum(g, n_steps - 1))[0]
+        return lax.cond(g < n_steps, do, lambda c: c, carry), None
 
-    def segment(carry, seg_i):
-        gg = seg_i * n_in + jnp.arange(n_in)
-        carry, _ = lax.scan(guarded, carry, gg)
-        return carry, None
+    def build(level):
+        f, s = factors[level], strides[level]
+        if level == levels - 1:                       # innermost: real steps
+            def leaf(carry, base_idx):
+                carry, _ = lax.scan(guarded, carry, base_idx + jnp.arange(f))
+                return carry
+            return leaf
+        child = build(level + 1)
 
-    segment = jax.checkpoint(segment)
-    return lax.scan(segment, init, jnp.arange(n_out))
+        def node(carry, base_idx):
+            def body(c, i):
+                return child(c, base_idx + i * s), None
+            carry, _ = lax.scan(jax.checkpoint(body), carry, jnp.arange(f))
+            return carry
+        return node
+
+    return build(0)(init, 0), None
 
 
 def _flux(fields, m, grid, jnp):
@@ -641,7 +660,7 @@ def run_jax(sim, jit: bool = True):
     return result
 
 
-def value_and_grad_eps(sim, loss, remat="nested"):
+def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
     """Return ``(value, d value / d eps_r)`` for a scalar ``loss(out)``.
 
     ``out`` is a dict of JAX arrays mirroring the monitor outputs::
@@ -685,7 +704,8 @@ def value_and_grad_eps(sim, loss, remat="nested"):
         ce = sim.dt / (eps_r * EPS_0)
         ce_e = {c: ce for c in ("Ex", "Ey", "Ez")}
         sf, sd, sfx = _device_simulate(sim, static, plans, ce_e, pplans,
-                                       ade=None, ce_particle=ce, remat=remat)
+                                       ade=None, ce_particle=ce, remat=remat,
+                                       checkpoint_levels=checkpoint_levels)
         n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
         out = {
             "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},

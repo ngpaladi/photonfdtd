@@ -115,9 +115,13 @@ def test_gradient_checkpointing_matches_plain_grad():
     loss = lambda out: out["dft"]["d"]["Ez"].real.sum()
 
     v0, g0 = pf.jax_value_and_grad_eps(sim, loss, remat="none")
-    v1, g1 = pf.jax_value_and_grad_eps(sim, loss, remat="nested")
-    assert np.isclose(v0, v1)
-    assert np.allclose(g0, g1, rtol=1e-10, atol=1e-12 * np.abs(g0).max())
+    # 2-level (sqrt(N)) and 3-level (N**(1/3)) checkpointing must both reproduce
+    # the plain reverse pass exactly - rematerialization is exact.
+    for levels in (2, 3):
+        v1, g1 = pf.jax_value_and_grad_eps(sim, loss, remat="nested",
+                                           checkpoint_levels=levels)
+        assert np.isclose(v0, v1)
+        assert np.allclose(g0, g1, rtol=1e-10, atol=1e-12 * np.abs(g0).max())
 
 
 def test_grad_eps_guards_on_new_features():
