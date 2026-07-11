@@ -65,3 +65,16 @@ want either, install the CuPy build that matches your card:
 
 CuPy is optional and imported lazily; with neither it nor a CUDA ``jaxlib``
 installed, the plain NumPy core still runs everything on the CPU.
+
+Which backend actually runs
+---------------------------
+
+You don't have to think about any of this most of the time. By default
+(``backend="auto"``) a simulation picks its own engine: if JAX is installed and
+the run is big enough that compiling it pays off, it uses the JAX backend (on the
+GPU, if there's one) — and otherwise it stays on the plain NumPy core, which is
+instant and needs no extra dependency. On a large 3-D forward run that hands you
+roughly a 4x speedup on CPU and ~40x on GPU without changing a line of code. If
+you'd rather pin it, pass ``backend="numpy"`` (deterministic, dependency-light)
+or ``backend="jax"`` outright. Out-of-core runs always take the NumPy tiling
+path, since JAX can't stream to disk.

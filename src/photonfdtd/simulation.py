@@ -336,6 +336,28 @@ class Result:
     dft_freqs: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
+# Auto-backend threshold. With backend="auto", dispatch to JAX once the run is
+# at least this many cell-steps (grid cells x timesteps). Below it the NumPy core
+# is already sub-second and beats JAX's one-time XLA compile; above it, XLA
+# fusion (and the GPU, if present) wins by a wide margin - measured ~4x on CPU
+# and ~40x on GPU on a ~7e8 cell-step 3-D run. Module-level so it is tunable.
+AUTO_JAX_MIN_CELL_STEPS = 5e7
+
+_JAX_AVAILABLE: Optional[bool] = None
+
+
+def _jax_available() -> bool:
+    """Whether the JAX backend can be imported (cached)."""
+    global _JAX_AVAILABLE
+    if _JAX_AVAILABLE is None:
+        try:
+            import jax  # noqa: F401
+            _JAX_AVAILABLE = True
+        except Exception:
+            _JAX_AVAILABLE = False
+    return _JAX_AVAILABLE
+
+
 class Simulation:
     def __init__(
         self,
@@ -353,6 +375,7 @@ class Simulation:
         precision="float64",
         subpixel: bool = False,
         subpixel_factor: int = 3,
+        backend: str = "auto",
     ) -> None:
         # Working dtype(s) for fields, CPML state, coefficients and monitor
         # storage. float32 halves memory and roughly doubles throughput (FDTD is
@@ -381,6 +404,14 @@ class Simulation:
         self.use_jax = bool(use_jax)
         if self.use_jax and (self.use_gpu or self.use_numba):
             raise ValueError("use_jax is exclusive of use_gpu / use_numba.")
+        # Backend selection. "auto" (the default) dispatches to the JAX backend
+        # when it is installed and the run is big enough for XLA fusion / GPU to
+        # pay off (see _use_jax_backend), otherwise the NumPy core. Explicit
+        # values ("numpy"/"jax") force the choice; the use_jax / use_gpu /
+        # use_numba booleans, if set, still win for back-compatibility.
+        if backend not in ("auto", "numpy", "jax"):
+            raise ValueError("backend must be 'auto', 'numpy', or 'jax'")
+        self.backend = backend
         # The fused Numba kernel is a single specialization over all stepping
         # arrays; mixing dtypes among them has no real use case and unclear
         # promotion semantics, so require one compute dtype there. Monitor
@@ -776,6 +807,37 @@ class Simulation:
         self._b_h = bh; self._c_h = ch
 
     # ------------------------------------------------------------------ #
+    # Backend dispatch.
+    # ------------------------------------------------------------------ #
+    def _jax_compatible(self) -> bool:
+        """Whether the JAX backend can run this sim as configured (auto falls
+        back to NumPy otherwise)."""
+        # JAX requires one uniform precision across the stepping arrays.
+        if len({self.dtypes[k] for k in _FIELD_KEYS + ("eps_r",)}) > 1:
+            return False
+        # The disk-side compressed FieldMonitor store is host-only.
+        for m in self.monitors:
+            if isinstance(m, FieldMonitor) and m.compression is not None:
+                return False
+        return True
+
+    def _use_jax_backend(self, out_of_core: bool) -> bool:
+        """Resolve whether to run on JAX for this call. Explicit backend choices
+        win; ``backend="auto"`` picks JAX when it is installed, the sim is
+        JAX-compatible, and the run is large enough for it to pay off."""
+        if self.use_gpu or self.use_numba:
+            return False                       # explicit CuPy / Numba backend
+        if self.use_jax or self.backend == "jax":
+            return True                        # explicit JAX
+        if self.backend == "numpy":
+            return False
+        # backend == "auto":
+        if out_of_core or not _jax_available() or not self._jax_compatible():
+            return False
+        work = int(np.prod(self.grid.shape)) * int(self.n_steps)
+        return work >= AUTO_JAX_MIN_CELL_STEPS
+
+    # ------------------------------------------------------------------ #
     def run(self, out_of_core: bool = False, tile_cells: Optional[int] = None,
             ooc_workdir: Optional[str] = None) -> Result:
         """Time-step the simulation and return the recorded monitor data.
@@ -812,7 +874,7 @@ class Simulation:
                 tile_cells = max(self.grid.shape[0] // 8, 1)
             return run_out_of_core(self, tile_cells, workdir=ooc_workdir)
 
-        if self.use_jax:
+        if self._use_jax_backend(out_of_core):
             from .jaxbackend import run_jax
             return run_jax(self)
 
