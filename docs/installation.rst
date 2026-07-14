@@ -74,7 +74,12 @@ You don't have to think about any of this most of the time. By default
 the run is big enough that compiling it pays off, it uses the JAX backend (on the
 GPU, if there's one) — and otherwise it stays on the plain NumPy core, which is
 instant and needs no extra dependency. On a large 3-D forward run that hands you
-roughly a 4x speedup on CPU and ~40x on GPU without changing a line of code. If
-you'd rather pin it, pass ``backend="numpy"`` (deterministic, dependency-light)
-or ``backend="jax"`` outright. Out-of-core runs always take the NumPy tiling
-path, since JAX can't stream to disk.
+roughly a 4x speedup on CPU and ~40x on GPU without changing a line of code.
+
+It also checks that the run will actually *fit*: it estimates the working set
+and compares it to what your machine has (GPU VRAM if there's a GPU, otherwise
+host RAM), and if a JAX run would overflow that, auto quietly stays on NumPy and
+points you at ``run(out_of_core=True)`` rather than handing you an out-of-memory
+crash. If you'd rather pin the backend, pass ``backend="numpy"`` (deterministic,
+dependency-light) or ``backend="jax"`` outright; out-of-core runs always take the
+NumPy tiling path, since JAX can't stream to disk.

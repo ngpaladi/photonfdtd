@@ -47,7 +47,9 @@ from .smatrix import mode_amplitudes, port_fields, s_parameters
 from .design import (
     EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
 )
-from .memory import estimate_memory, recommend_mode, format_report
+from .memory import (
+    estimate_memory, recommend_mode, format_report, available_memory,
+)
 from . import adapters
 from .adapters import from_gdsfactory
 
@@ -66,8 +68,8 @@ __all__ = [
     "jax_value_and_grad_eps_reversible_pml",
     "mode_amplitudes", "port_fields", "s_parameters",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
-    "estimate_memory", "recommend_mode", "format_report",
+    "estimate_memory", "recommend_mode", "format_report", "available_memory",
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"

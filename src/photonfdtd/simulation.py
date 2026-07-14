@@ -835,7 +835,25 @@ class Simulation:
         if out_of_core or not _jax_available() or not self._jax_compatible():
             return False
         work = int(np.prod(self.grid.shape)) * int(self.n_steps)
-        return work >= AUTO_JAX_MIN_CELL_STEPS
+        if work < AUTO_JAX_MIN_CELL_STEPS:
+            return False
+        # Machine-spec aware: don't route to JAX if it wouldn't fit the device
+        # it would run on (GPU VRAM if a GPU is present, else host RAM). A JAX
+        # run that overflows VRAM OOMs, so falling back to the NumPy core - and
+        # nudging toward out_of_core - is the safer default.
+        from .memory import estimate_memory, available_memory
+        need = estimate_memory(self)["working_set"] * 2   # margin for XLA scratch
+        budget, kind = available_memory()
+        if budget is not None and need > budget:
+            warnings.warn(
+                f"backend='auto': this run needs ~{need / 1e9:.1f} GB but only "
+                f"~{budget / 1e9:.1f} GB of {kind.upper()} memory is available, "
+                "so it stays on the NumPy backend. For a run this large, use "
+                "run(out_of_core=True) (and use_gpu=True for GPU tiling).",
+                stacklevel=3,
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------ #
     def run(self, out_of_core: bool = False, tile_cells: Optional[int] = None,

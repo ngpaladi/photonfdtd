@@ -66,15 +66,80 @@ def estimate_memory(sim, checkpoint_levels: int = 2,
     }
 
 
-def recommend_mode(sim, budget_bytes: int, differentiable: bool = True,
+def available_host_ram():
+    """Available host RAM in bytes (Linux ``MemAvailable``), or None if it can't
+    be read on this platform."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    try:
+        import os
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return None
+
+
+def _nvidia_total_bytes():
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3)
+        return int(out.stdout.strip().splitlines()[0]) * 1024 * 1024
+    except Exception:
+        return None
+
+
+def gpu_memory_budget():
+    """Bytes a JAX program can allocate on the default GPU (the XLA allocator
+    limit minus what's already in use), or None if there's no GPU / it can't be
+    determined. Note: this initializes JAX's GPU backend if it hasn't been."""
+    try:
+        import jax
+        for d in jax.devices():
+            if d.platform in ("gpu", "cuda", "rocm"):
+                try:
+                    st = d.memory_stats() or {}
+                    lim = st.get("bytes_limit")
+                    if lim:
+                        return max(0, int(lim) - int(st.get("bytes_in_use", 0)))
+                except Exception:
+                    pass
+                tot = _nvidia_total_bytes()          # fall back to 70% of VRAM
+                return int(tot * 0.7) if tot else None
+    except Exception:
+        pass
+    return None
+
+
+def available_memory():
+    """``(bytes, "gpu"|"cpu")`` a run could use on the device JAX would target:
+    GPU VRAM if a GPU is present, else host RAM. ``bytes`` is None if unknown."""
+    gpu = gpu_memory_budget()
+    if gpu is not None:
+        return gpu, "gpu"
+    return available_host_ram(), "cpu"
+
+
+def recommend_mode(sim, budget_bytes=None, differentiable: bool = True,
                    checkpoint_levels: int = 2) -> str:
     """Cheapest-compute mode whose estimated peak fits ``budget_bytes``.
 
-    For a differentiable (adjoint) run the preference order is
-    none -> nested -> reversible (increasing compute, decreasing memory); for a
-    forward-only run, forward -> out_of_core. Returns the mode name, or
-    ``'out_of_core'`` / ``'infeasible'`` as the last resort.
+    ``budget_bytes`` defaults to the memory actually available on this machine
+    (GPU VRAM if present, else host RAM). For a differentiable (adjoint) run the
+    preference order is none -> nested -> reversible (increasing compute,
+    decreasing memory); for a forward-only run, forward -> out_of_core. Returns
+    the mode name, or ``'out_of_core'`` / ``'infeasible'`` as the last resort.
     """
+    if budget_bytes is None:
+        budget_bytes = available_memory()[0]
+        if budget_bytes is None:
+            budget_bytes = float("inf")             # unknown -> don't constrain
     est = estimate_memory(sim, checkpoint_levels)
     if differentiable:
         order = ["adjoint_none", "adjoint_nested", "adjoint_reversible"]

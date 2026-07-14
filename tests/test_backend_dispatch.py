@@ -49,3 +49,27 @@ def test_auto_picks_jax_when_worth_it(monkeypatch):
     a = np.asarray(r_np.dft["d"]["Ez"])
     b = np.asarray(r_auto.dft["d"]["Ez"])
     assert np.abs(a - b).max() / np.abs(a).max() < 1e-9
+
+
+def test_available_memory():
+    b, kind = pf.available_memory()
+    assert kind in ("gpu", "cpu")
+    assert b is None or b > 0
+
+
+def test_memory_aware_fallback(monkeypatch):
+    """auto won't route to JAX if the run wouldn't fit the target device; it
+    falls back to NumPy (and warns) rather than risk an OOM."""
+    pytest.importorskip("jax")
+    import photonfdtd.memory as mem
+    monkeypatch.setattr(sm, "AUTO_JAX_MIN_CELL_STEPS", 1)   # tiny run counts as big
+    # Plenty of memory -> JAX.
+    monkeypatch.setattr(mem, "available_memory", lambda: (10 ** 11, "cpu"))
+    assert _small(backend="auto")._use_jax_backend(False) is True
+    # Almost none -> NumPy, with a warning.
+    monkeypatch.setattr(mem, "available_memory", lambda: (1000, "gpu"))
+    with pytest.warns(UserWarning, match="NumPy"):
+        assert _small(backend="auto")._use_jax_backend(False) is False
+    # Unknown (None) -> don't block on memory.
+    monkeypatch.setattr(mem, "available_memory", lambda: (None, "cpu"))
+    assert _small(backend="auto")._use_jax_backend(False) is True
