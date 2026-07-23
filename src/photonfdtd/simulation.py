@@ -409,8 +409,8 @@ class Simulation:
         # pay off (see _use_jax_backend), otherwise the NumPy core. Explicit
         # values ("numpy"/"jax") force the choice; the use_jax / use_gpu /
         # use_numba booleans, if set, still win for back-compatibility.
-        if backend not in ("auto", "numpy", "jax"):
-            raise ValueError("backend must be 'auto', 'numpy', or 'jax'")
+        if backend not in ("auto", "numpy", "jax", "rust"):
+            raise ValueError("backend must be 'auto', 'numpy', 'jax', or 'rust'")
         self.backend = backend
         # The fused Numba kernel is a single specialization over all stepping
         # arrays; mixing dtypes among them has no real use case and unclear
@@ -891,6 +891,14 @@ class Simulation:
             if tile_cells is None:
                 tile_cells = max(self.grid.shape[0] // 8, 1)
             return run_out_of_core(self, tile_cells, workdir=ooc_workdir)
+
+        if self.backend == "rust":
+            # Compiled Rust stepping core (rust/src/lib.rs): the whole time
+            # loop runs natively with PML-slab-compacted psi state - the
+            # lowest-memory in-core backend. Explicit opt-in only (not part
+            # of "auto") while experimental.
+            from .rustbackend import run_rust
+            return run_rust(self)
 
         if self._use_jax_backend(out_of_core):
             from .jaxbackend import run_jax

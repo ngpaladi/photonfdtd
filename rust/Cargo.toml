@@ -1,0 +1,19 @@
+[package]
+name = "photonfdtd-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FDTD stepping kernel for photonfdtd (PyO3 extension)"
+license = "MIT"
+
+[lib]
+name = "_photonfdtd_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+rayon = "1.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
