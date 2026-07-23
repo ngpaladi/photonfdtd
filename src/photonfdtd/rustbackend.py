@@ -3,11 +3,14 @@
 Two engines share one Python driver (source tables, chunked time loop,
 monitor recording):
 
-* ``backend="rust"`` - CPU (rayon), float64. The whole time loop runs
-  natively; Python is re-entered only at monitor-record steps.
+* ``backend="rust"`` - CPU (rayon), float64 or float32. The whole time
+  loop runs natively (with ghost-zone temporal blocking on large domains);
+  Python is re-entered only at monitor-record steps.
 * ``backend="rust-cuda"`` - GPU (CUDA, feature ``cuda``), float64 or
-  float32. All state is device-resident; the host is touched only when a
-  monitor records.
+  float32. VRAM-resident when the run fits the device; otherwise the
+  host-resident domain is streamed through the GPU in temporally-blocked
+  tiles over the DMA copy engines, so beyond-VRAM runs keep near-GPU
+  throughput.
 
 Both store CPML psi state compacted to the PML slabs (cells whose CPML `c`
 coefficient is nonzero never develop psi, so this is exactly equivalent to
@@ -23,7 +26,7 @@ Supported: 1D/2D/3D, CPML, point/soft sources (hence ModeSource /
 SinglePhotonSource via expansion), FieldMonitor (interval/times, downsample,
 plane_z) and DFTMonitor. Not supported (raises): dispersive media, subpixel
 smoothing, ChargedParticle, FluxMonitor (needs every-step accumulation),
-FieldMonitor(compression=), and float32 on the CPU core (CUDA-only).
+and FieldMonitor(compression=).
 """
 from __future__ import annotations
 
@@ -82,17 +85,11 @@ def cuda_available() -> bool:
 def _validate(sim, cuda: bool) -> None:
     from .simulation import _COMPUTE_KEYS
     dts = {np.dtype(sim.dtypes[k]) for k in _COMPUTE_KEYS}
-    if cuda:
-        if dts not in ({np.dtype(np.float64)}, {np.dtype(np.float32)}):
-            raise NotImplementedError(
-                "backend='rust-cuda' needs one uniform compute precision "
-                "('float32' or 'float64'; monitor storage may differ)."
-            )
-    elif dts != {np.dtype(np.float64)}:
+    if dts not in ({np.dtype(np.float64)}, {np.dtype(np.float32)}):
+        backend = "rust-cuda" if cuda else "rust"
         raise NotImplementedError(
-            "the Rust CPU backend runs in float64 only; use "
-            "precision='float64' (monitor storage precision may differ), or "
-            "backend='rust-cuda' for float32."
+            f"backend='{backend}' needs one uniform compute precision "
+            "('float32' or 'float64'; monitor storage may differ)."
         )
     if sim.subpixel:
         raise NotImplementedError(
@@ -152,8 +149,10 @@ def _build_tables(sim, npdt):
     t["maps_h"] = [_pml_map(a) for a in t["c_h"]]
 
     # Soft-source tables: value added to (comp, i, j, k) at each step,
-    # evaluated at the component's Yee time (H at t+dt/2, E at t+dt).
-    n_src = len(sim.sources)
+    # evaluated at the component's Yee time (H at t+dt/2, E at t+dt). A
+    # sourceless sim gets one zero-amplitude dummy entry so the tables are
+    # never empty (the CUDA path allocates device buffers from them).
+    n_src = max(len(sim.sources), 1)
     steps = np.arange(n_steps)
     t["src_comp"] = np.zeros(n_src, dtype=np.int64)
     t["src_idx"] = np.zeros((n_src, 3), dtype=np.int64)
@@ -168,15 +167,33 @@ def _build_tables(sim, npdt):
 
 
 class _CpuEngine:
-    """Rayon CPU core: fields/psi live as numpy arrays, stepped in place."""
+    """Rayon CPU core: fields/psi live as numpy arrays, stepped in place.
 
-    def __init__(self, sim):
+    On large domains (beyond cache) the time loop runs with ghost-zone
+    temporal blocking (see rust/src/blocked.rs): x-slab tiles are advanced
+    ``t_block`` steps per visit so the arrays cross RAM ~twice per t_block
+    steps instead of twice per step. Bit-identical to plain stepping.
+    Override with PHOTONFDTD_RUST_TB (0 disables) / PHOTONFDTD_RUST_TILE.
+    """
+
+    # Enable temporal blocking above ~4x a typical L3 (stepping state no
+    # longer cache-resident). Short blocks + small tiles measure best on
+    # CPU: the halo is t_block+2 rows, so long blocks pay ~2*T/tile_rows in
+    # redundant halo compute while the tile buffer outgrows its cache slice.
+    # A parameter scan on a 20M-cell strip put T=8 with ~3.5 MB tile
+    # buffers ahead of every longer-block configuration.
+    _TB_MIN_BYTES = 256e6
+    _TB_DEFAULT = 8
+
+    def __init__(self, sim, npdt=np.float64):
         rs = _rust_module()
-        self._rs = rs
+        self._npdt = np.dtype(npdt).type
+        self._step_range = (rs.step_range_f64 if self._npdt == np.float64
+                            else rs.step_range_f32)
         nx, ny, nz = sim.grid.shape
-        self._t = t = _build_tables(sim, np.float64)
+        self._t = t = _build_tables(sim, self._npdt)
         self._dxyz = tuple(d if d > 0 else 1.0 for d in sim.grid.cell_size)
-        z = lambda shape: np.zeros(shape, dtype=np.float64)
+        z = lambda shape: np.zeros(shape, dtype=self._npdt)
         self._fields = [z((nx, ny, nz)) for _ in range(6)]
         pe = [int((m >= 0).sum()) for m in t["maps_e"]]
         ph = [int((m >= 0).sum()) for m in t["maps_h"]]
@@ -188,27 +205,50 @@ class _CpuEngine:
             z((nx, ny, ph[2])), z((ph[0], ny, nz)),   # psi_Hy_z, psi_Hy_x
             z((ph[0], ny, nz)), z((nx, ph[1], nz)),   # psi_Hz_x, psi_Hz_y
         ]
+        import os
+        itemsize = np.dtype(self._npdt).itemsize
+        state_bytes = 7 * nx * ny * nz * itemsize
+        tb = int(os.environ.get(
+            "PHOTONFDTD_RUST_TB",
+            self._TB_DEFAULT if state_bytes > self._TB_MIN_BYTES else 0))
+        # Tile core sized so one tile buffer (~8 evolving arrays x rows) is
+        # ~3.5 MB - roughly an L3 slice per worker thread (see scan above).
+        row_bytes = max(ny * nz * itemsize * 8, 1)
+        default_rows = max(2 * (tb + 2), int(3.5e6 / row_bytes))
+        self._t_block = tb
+        self._tile_rows = int(os.environ.get("PHOTONFDTD_RUST_TILE",
+                                             default_rows))
 
     def advance(self, step0: int, n_sub: int) -> None:
         t = self._t
         dx, dy, dz = self._dxyz
-        self._rs.step_range(*self._fields, *self._psi,
-                            t["b_e"], t["c_e"], t["b_h"], t["c_h"],
-                            t["maps_e"], t["maps_h"],
-                            t["ce_field"], float(t["ch_field"]),
-                            dx, dy, dz,
-                            t["src_comp"], t["src_idx"], t["src_vals"],
-                            step0, n_sub)
+        self._step_range(*self._fields, self._psi,
+                         t["b_e"], t["c_e"], t["b_h"], t["c_h"],
+                         t["maps_e"], t["maps_h"],
+                         t["ce_field"], float(t["ch_field"]),
+                         dx, dy, dz,
+                         t["src_comp"], t["src_idx"], t["src_vals"],
+                         step0, n_sub, self._t_block, self._tile_rows)
 
     def get(self, comp: str) -> np.ndarray:
         return self._fields[_COMP_CODE[comp]]
 
 
 class _CudaEngine:
-    """CUDA core: all state device-resident; components are downloaded (and
-    cached until the next advance) only when a monitor records."""
+    """CUDA core. VRAM-resident when the run fits the device (all state on
+    the GPU; components are downloaded, and cached until the next advance,
+    only when a monitor records). When the stepping state would not fit -
+    or PHOTONFDTD_CUDA_STREAM=1 forces it - the domain stays in host RAM
+    and is streamed through the GPU in temporally-blocked x-slab tiles over
+    the DMA copy engines (see StreamingCudaStepper): per ``t_block`` steps
+    the domain crosses PCIe ~twice instead of 2*t_block times, so beyond-
+    VRAM runs keep near-GPU throughput. Bit-identical either way.
+    """
+
+    _TB_DEFAULT = 32
 
     def __init__(self, sim, npdt):
+        import os
         import sys
         rs = _rust_module()
         if not getattr(rs, "CUDA_BUILT", False):
@@ -218,18 +258,39 @@ class _CudaEngine:
                 "cuda' in rust/."
             )
         t = _build_tables(sim, npdt)
+        nx, ny, nz = sim.grid.shape
         dx, dy, dz = (npdt(d) if d > 0 else npdt(1.0) for d in sim.grid.cell_size)
-        ctor = rs.CudaStepper.new_f64 if npdt == np.float64 else rs.CudaStepper.new_f32
-        self._stepper = ctor(
+        name, free_mb, total_mb = rs.CudaStepper.device_info()
+        itemsize = np.dtype(npdt).itemsize
+        # Rough resident need: 6 fields + ce + compact psi + slack.
+        need_mb = 7.5 * nx * ny * nz * itemsize / 1e6
+        stream = os.environ.get("PHOTONFDTD_CUDA_STREAM")
+        self._streaming = (stream == "1" or
+                           (stream != "0" and need_mb > 0.85 * free_mb))
+        args = (
             t["ce_field"], t["b_e"], t["c_e"], t["b_h"], t["c_h"],
             [m for m in t["maps_e"]], [m for m in t["maps_h"]],
             npdt(t["ch_field"]), dx, dy, dz,
             t["src_comp"].astype(np.int32),
             t["src_idx"].astype(np.int32),
             t["src_vals"])
-        name, free_mb, total_mb = rs.CudaStepper.device_info()
+        if self._streaming:
+            t_block = int(os.environ.get("PHOTONFDTD_CUDA_TB", self._TB_DEFAULT))
+            # Tile sized to ~1/4 of free VRAM (~20 slab-arrays resident).
+            row_bytes = max(ny * nz * itemsize * 20, 1)
+            default_rows = max(4 * (t_block + 2),
+                               int(0.25 * free_mb * 1e6 / row_bytes))
+            tile_rows = int(os.environ.get("PHOTONFDTD_CUDA_TILE", default_rows))
+            ctor = (rs.StreamingCudaStepper.new_f64 if npdt == np.float64
+                    else rs.StreamingCudaStepper.new_f32)
+            self._stepper = ctor(*args, t_block, tile_rows)
+        else:
+            ctor = (rs.CudaStepper.new_f64 if npdt == np.float64
+                    else rs.CudaStepper.new_f32)
+            self._stepper = ctor(*args)
         if sim.verbose:
-            print(f"[photonfdtd] Rust CUDA backend, device: {name} "
+            mode = "streaming (host-resident)" if self._streaming else "VRAM-resident"
+            print(f"[photonfdtd] Rust CUDA backend ({mode}), device: {name} "
                   f"({free_mb}/{total_mb} MB free)", file=sys.stderr, flush=True)
         self._cache: Dict[str, np.ndarray] = {}
 
@@ -389,7 +450,8 @@ def _run_loop(sim, engine):
 def run_rust(sim):
     """Run ``sim`` on the Rust CPU backend and return a Result."""
     _validate(sim, cuda=False)
-    return _run_loop(sim, _CpuEngine(sim))
+    npdt = np.dtype(sim.dtypes["Ex"]).type
+    return _run_loop(sim, _CpuEngine(sim, npdt))
 
 
 def run_rust_cuda(sim):

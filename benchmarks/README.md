@@ -36,11 +36,12 @@ as "steady":
 
 | backend        | prec | wall (s) | steady (s) | Mcell-steps/s | peak RSS (MB) |
 |----------------|------|---------:|-----------:|--------------:|--------------:|
-| rust-cuda      | f64  |     0.73 |       0.73 |          4830 |           383 |
-| rust-cuda      | f32  |     0.48 |       0.48 |          7452 |           378 |
+| rust-cuda      | f64  |     0.81 |       0.81 |          4380 |           385 |
+| rust-cuda      | f32  |     0.57 |       0.57 |          6185 |           380 |
 | jax (GPU)      | f64  |      3.8 |       ~2.6 |           928 |          1248 |
 | jax (GPU)      | f32  |      1.9 |       ~1.4 |          1894 |          1068 |
-| rust (CPU)     | f64  |      7.7 |        7.7 |           462 |           258 |
+| rust (CPU)     | f64  |      8.9 |        8.9 |           397 |           258 |
+| rust (CPU)     | f32  |      6.7 |        6.7 |           529 |           239 |
 | jax (CPU)      | f64  |     15.6 |       15.6 |           227 |           858 |
 | numpy          | f64  |    147.9 |      147.9 |            24 |           281 |
 
@@ -48,7 +49,45 @@ All f64 backends agree on the final field frame to ~2e-14 relative
 (double-precision round-off over 6295 steps); f32 runs agree to ~5e-6, i.e.
 single-precision round-off. The Rust CUDA margin over XLA comes from fused
 H/E kernels (each array is touched once per pass) and in-place updates;
-both saturate the same VRAM bandwidth ceiling in principle.
+both saturate the same VRAM bandwidth ceiling in principle. (This small
+0.56M-cell domain is largely cache-resident on the CPU, so CPU numbers here
+are compute-bound; the RAM-bound regime below is what large runs see.)
+
+## RAM-bound CPU throughput (20M-cell strip, whole-chip regime)
+
+Same strip as the memory benchmark. The fused H/E passes and ghost-zone
+temporal blocking (x-slab tiles advanced T=8 steps per visit inside a
+~3.5 MB thread-local buffer; enabled automatically on large domains, exact
+to the bit) both target this regime:
+
+| CPU path                      | f64 Mcell-steps/s | f32 Mcell-steps/s |
+|-------------------------------|------------------:|------------------:|
+| unfused (previous)            |               248 |                 - |
+| fused, plain                  |               310 |               626 |
+| fused + temporal blocking     |               382 |               913 |
+
+For scale, the measured STREAM triad on this machine is 34.3 GB/s; the
+fused plain path already runs at that roof, and blocking is what buys
+throughput past it.
+
+## Beyond-VRAM GPU streaming
+
+When the stepping state does not fit the device (or with
+`PHOTONFDTD_CUDA_STREAM=1`), `rust-cuda` keeps the domain in host RAM and
+streams temporally-blocked x-slab tiles through the GPU over the DMA copy
+engines - per T steps the domain crosses PCIe ~twice instead of 2T times.
+Bit-identical to the resident stepper (covered by the parity tests). On the
+20M-cell f64 strip, forced streaming with a ~1/5-domain tile (T=64):
+
+| GPU path                  | f64 Mcell-steps/s | f32 Mcell-steps/s | peak VRAM (MB) |
+|---------------------------|------------------:|------------------:|---------------:|
+| VRAM-resident             |              4067 |              7835 |           1331 |
+| streamed, tile-bounded    |              2483 |              5243 |            499 |
+
+Streaming holds ~60% of resident throughput while VRAM usage is set by the
+tile, not the domain - so domain size is limited by host RAM (~800M cells
+f32 on a 30 GB host, stepped ~13x faster than the best CPU path). Naive
+per-step streaming would be PCIe-bound at roughly 1% of this.
 
 ## Peak memory at whole-chip scale
 
@@ -79,10 +118,18 @@ The JAX CUDA plugin needs the `nvidia-*-cu12` wheels' lib dirs on
 `pip install --user "jax[cuda12]"`). `rust-cuda` needs only the CUDA driver
 plus NVRTC (from the system toolkit or the `nvidia-cuda-nvrtc-cu12` wheel).
 
-## Next step for beyond-VRAM domains
+## Tuning knobs (env vars)
 
-`rust-cuda` currently requires the domain to fit in VRAM. The planned
-extension is pinned-host-memory double buffering over the GPU's DMA copy
-engines with *temporal blocking* (advance each slab T~32-64 steps per visit
-with a light-cone halo), which amortizes the PCIe transfer cost by T and
-keeps near-GPU throughput on host-RAM-sized (billion-cell f32) domains.
+All optional; the defaults come from the scans above.
+
+- `PHOTONFDTD_RUST_TB` - CPU temporal-block length T (0 disables; default 8
+  on large domains).
+- `PHOTONFDTD_RUST_TILE` - CPU tile core rows (default ~3.5 MB buffers).
+- `PHOTONFDTD_CUDA_STREAM` - 1 forces GPU streaming, 0 forces resident
+  (default: stream only when the run does not fit VRAM).
+- `PHOTONFDTD_CUDA_TB` / `PHOTONFDTD_CUDA_TILE` - streaming block length
+  (default 32) and tile rows (default ~1/4 of free VRAM).
+
+Streaming transfers are currently pageable; pinned-host-memory double
+buffering would overlap DMA with compute and should recover most of the
+remaining gap to resident throughput.
