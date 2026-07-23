@@ -16,9 +16,12 @@ field.
 
 Run one backend per process (clean wall-clock + peak-RSS accounting):
 
-    python benchmarks/bench_grating_coupler.py numpy|jax|rust [outdir]
+    python benchmarks/bench_grating_coupler.py numpy|jax|rust|rust-cuda \
+        [outdir] [float64|float32]
 
-Writes <outdir>/gc_<backend>.npz with the Ez movie, timings, and peak RSS.
+Writes <outdir>/gc_<tag>.npz with the Ez movie, timings, and peak RSS
+(tag = backend, plus "_f32" for float32). For GPU JAX, put the nvidia pip
+wheels' lib dirs on LD_LIBRARY_PATH.
 """
 import json
 import math
@@ -85,7 +88,7 @@ def build_structures():
     return structures
 
 
-def build_sim(backend):
+def build_sim(backend, precision="float64"):
     grid = pf.Grid(size=SIZE, cell_size=DX, pml_layers=PML)
     freq0 = pf.C_0 / LAM0
     yprof = np.linspace(-0.75e-6, 0.75e-6, 61)
@@ -98,14 +101,20 @@ def build_sim(backend):
     interval = max(probe.n_steps // N_FRAMES, 1)
     mon = pf.FieldMonitor(name="movie", components=("Ez",),
                           interval=interval, downsample=DOWNSAMPLE)
+    # Monitor storage stays float64 for the cross-backend parity probe even
+    # when the compute precision is float32.
+    prec = {"compute": precision, "monitors": "float64"}
     return pf.Simulation(grid, structures=build_structures(), sources=[src],
-                         monitors=[mon], run_time=RUN_TIME, backend=backend)
+                         monitors=[mon], run_time=RUN_TIME, backend=backend,
+                         precision=prec)
 
 
 def main():
     backend = sys.argv[1]
     outdir = sys.argv[2] if len(sys.argv) > 2 else "."
-    sim = build_sim(backend)
+    precision = sys.argv[3] if len(sys.argv) > 3 else "float64"
+    tag = backend + ("_f32" if precision == "float32" else "")
+    sim = build_sim(backend, precision)
     n_cells = int(np.prod(sim.grid.shape))
 
     t0 = time.perf_counter()
@@ -118,14 +127,14 @@ def main():
     xs = sim.grid.coords[0][::DOWNSAMPLE]
     ys = sim.grid.coords[1][::DOWNSAMPLE]
     np.savez_compressed(
-        f"{outdir}/gc_{backend}.npz",
+        f"{outdir}/gc_{tag}.npz",
         frames=frames.astype(np.float32), eps=eps,
         x=xs, y=ys, times=result.monitor_times["movie"],
         frames64_tail=frames[-1].astype(np.float64),   # full-precision parity probe
         wall=wall, peak_mb=peak_mb,
         n_steps=sim.n_steps, n_cells=n_cells)
     print(json.dumps(dict(
-        backend=backend, wall_s=round(wall, 2), peak_rss_mb=round(peak_mb),
+        backend=tag, wall_s=round(wall, 2), peak_rss_mb=round(peak_mb),
         n_steps=sim.n_steps, n_cells=n_cells,
         mcellsteps_per_s=round(n_cells * sim.n_steps / wall / 1e6),
     )))

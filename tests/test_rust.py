@@ -9,10 +9,14 @@ import numpy as np
 import pytest
 
 import photonfdtd as pf
-from photonfdtd.rustbackend import rust_available
+from photonfdtd.rustbackend import rust_available, cuda_available
 
 pytestmark = pytest.mark.skipif(
     not rust_available(), reason="Rust extension (_photonfdtd_rs) not built"
+)
+
+needs_cuda = pytest.mark.skipif(
+    not cuda_available(), reason="Rust extension built without CUDA / no GPU"
 )
 
 
@@ -77,6 +81,58 @@ def test_rust_matches_numpy_1d():
 
     a, b = run("numpy"), run("rust")
     np.testing.assert_allclose(b, a, rtol=0.0, atol=1e-12 * np.abs(a).max())
+
+
+@needs_cuda
+def test_rust_cuda_matches_numpy_2d():
+    r_np = _run_2d("numpy")
+    r_cu = _run_2d("rust-cuda")
+    for c in ("Ez", "Hx", "Hy"):
+        a, b = r_np.fields["s"][c], r_cu.fields["s"][c]
+        np.testing.assert_allclose(b, a, rtol=0.0,
+                                   atol=1e-12 * np.abs(a).max())
+    a, b = r_np.dft["d"]["Ez"], r_cu.dft["d"]["Ez"]
+    np.testing.assert_allclose(b, a, rtol=0.0, atol=1e-12 * np.abs(a).max())
+
+
+@needs_cuda
+def test_rust_cuda_matches_numpy_3d():
+    def run(backend):
+        freq0 = pf.C_0 / 1.0e-6
+        grid = pf.Grid(size=(2.5e-6, 2e-6, 2e-6), cell_size=80e-9,
+                       pml_layers=(8, 8, 8))
+        box = pf.Box(center=(0.4e-6, 0, 0), size=(0.8e-6, 0.8e-6, 0.8e-6),
+                     medium=pf.Medium.from_index(1.8))
+        src = pf.PointDipole(position=(-0.5e-6, 0, 0), component="Ey",
+                             waveform=pf.GaussianPulse(freq0=freq0, fwhm=5e-15))
+        mon = pf.FieldMonitor(name="s", components=("Ey", "Hz"), times=[14e-15])
+        sim = pf.Simulation(grid, structures=[box], sources=[src],
+                            monitors=[mon], run_time=15e-15, backend=backend)
+        return sim.run().fields["s"]
+
+    a, b = run("numpy"), run("rust-cuda")
+    for c in a:
+        np.testing.assert_allclose(b[c], a[c], rtol=0.0,
+                                   atol=1e-12 * np.abs(a[c]).max())
+
+
+@needs_cuda
+def test_rust_cuda_float32():
+    r_np = _run_2d("numpy")
+    # float32 run should agree with the float64 reference to single round-off
+    freq0 = pf.C_0 / 1.0e-6
+    grid = pf.Grid(size=(4e-6, 3e-6), cell_size=50e-9, pml_layers=(10, 10, 0))
+    box = pf.Box(center=(0.6e-6, 0.0), size=(1.0e-6, 1.0e-6),
+                 medium=pf.Medium.from_index(2.0))
+    src = pf.PointDipole(position=(-0.8e-6, 0.0, 0.0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=freq0, fwhm=6e-15))
+    mon = pf.FieldMonitor(name="s", components=("Ez",), interval=25)
+    sim = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
+                        run_time=40e-15, backend="rust-cuda",
+                        precision="float32")
+    r32 = sim.run()
+    a, b = r_np.fields["s"]["Ez"], r32.fields["s"]["Ez"]
+    assert np.abs(a - b).max() < 1e-5 * np.abs(a).max()
 
 
 def test_rust_rejects_unsupported():

@@ -24,6 +24,9 @@ use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+#[cfg(feature = "cuda")]
+mod cuda;
+
 /// Raw mutable pointer wrapper so rayon threads can write disjoint x-slices
 /// of the same array. Safety: every parallel loop below writes only cells
 /// whose x index belongs to its own iteration, and reads either arrays not
@@ -474,5 +477,8 @@ fn step_range(
 fn _photonfdtd_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(step_range, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    #[cfg(feature = "cuda")]
+    m.add_class::<cuda::CudaStepper>()?;
+    m.add("CUDA_BUILT", cfg!(feature = "cuda"))?;
     Ok(())
 }

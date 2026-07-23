@@ -1,24 +1,29 @@
-"""Rust backend: the fused Yee+CPML kernel compiled from ``rust/src/lib.rs``.
+"""Rust backends: compiled Yee+CPML stepping cores from ``rust/src/``.
 
-The compiled extension (``photonfdtd._photonfdtd_rs``) runs the *time loop*
-itself in chunks: soft-source waveforms are precomputed into per-step tables
-(exactly as the JAX backend does in ``_build_static``), and Python is
-re-entered only at monitor-record steps to copy snapshots out. The kernel is
-a port of the Numba ``_update_fields_numba`` body (same maths, no fastmath),
-parallelised over x with rayon, so results track the NumPy reference to
-double-precision round-off.
+Two engines share one Python driver (source tables, chunked time loop,
+monitor recording):
 
-Build the extension with::
+* ``backend="rust"`` - CPU (rayon), float64. The whole time loop runs
+  natively; Python is re-entered only at monitor-record steps.
+* ``backend="rust-cuda"`` - GPU (CUDA, feature ``cuda``), float64 or
+  float32. All state is device-resident; the host is touched only when a
+  monitor records.
 
-    cd rust && cargo build --release
+Both store CPML psi state compacted to the PML slabs (cells whose CPML `c`
+coefficient is nonzero never develop psi, so this is exactly equivalent to
+dense storage), keeping the stepping state at six field arrays + the update
+coefficient + thin PML strips - sized for whole-chip domains.
+
+Build (CPU only / with CUDA)::
+
+    cd rust && cargo build --release [--features cuda]
     cp target/release/lib_photonfdtd_rs.so ../src/photonfdtd/_photonfdtd_rs.so
 
 Supported: 1D/2D/3D, CPML, point/soft sources (hence ModeSource /
 SinglePhotonSource via expansion), FieldMonitor (interval/times, downsample,
-plane_z) and DFTMonitor. Not supported (raises): float32 precision,
-dispersive media, subpixel smoothing, ChargedParticle, FluxMonitor (it needs
-every-step accumulation, which would defeat the chunked loop), and
-FieldMonitor(compression=).
+plane_z) and DFTMonitor. Not supported (raises): dispersive media, subpixel
+smoothing, ChargedParticle, FluxMonitor (needs every-step accumulation),
+FieldMonitor(compression=), and float32 on the CPU core (CUDA-only).
 """
 from __future__ import annotations
 
@@ -58,118 +63,197 @@ def rust_available() -> bool:
         return False
 
 
-def _validate(sim) -> None:
+def cuda_available() -> bool:
+    """Whether the extension was built with the CUDA feature *and* a usable
+    device is present."""
+    try:
+        rs = _rust_module()
+    except RuntimeError:
+        return False
+    if not getattr(rs, "CUDA_BUILT", False):
+        return False
+    try:
+        rs.CudaStepper.device_info()
+        return True
+    except Exception:
+        return False
+
+
+def _validate(sim, cuda: bool) -> None:
     from .simulation import _COMPUTE_KEYS
     dts = {np.dtype(sim.dtypes[k]) for k in _COMPUTE_KEYS}
-    if dts != {np.dtype(np.float64)}:
+    if cuda:
+        if dts not in ({np.dtype(np.float64)}, {np.dtype(np.float32)}):
+            raise NotImplementedError(
+                "backend='rust-cuda' needs one uniform compute precision "
+                "('float32' or 'float64'; monitor storage may differ)."
+            )
+    elif dts != {np.dtype(np.float64)}:
         raise NotImplementedError(
-            "the Rust backend runs in float64 only; use precision='float64' "
-            "(monitor storage precision may still differ)."
+            "the Rust CPU backend runs in float64 only; use "
+            "precision='float64' (monitor storage precision may differ), or "
+            "backend='rust-cuda' for float32."
         )
     if sim.subpixel:
         raise NotImplementedError(
-            "subpixel=True is not supported on the Rust backend; use the "
+            "subpixel=True is not supported on the Rust backends; use the "
             "NumPy or JAX backend."
         )
     if getattr(sim, "_has_dispersion", False):
         raise NotImplementedError(
-            "dispersive media are not supported on the Rust backend; use the "
-            "NumPy or JAX backend."
+            "dispersive media are not supported on the Rust backends; use "
+            "the NumPy or JAX backend."
         )
     if sim.particle_sources:
         raise NotImplementedError(
-            "ChargedParticle sources are not supported on the Rust backend; "
+            "ChargedParticle sources are not supported on the Rust backends; "
             "use the NumPy, Numba, or JAX backend."
         )
     for m in sim.monitors:
         if isinstance(m, FluxMonitor):
             raise NotImplementedError(
                 "FluxMonitor needs every-step accumulation and is not "
-                "supported on the Rust backend; use a DFTMonitor port plane "
+                "supported on the Rust backends; use a DFTMonitor port plane "
                 "or the NumPy/JAX backend."
             )
         if isinstance(m, FieldMonitor) and m.compression is not None:
             raise NotImplementedError(
                 "FieldMonitor(compression=) is a host-side store not wired "
-                "to the Rust backend; drop compression for backend='rust'."
+                "to the Rust backends; drop compression."
             )
 
 
-def run_rust(sim):
-    """Run ``sim`` on the Rust backend and return a Result."""
-    rs = _rust_module()
+# ------------------------------------------------------------------ #
+# Static tables shared by both engines.
+# ------------------------------------------------------------------ #
+def _pml_map(c_arr):
+    """Compact-index map along one axis: position of each nonzero-c cell in
+    the compact psi array, -1 in the bulk."""
+    m = np.full(c_arr.size, -1, dtype=np.int32)
+    idx = np.flatnonzero(c_arr != 0.0)
+    m[idx] = np.arange(idx.size, dtype=np.int32)
+    return m
+
+
+def _build_tables(sim, npdt):
+    grid = sim.grid
+    dt = sim.dt
+    n_steps = sim.n_steps
+    t = dict(
+        ce_field=np.ascontiguousarray(
+            dt / (np.asarray(sim.eps_r, dtype=np.float64) * EPS_0), dtype=npdt),
+        ch_field=npdt(dt / MU_0),
+        b_e=[np.ascontiguousarray(a, dtype=npdt) for a in sim._b_e],
+        c_e=[np.ascontiguousarray(a, dtype=npdt) for a in sim._c_e],
+        b_h=[np.ascontiguousarray(a, dtype=npdt) for a in sim._b_h],
+        c_h=[np.ascontiguousarray(a, dtype=npdt) for a in sim._c_h],
+    )
+    t["maps_e"] = [_pml_map(a) for a in t["c_e"]]
+    t["maps_h"] = [_pml_map(a) for a in t["c_h"]]
+
+    # Soft-source tables: value added to (comp, i, j, k) at each step,
+    # evaluated at the component's Yee time (H at t+dt/2, E at t+dt).
+    n_src = len(sim.sources)
+    steps = np.arange(n_steps)
+    t["src_comp"] = np.zeros(n_src, dtype=np.int64)
+    t["src_idx"] = np.zeros((n_src, 3), dtype=np.int64)
+    t["src_vals"] = np.zeros((n_src, max(n_steps, 1)), dtype=npdt)
+    for s, src in enumerate(sim.sources):
+        i, j, k = grid.index_at(src.position)
+        t["src_comp"][s] = _COMP_CODE[src.component]
+        t["src_idx"][s] = (i, j, k)
+        tt = (steps + (0.5 if src.component[0] == "H" else 1.0)) * dt
+        t["src_vals"][s] = np.asarray(src.amplitude * src.waveform(tt), dtype=npdt)
+    return t
+
+
+class _CpuEngine:
+    """Rayon CPU core: fields/psi live as numpy arrays, stepped in place."""
+
+    def __init__(self, sim):
+        rs = _rust_module()
+        self._rs = rs
+        nx, ny, nz = sim.grid.shape
+        self._t = t = _build_tables(sim, np.float64)
+        self._dxyz = tuple(d if d > 0 else 1.0 for d in sim.grid.cell_size)
+        z = lambda shape: np.zeros(shape, dtype=np.float64)
+        self._fields = [z((nx, ny, nz)) for _ in range(6)]
+        pe = [int((m >= 0).sum()) for m in t["maps_e"]]
+        ph = [int((m >= 0).sum()) for m in t["maps_h"]]
+        self._psi = [
+            z((nx, pe[1], nz)), z((nx, ny, pe[2])),   # psi_Ex_y, psi_Ex_z
+            z((nx, ny, pe[2])), z((pe[0], ny, nz)),   # psi_Ey_z, psi_Ey_x
+            z((pe[0], ny, nz)), z((nx, pe[1], nz)),   # psi_Ez_x, psi_Ez_y
+            z((nx, ph[1], nz)), z((nx, ny, ph[2])),   # psi_Hx_y, psi_Hx_z
+            z((nx, ny, ph[2])), z((ph[0], ny, nz)),   # psi_Hy_z, psi_Hy_x
+            z((ph[0], ny, nz)), z((nx, ph[1], nz)),   # psi_Hz_x, psi_Hz_y
+        ]
+
+    def advance(self, step0: int, n_sub: int) -> None:
+        t = self._t
+        dx, dy, dz = self._dxyz
+        self._rs.step_range(*self._fields, *self._psi,
+                            t["b_e"], t["c_e"], t["b_h"], t["c_h"],
+                            t["maps_e"], t["maps_h"],
+                            t["ce_field"], float(t["ch_field"]),
+                            dx, dy, dz,
+                            t["src_comp"], t["src_idx"], t["src_vals"],
+                            step0, n_sub)
+
+    def get(self, comp: str) -> np.ndarray:
+        return self._fields[_COMP_CODE[comp]]
+
+
+class _CudaEngine:
+    """CUDA core: all state device-resident; components are downloaded (and
+    cached until the next advance) only when a monitor records."""
+
+    def __init__(self, sim, npdt):
+        import sys
+        rs = _rust_module()
+        if not getattr(rs, "CUDA_BUILT", False):
+            raise RuntimeError(
+                "backend='rust-cuda' but the extension was built without the "
+                "CUDA feature. Rebuild with 'cargo build --release --features "
+                "cuda' in rust/."
+            )
+        t = _build_tables(sim, npdt)
+        dx, dy, dz = (npdt(d) if d > 0 else npdt(1.0) for d in sim.grid.cell_size)
+        ctor = rs.CudaStepper.new_f64 if npdt == np.float64 else rs.CudaStepper.new_f32
+        self._stepper = ctor(
+            t["ce_field"], t["b_e"], t["c_e"], t["b_h"], t["c_h"],
+            [m for m in t["maps_e"]], [m for m in t["maps_h"]],
+            npdt(t["ch_field"]), dx, dy, dz,
+            t["src_comp"].astype(np.int32),
+            t["src_idx"].astype(np.int32),
+            t["src_vals"])
+        name, free_mb, total_mb = rs.CudaStepper.device_info()
+        if sim.verbose:
+            print(f"[photonfdtd] Rust CUDA backend, device: {name} "
+                  f"({free_mb}/{total_mb} MB free)", file=sys.stderr, flush=True)
+        self._cache: Dict[str, np.ndarray] = {}
+
+    def advance(self, step0: int, n_sub: int) -> None:
+        self._cache.clear()
+        self._stepper.run_steps(step0, n_sub)
+
+    def get(self, comp: str) -> np.ndarray:
+        if comp not in self._cache:
+            self._cache[comp] = self._stepper.read_field(_COMP_CODE[comp])
+        return self._cache[comp]
+
+
+# ------------------------------------------------------------------ #
+# Shared driver: chunked time loop + monitor recording.
+# ------------------------------------------------------------------ #
+def _run_loop(sim, engine):
     from .simulation import Result
 
-    _validate(sim)
     grid = sim.grid
-    nx, ny, nz = grid.shape
-    dx, dy, dz = (d if d > 0 else 1.0 for d in grid.cell_size)
     dt = sim.dt
     n_steps = sim.n_steps
     mon_dtype = sim.dtypes["monitors"]
 
-    # Field arrays, C-contiguous float64 (the kernel indexes flat
-    # (i*ny + j)*nz + k).
-    z = lambda: np.zeros((nx, ny, nz), dtype=np.float64)
-    Ex, Ey, Ez, Hx, Hy, Hz = z(), z(), z(), z(), z(), z()
-
-    ce_field = np.ascontiguousarray(dt / (np.asarray(sim.eps_r, dtype=np.float64) * EPS_0))
-    ch_field = dt / MU_0
-    b_e = [np.ascontiguousarray(a, dtype=np.float64) for a in sim._b_e]
-    c_e = [np.ascontiguousarray(a, dtype=np.float64) for a in sim._c_e]
-    b_h = [np.ascontiguousarray(a, dtype=np.float64) for a in sim._b_h]
-    c_h = [np.ascontiguousarray(a, dtype=np.float64) for a in sim._c_h]
-
-    # CPML psi state, compacted to the PML slabs: along each psi array's
-    # derivative axis only the cells with a nonzero CPML `c` coefficient are
-    # stored, addressed via a per-axis compact-index map (-1 = bulk, no psi).
-    # Cells with c == 0 never develop psi, so this is exactly equivalent to
-    # dense storage while keeping the stepping state at ~6 field arrays +
-    # ce_field + thin PML strips - sized for whole-chip domains.
-    def _pml_map(c_arr):
-        m = np.full(c_arr.size, -1, dtype=np.int32)
-        idx = np.flatnonzero(c_arr != 0.0)
-        m[idx] = np.arange(idx.size, dtype=np.int32)
-        return m, idx.size
-
-    maps_e, maps_h, pe, ph = [], [], [], []
-    for ax in range(3):
-        m, n = _pml_map(c_e[ax]); maps_e.append(m); pe.append(n)
-        m, n = _pml_map(c_h[ax]); maps_h.append(m); ph.append(n)
-
-    zc = lambda shape: np.zeros(shape, dtype=np.float64)
-    psi = [
-        zc((nx, pe[1], nz)),   # psi_Ex_y
-        zc((nx, ny, pe[2])),   # psi_Ex_z
-        zc((nx, ny, pe[2])),   # psi_Ey_z
-        zc((pe[0], ny, nz)),   # psi_Ey_x
-        zc((pe[0], ny, nz)),   # psi_Ez_x
-        zc((nx, pe[1], nz)),   # psi_Ez_y
-        zc((nx, ph[1], nz)),   # psi_Hx_y
-        zc((nx, ny, ph[2])),   # psi_Hx_z
-        zc((nx, ny, ph[2])),   # psi_Hy_z
-        zc((ph[0], ny, nz)),   # psi_Hy_x
-        zc((ph[0], ny, nz)),   # psi_Hz_x
-        zc((nx, ph[1], nz)),   # psi_Hz_y
-    ]
-
-    # Precomputed soft-source tables: value added to (comp, i, j, k) at each
-    # step, evaluated at the component's Yee time (H at t+dt/2, E at t+dt).
-    n_src = len(sim.sources)
-    src_comp = np.zeros(n_src, dtype=np.int64)
-    src_idx = np.zeros((n_src, 3), dtype=np.int64)
-    src_vals = np.zeros((n_src, max(n_steps, 1)), dtype=np.float64)
-    steps = np.arange(n_steps)
-    for s, src in enumerate(sim.sources):
-        i, j, k = grid.index_at(src.position)
-        src_comp[s] = _COMP_CODE[src.component]
-        src_idx[s] = (i, j, k)
-        t = (steps + (0.5 if src.component[0] == "H" else 1.0)) * dt
-        src_vals[s] = np.asarray(src.amplitude * src.waveform(t), dtype=np.float64)
-
-    comps = {"Ex": Ex, "Ey": Ey, "Ez": Ez, "Hx": Hx, "Hy": Hy, "Hz": Hz}
-
-    # ---- monitor bookkeeping (mirrors the NumPy path) ---- #
     result = Result(times=np.arange(n_steps) * dt)
     rec_fields: Dict[str, Dict[str, Optional[np.ndarray]]] = {}
     rec_times: Dict[str, list] = {}
@@ -227,7 +311,7 @@ def run_rust(sim):
         idx = rec_count[m.name]
         n_rec = sum(1 for s in rec_steps[m.name] if 0 <= s < n_steps)
         for c in m.components:
-            snap = snap_view(comps[c], m.downsample, rec_zslice[m.name])
+            snap = snap_view(engine.get(c), m.downsample, rec_zslice[m.name])
             arr = store[c]
             if arr is None:
                 arr = np.empty((n_rec,) + snap.shape, dtype=mon_dtype)
@@ -242,7 +326,7 @@ def run_rust(sim):
         omega = dft_omega[m.name]
         store = dft_accum[m.name]
         for c in m.components:
-            snap = snap_view_plane(comps[c], m.downsample, dft_plane[m.name])
+            snap = snap_view_plane(engine.get(c), m.downsample, dft_plane[m.name])
             t = t_e if c[0] == "E" else t_h
             phase = np.exp(1j * omega * t).reshape((-1,) + (1,) * snap.ndim)
             acc = store[c]
@@ -259,17 +343,13 @@ def run_rust(sim):
     pos = 0
 
     def _advance(to_step_exclusive):
-        """Run steps [pos, to_step_exclusive) in Rust (chunked for progress)."""
+        """Run steps [pos, to_step_exclusive) (chunked for progress)."""
         nonlocal pos
         while pos < to_step_exclusive:
             n_sub = min(to_step_exclusive - pos,
                         progress_interval if sim.progress_callback else
                         to_step_exclusive - pos)
-            rs.step_range(Ex, Ey, Ez, Hx, Hy, Hz, *psi,
-                          b_e, c_e, b_h, c_h, maps_e, maps_h,
-                          ce_field, ch_field,
-                          dx, dy, dz, src_comp, src_idx, src_vals,
-                          pos, n_sub)
+            engine.advance(pos, n_sub)
             pos += n_sub
             if sim.progress_callback is not None:
                 sim.progress_callback(min(pos, n_steps), n_steps)
@@ -304,3 +384,16 @@ def run_rust(sim):
                     np.zeros((len(m.freqs),) + grid.shape, dtype=np.complex128)
             result.dft[m.name] = out
     return result
+
+
+def run_rust(sim):
+    """Run ``sim`` on the Rust CPU backend and return a Result."""
+    _validate(sim, cuda=False)
+    return _run_loop(sim, _CpuEngine(sim))
+
+
+def run_rust_cuda(sim):
+    """Run ``sim`` on the Rust CUDA backend and return a Result."""
+    _validate(sim, cuda=True)
+    npdt = np.dtype(sim.dtypes["Ex"]).type
+    return _run_loop(sim, _CudaEngine(sim, npdt))

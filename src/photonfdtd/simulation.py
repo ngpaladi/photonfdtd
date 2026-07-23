@@ -409,8 +409,9 @@ class Simulation:
         # pay off (see _use_jax_backend), otherwise the NumPy core. Explicit
         # values ("numpy"/"jax") force the choice; the use_jax / use_gpu /
         # use_numba booleans, if set, still win for back-compatibility.
-        if backend not in ("auto", "numpy", "jax", "rust"):
-            raise ValueError("backend must be 'auto', 'numpy', 'jax', or 'rust'")
+        if backend not in ("auto", "numpy", "jax", "rust", "rust-cuda"):
+            raise ValueError(
+                "backend must be 'auto', 'numpy', 'jax', 'rust', or 'rust-cuda'")
         self.backend = backend
         # The fused Numba kernel is a single specialization over all stepping
         # arrays; mixing dtypes among them has no real use case and unclear
@@ -892,13 +893,15 @@ class Simulation:
                 tile_cells = max(self.grid.shape[0] // 8, 1)
             return run_out_of_core(self, tile_cells, workdir=ooc_workdir)
 
-        if self.backend == "rust":
-            # Compiled Rust stepping core (rust/src/lib.rs): the whole time
-            # loop runs natively with PML-slab-compacted psi state - the
-            # lowest-memory in-core backend. Explicit opt-in only (not part
-            # of "auto") while experimental.
-            from .rustbackend import run_rust
-            return run_rust(self)
+        if self.backend in ("rust", "rust-cuda"):
+            # Compiled Rust stepping cores (rust/src/): the whole time loop
+            # runs natively with PML-slab-compacted psi state - the
+            # lowest-memory in-core backends. "rust" is the rayon CPU core;
+            # "rust-cuda" keeps all state GPU-resident (float32 or float64).
+            # Explicit opt-in only (not part of "auto") while experimental.
+            from .rustbackend import run_rust, run_rust_cuda
+            return (run_rust_cuda if self.backend == "rust-cuda"
+                    else run_rust)(self)
 
         if self._use_jax_backend(out_of_core):
             from .jaxbackend import run_jax

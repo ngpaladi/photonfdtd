@@ -18,6 +18,10 @@ from matplotlib import animation
 INK = "#3d3d3d"
 MUTED = "#8a8a8a"
 
+DISPLAY = {"rust": "Rust CPU", "rust-cuda": "Rust CUDA",
+           "rust-cuda_f32": "Rust CUDA f32", "jax": "JAX",
+           "jax_f32": "JAX f32", "numpy": "NumPy"}
+
 
 def make_gif(datadir, backend):
     d = np.load(f"{datadir}/gc_{backend}.npz")
@@ -41,7 +45,8 @@ def make_gif(datadir, backend):
     for s in ax.spines.values():
         s.set_color(MUTED)
         s.set_linewidth(0.6)
-    ax.set_title(f"Elliptic grating coupler — {backend.upper()} backend\n"
+    ax.set_title(f"Elliptic grating coupler — "
+                 f"{DISPLAY.get(backend, backend)} backend\n"
                  f"{wall:.1f} s wall · {peak/1024:.2f} GB peak RSS · "
                  f"{int(d['n_steps'])} steps on {int(d['n_cells'])/1e6:.2f}M cells",
                  color=INK, fontsize=11, loc="left", pad=10)
