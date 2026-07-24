@@ -22,6 +22,7 @@
 use numpy::{Element, PyArray1, PyArray2, PyArray3, PyArrayMethods};
 use pyo3::prelude::*;
 
+mod adi;
 mod blocked;
 mod kernel;
 
@@ -139,6 +140,7 @@ make_step_range!(step_range_f32, f32);
 fn _photonfdtd_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(step_range_f64, m)?)?;
     m.add_function(wrap_pyfunction!(step_range_f32, m)?)?;
+    adi::register(m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     #[cfg(feature = "cuda")]
     {

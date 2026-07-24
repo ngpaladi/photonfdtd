@@ -44,6 +44,11 @@ from .reversible_pml import (
 )
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
+from .eim import (
+    Layer, SlabModes, slab_modes, effective_index, EffectiveIndex2D,
+)
+from .eme import Section, EMEResult, eme_2d, sections_from_eps
+from .adi import ADISimulation2D, ADISource, ADIResult
 from .design import (
     EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
 )
@@ -67,6 +72,10 @@ __all__ = [
     "jax_value_and_grad_eps_reversible",
     "jax_value_and_grad_eps_reversible_pml",
     "mode_amplitudes", "port_fields", "s_parameters",
+    # 2.5-D effective-index reduction, eigenmode expansion, ADI-FDTD
+    "Layer", "SlabModes", "slab_modes", "effective_index", "EffectiveIndex2D",
+    "Section", "EMEResult", "eme_2d", "sections_from_eps",
+    "ADISimulation2D", "ADISource", "ADIResult",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
     "estimate_memory", "recommend_mode", "format_report", "available_memory",
     "adapters", "from_gdsfactory",

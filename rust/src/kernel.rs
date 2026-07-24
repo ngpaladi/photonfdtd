@@ -15,10 +15,12 @@ pub trait Real:
     Copy
     + Send
     + Sync
+    + Default
     + PartialEq
     + core::ops::Add<Output = Self>
     + core::ops::Sub<Output = Self>
     + core::ops::Mul<Output = Self>
+    + core::ops::Div<Output = Self>
     + core::ops::Neg<Output = Self>
     + core::ops::AddAssign
 {
