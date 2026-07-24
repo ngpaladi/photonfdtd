@@ -11,8 +11,11 @@ correct; the pieces that don't, don't. See *Status* below.
 
 ## Install
 
-photonfdtd is not on PyPI yet, so `pip install photonfdtd` does not work.
-Install it from source instead — either directly from GitHub:
+```bash
+pip install photonfdtd
+```
+
+or from source, either directly from GitHub:
 
 ```bash
 pip install "git+https://github.com/ngpaladi/photonfdtd"
@@ -26,7 +29,27 @@ cd photonfdtd
 pip install -e .
 ```
 
-Once a release is published to PyPI, `pip install photonfdtd` will work too.
+The PyPI wheel is pure Python (NumPy core; `photonfdtd[jax]` for the
+differentiable XLA backend). The optional compiled Rust / CUDA backends
+(`backend="rust"`, `backend="rust-cuda"`) are built separately from the Rust
+sources shipped in the sdist — see [`benchmarks/README.md`](benchmarks/README.md).
+
+### Releasing (maintainers)
+
+Releases publish to PyPI automatically via
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) using PyPI
+**Trusted Publishing** (OIDC — no API token stored). To cut a release:
+
+1. Bump the version in `pyproject.toml` **and** `src/photonfdtd/__init__.py`
+   (kept in sync by `tests/test_version.py`).
+2. Publish a GitHub Release tagged `vX.Y.Z` matching that version. The workflow
+   runs the tests, guards tag-vs-version, builds the sdist + wheel, and
+   publishes.
+
+One-time setup before the first release: on PyPI, add a *trusted publisher* for
+the project (Publishing → add a GitHub Actions publisher) with owner `ngpaladi`,
+repo `photonfdtd`, workflow `publish.yml`, environment `pypi`. Until the project
+exists, use PyPI's *pending publisher* form with the same values.
 
 ## Quick start
 
