@@ -1,0 +1,26 @@
+[package]
+name = "photonfdtd-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust FDTD stepping kernel for photonfdtd (PyO3 extension)"
+license = "MIT"
+
+[lib]
+name = "_photonfdtd_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+rayon = "1.10"
+cudarc = { version = "0.19.8", optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[features]
+# GPU stepping core (CudaStepper). Off by default so the CPU backend builds
+# on machines without the CUDA driver/NVRTC libraries.
+# cuda-12020 matches the CUDA 12.2 driver (535.x); adjust to your driver.
+cuda = ["dep:cudarc", "cudarc/cuda-12020"]

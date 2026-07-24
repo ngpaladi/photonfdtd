@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonfdtd"
-version = "0.11.0"
-description = "Local-only FDTD + waveguide mode solver for integrated photonics, in pure Python/NumPy."
+version = "0.12.0"
+description = "Local-only FDTD + waveguide mode solver for integrated photonics (NumPy core; optional JAX and compiled Rust/CUDA backends)."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -44,6 +44,17 @@ Issues = "https://github.com/ngpaladi/photonfdtd/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/photonfdtd"]
+# The compiled Rust extension (_photonfdtd_rs.*) is platform-specific and is
+# built separately (see rust/README or benchmarks/README.md); never bundle a
+# locally-built binary into the pure-Python wheel.
+exclude = ["*.so", "*.pyd", "*.dylib"]
+
+[tool.hatch.build.targets.sdist]
+# Ship the Rust sources so a user with a toolchain can build the optional
+# backends, but never the build output.
+include = ["src/photonfdtd", "rust/Cargo.toml", "rust/Cargo.lock",
+           "rust/src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+exclude = ["rust/target", "*.so", "*.pyd", "*.dylib"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

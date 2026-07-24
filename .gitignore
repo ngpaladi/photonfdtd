@@ -12,3 +12,4 @@ docs/_build/
 htmlcov/
 *.so
 .DS_Store
+rust/target/
