@@ -31,6 +31,11 @@ Geometry
 
 .. automodule:: photonfdtd.geometry
 
+Subpixel smoothing
+------------------
+
+.. automodule:: photonfdtd.smoothing
+
 Sources
 -------
 
@@ -51,10 +56,67 @@ Simulation
 
 .. automodule:: photonfdtd.simulation
 
+JAX engine
+----------
+
+The differentiable time loop behind :meth:`Simulation.run
+<photonfdtd.Simulation.run>`, its adjoints, and memory planning; see
+:doc:`backends`.
+
+Time stepping (differentiable)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.jaxbackend
+
+Reversible adjoint
+~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.reversible
+
+Reversible adjoint with CPML
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.reversible_pml
+
+Memory planning
+~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.memory
+
 Mode solver
 -----------
 
 .. automodule:: photonfdtd.mode
+
+S-parameters
+------------
+
+.. automodule:: photonfdtd.smatrix
+
+Inverse design
+--------------
+
+.. automodule:: photonfdtd.design
+
+Layout-scale methods
+--------------------
+
+See :doc:`layout_scale` for the guide.
+
+Effective-index method (2.5-D)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.eim
+
+Eigenmode expansion
+~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.eme
+
+ADI-FDTD (CFL-free)
+~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.adi
 
 Adapters
 --------

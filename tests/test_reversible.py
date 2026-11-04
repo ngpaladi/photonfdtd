@@ -7,7 +7,7 @@ import pytest
 
 import photonfdtd as pf
 
-jax = pytest.importorskip("jax")
+import jax
 import jax.numpy as jnp   # noqa: E402
 jax.config.update("jax_enable_x64", True)
 
@@ -23,7 +23,7 @@ def _nopml_sim(run_time=60e-15):
                          waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0])
     return pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
-                         run_time=run_time, use_jax=True)
+                         run_time=run_time)
 
 
 def test_forward_reverse_is_identity():
@@ -76,7 +76,7 @@ def test_reversible_pml_gradient_matches_plain():
                          waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0])
     sim = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
-                        run_time=45e-15, use_jax=True)
+                        run_time=45e-15)
 
     # forward-then-reverse returns to the initial state at machine precision.
     from photonfdtd.jaxbackend import _build_static, _monitor_plan
@@ -112,7 +112,7 @@ def test_reversible_gating():
                          waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0])
     sim = pf.Simulation(grid, sources=[src], monitors=[mon],
-                        run_time=20e-15, use_jax=True)
+                        run_time=20e-15)
     from photonfdtd.reversible import reversible_available
     ok, _ = reversible_available(sim)
     assert not ok

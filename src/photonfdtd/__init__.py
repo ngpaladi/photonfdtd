@@ -9,14 +9,23 @@ Capabilities:
 - Anisotropic subpixel (sub-cell) smoothing of material interfaces for
   second-order accuracy at boundaries (``Simulation(subpixel=True)``)
 - Axis-aligned Box and arbitrary-polygon PolySlab geometry primitives
-- Point-dipole, distributed mode, and energy-normalised single-photon sources
-- Field snapshot monitors and a flux monitor through a coordinate plane
+- Point-dipole, distributed mode (bidirectional and one-way), energy-normalised
+  single-photon, and moving-charge (Cherenkov) sources
+- Field-snapshot, flux, and running-DFT monitors; mode-decomposition
+  S-parameters from a port plane (:func:`s_parameters`)
 - Full-vectorial (FDFD) waveguide mode solver
+- 2.5-D effective-index reduction (:mod:`photonfdtd.eim`), eigenmode
+  expansion (:mod:`photonfdtd.eme`), and CFL-free ADI-FDTD
+  (:mod:`photonfdtd.adi`) for layout-scale devices
+- JAX/XLA time stepping (CPU / GPU / TPU from one code path), differentiable
+  with checkpointed and reversible time-domain adjoints, and a 2-D etch-density inverse-design pipeline
+  (:mod:`photonfdtd.design`)
 - :func:`from_gdsfactory` adapter that turns a gdsfactory Component into a
   fully-built Simulation
 
-A NumPy backend is used throughout. It is correct but not fast; for production
-runs of large 3D problems a compiled or GPU backend is on the roadmap.
+Every time loop runs on JAX (:mod:`photonfdtd.jaxbackend`, and the ADI-FDTD
+stepper in :mod:`photonfdtd.adi`); :mod:`photonfdtd.memory` sizes a run against
+the device before it starts.
 """
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
@@ -31,10 +40,8 @@ from .sources import (
     ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
 from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
-from .storage import CompressedFieldSeries
 from .simulation import Simulation
-# Differentiable JAX entry point (import is lazy - jax is an optional dep;
-# accessing the name only fails if jax is missing when actually called).
+# Differentiable JAX entry points.
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .reversible import (
     value_and_grad_eps_reversible as jax_value_and_grad_eps_reversible,
@@ -67,7 +74,6 @@ __all__ = [
     "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
-    "CompressedFieldSeries",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "jax_value_and_grad_eps_reversible",
     "jax_value_and_grad_eps_reversible_pml",
@@ -81,4 +87,4 @@ __all__ = [
     "adapters", "from_gdsfactory",
 ]
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"

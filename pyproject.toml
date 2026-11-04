@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonfdtd"
-version = "0.12.0"
-description = "Local-only FDTD + waveguide mode solver for integrated photonics (NumPy core; optional JAX and compiled Rust/CUDA backends)."
+version = "0.13.0"
+description = "Local-only, differentiable JAX/XLA FDTD + waveguide mode solver for integrated photonics."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -23,20 +23,14 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "matplotlib>=3.7",
+    # The time-stepping engine (CPU wheel by default; install a CUDA/TPU jaxlib,
+    # e.g. "jax[cuda12]", for GPU/TPU).
+    "jax>=0.4",
 ]
 
 [project.optional-dependencies]
-# numba is included so CI exercises the JIT backend's parity tests (the GPU
-# parity test still skips - no CUDA device in CI).
-test = ["pytest>=7.4", "numba>=0.59", "zstandard>=0.21"]
+test = ["pytest>=7.4"]
 docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
-# Faster/better ratios for FieldMonitor(compression=...) than the stdlib zlib
-# fallback. Optional: without it, compression='zstd' raises but True/'zlib' work.
-compress = ["zstandard>=0.21"]
-# Differentiable / XLA-compiled backend (Simulation(use_jax=True) and
-# jax_value_and_grad_eps). CPU wheel by default; install a CUDA/TPU jaxlib for
-# GPU/TPU. Optional: without it, use_jax raises on run().
-jax = ["jax>=0.4"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"
@@ -44,17 +38,9 @@ Issues = "https://github.com/ngpaladi/photonfdtd/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/photonfdtd"]
-# The compiled Rust extension (_photonfdtd_rs.*) is platform-specific and is
-# built separately (see rust/README or benchmarks/README.md); never bundle a
-# locally-built binary into the pure-Python wheel.
-exclude = ["*.so", "*.pyd", "*.dylib"]
 
 [tool.hatch.build.targets.sdist]
-# Ship the Rust sources so a user with a toolchain can build the optional
-# backends, but never the build output.
-include = ["src/photonfdtd", "rust/Cargo.toml", "rust/Cargo.lock",
-           "rust/src", "tests", "README.md", "LICENSE", "pyproject.toml"]
-exclude = ["rust/target", "*.so", "*.pyd", "*.dylib"]
+include = ["src/photonfdtd", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

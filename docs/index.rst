@@ -1,11 +1,12 @@
 photonfdtd
 ==========
 
-A small, fully-local, open-source **FDTD engine and waveguide mode solver**,
-written in Python and NumPy. Under the hood it's a Yee-grid time-stepper with
-CPML absorbing boundaries and a full-vectorial mode solver, with an API borrowed
-in spirit from Tidy3D — but the whole thing runs on your own machine. No cloud,
-no license server, no account.
+A small, fully-local, open-source **FDTD engine and waveguide mode solver** for
+integrated photonics: a Yee-grid time-stepper with CPML absorbing boundaries and
+a full-vectorial mode solver, with an API borrowed in spirit from Tidy3D. The
+time loop runs on JAX/XLA, one differentiable code path for CPU, GPU and TPU.
+The whole thing runs on your own machine. No cloud, no license
+server, no account.
 
 This is alpha-stage software, and I'd rather be upfront about which parts are
 which: the pieces that exist are tested and correct; the pieces that don't,
@@ -17,7 +18,9 @@ don't. See :doc:`api` for the full reference.
 
    installation
    quickstart
+   backends
    accuracy
+   layout_scale
    examples
    api
 
@@ -36,12 +39,33 @@ Capabilities
 - Geometry primitives: axis-aligned :class:`~photonfdtd.Box` and
   arbitrary-polygon :class:`~photonfdtd.PolySlab`.
 - Sources: soft point dipole (:class:`~photonfdtd.PointDipole`), distributed
-  mode injection (:class:`~photonfdtd.ModeSource`), an energy-normalised
+  mode injection (:class:`~photonfdtd.ModeSource`, and the one-way
+  :class:`~photonfdtd.UniModeSource`), an energy-normalised
   :class:`~photonfdtd.SinglePhotonSource`, and a moving-charge
   :class:`~photonfdtd.ChargedParticle` that emits Cherenkov radiation.
-- Field-snapshot and flux monitors.
+- Monitors: time-domain snapshots (:class:`~photonfdtd.FieldMonitor`, with
+  plane and stride selection), Poynting flux
+  (:class:`~photonfdtd.FluxMonitor`), and a running frequency-domain
+  :class:`~photonfdtd.DFTMonitor` whose storage scales with the number of
+  frequencies rather than timesteps.
+- **Mode-decomposition S-parameters** (:func:`~photonfdtd.s_parameters`) from a
+  memory-light port plane. See :doc:`accuracy`.
 - A **full-vectorial** finite-difference :class:`~photonfdtd.ModeSolver`
   (distinguishes TE/TM; validated against analytic slab dispersion).
+- **Layout-scale methods**: the 2.5-D effective-index reduction
+  (:class:`~photonfdtd.EffectiveIndex2D`), eigenmode expansion
+  (:func:`~photonfdtd.eme_2d`), and unconditionally-stable ADI-FDTD
+  (:class:`~photonfdtd.ADISimulation2D`) that steps past the CFL limit. See
+  :doc:`layout_scale`.
+- **JAX engine**: a JIT-compiled, **differentiable** ``lax.scan`` time loop
+  (CPU / GPU / TPU) with checkpointed and O(1)-memory reversible adjoints. See
+  :doc:`backends`.
+- **Inverse design**: a differentiable 2-D etch-density pipeline
+  (:class:`~photonfdtd.EtchedCore`, :func:`~photonfdtd.value_and_grad_density`)
+  for topology optimization of PIC devices. See :doc:`accuracy`.
+- **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
+  :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
+  before it starts.
 - A :func:`~photonfdtd.from_gdsfactory` adapter that turns a gdsfactory
   ``Component`` into a fully-built :class:`~photonfdtd.Simulation`.
 

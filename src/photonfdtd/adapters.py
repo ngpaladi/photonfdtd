@@ -55,8 +55,6 @@ def from_gdsfactory(
     run_time: float = 1e-12,
     extra_structures: Sequence = (),
     courant: float = 0.99,
-    use_gpu: bool = False,
-    use_numba: bool = False,
     precision="float64",
     xy_bounds: Optional[Tuple[float, float, float, float]] = None,
 ) -> Simulation:
@@ -184,7 +182,5 @@ def from_gdsfactory(
         monitors=[],
         run_time=run_time,
         courant=courant,
-        use_gpu=use_gpu,
-        use_numba=use_numba,
         precision=precision,
     )

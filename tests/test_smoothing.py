@@ -121,17 +121,7 @@ def test_subcell_interface_smoothness():
     assert jump_smooth.sum() == pytest.approx(net_smooth, rel=0.2)
 
 
-def test_backend_support():
-    """subpixel is supported on the JAX backend (per-component coefficient) and
-    rejected only on the fused Numba kernel that assumes one scalar coeff."""
+def test_subpixel_constructs():
+    """subpixel builds a per-component coefficient on the JAX engine."""
     grid = pf.Grid(size=(3e-6, 3e-6), cell_size=1e-7, pml_layers=(4, 4, 0))
-    # JAX: accepted (constructs without error).
-    pytest.importorskip("jax")
-    pf.Simulation(grid, subpixel=True, use_jax=True)
-
-    # Numba: rejected, but only meaningful when numba is actually installed
-    # (self.use_numba is False otherwise, so the guard never engages).
-    from photonfdtd import simulation as _s
-    if _s._NUMBA_AVAILABLE:
-        with pytest.raises(ValueError):
-            pf.Simulation(grid, subpixel=True, use_numba=True)
+    pf.Simulation(grid, subpixel=True)

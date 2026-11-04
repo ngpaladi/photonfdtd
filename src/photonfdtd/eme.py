@@ -21,9 +21,21 @@ equation ``d2Ez/dy2 + (k0^2 eps(y) - beta^2) Ez = 0``; ``"Hz"`` is the dual.
 
 The interface scattering matrix uses power-orthogonal mode normalisation and
 the standard transverse-field continuity mode match; sections are cascaded with
-the Redheffer star product. Validated in the tests against the FDTD backend: a
-uniform guide gives ``|T|=1``/``|R|=0`` to mode-truncation error, and a step
-junction's modal reflection matches an FDTD S-parameter measurement.
+the Redheffer star product. Validated in the tests: a uniform guide gives
+``|T|=1``/``|R|=0`` to machine precision and exactly ``exp(i beta L)`` of
+phase, a step junction's fundamental reflection matches the Fresnel value of
+the two modal indices, and the step conserves power once the basis is large
+enough.
+
+**Evanescent modes are part of the basis, not an optional extra.** The field
+mismatch at a junction is carried by the modes below cutoff (``beta^2 < 0``),
+which decay away from the interface but are what let both ``Ez`` and ``Hy``
+continuity be satisfied at once. A basis holding only propagating modes cannot
+conserve power: a 0.5 -> 0.2 um step with six modes in a 3.9 um box reports
+``|T00|^2 = 1.02``. With ``num_modes`` a few times the number of propagating
+modes the box supports, the same step gives ``0.989`` and total power
+``1.000`` (``1.0000`` by 64 modes). :func:`eme_2d` warns when a section at a junction has no evanescent
+mode in its basis; :meth:`EMEResult.power_balance` is the convergence check.
 
 References
 ----------
@@ -34,6 +46,7 @@ References
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -74,6 +87,32 @@ class EMEResult:
     def reflection(self, out_mode: int = 0, in_mode: int = 0) -> complex:
         """Complex reflection amplitude back into the input section."""
         return complex(self.S[out_mode, in_mode])
+
+    @property
+    def num_propagating_in(self) -> int:
+        """Propagating (real-``beta``) modes kept in the input section."""
+        return int(np.count_nonzero(self.n_eff_in > 0.0))
+
+    @property
+    def num_propagating_out(self) -> int:
+        """Propagating (real-``beta``) modes kept in the output section."""
+        return int(np.count_nonzero(self.n_eff_out > 0.0))
+
+    def power_balance(self, in_mode: int = 0) -> float:
+        """Total power scattered into propagating modes for unit power in
+        ``in_mode``: ``sum |t|^2`` over propagating output modes plus
+        ``sum |r|^2`` over propagating input modes.
+
+        Equals 1 for a lossless device when the modal basis is converged. A
+        value above 1 means ``num_modes`` is too small to represent the
+        interface fields (typically: no, or too few, evanescent modes); raise
+        it until this settles.
+        """
+        N = self.num_modes
+        col = self.S[:, in_mode]
+        pr = np.sum(np.abs(col[:N][self.n_eff_in > 0.0]) ** 2)
+        pt = np.sum(np.abs(col[N:][self.n_eff_out > 0.0]) ** 2)
+        return float(pr + pt)
 
 
 def _solve_modes(eps: np.ndarray, dy: float, wavelength: float, num_modes: int,
@@ -209,7 +248,12 @@ def eme_2d(
     wavelength : float
         Free-space wavelength (m).
     num_modes : int
-        Modes kept per section (accuracy vs cost).
+        Modes kept per section (accuracy vs cost). This must exceed the number
+        of *propagating* modes the transverse box supports, so that evanescent
+        modes are in the basis; otherwise junction fields cannot be matched
+        and the result does not conserve power (a ``RuntimeWarning`` is
+        issued). Two to four times the propagating count is typical; check
+        with :meth:`EMEResult.power_balance`.
     polarization : {"Ez", "Hz"}
         2-D field polarisation (see module docstring).
     """
@@ -227,6 +271,24 @@ def eme_2d(
 
     modes = [_solve_modes(s.eps, dy, wavelength, N, polarization)
              for s in sections]
+
+    # A junction between two different sections needs evanescent modes on
+    # both sides to match the fields. Warn if either side's basis is all
+    # propagating (every kept beta real).
+    for i in range(len(sections) - 1):
+        if np.array_equal(sections[i].eps, sections[i + 1].eps):
+            continue
+        for side in (i, i + 1):
+            beta = modes[side][0]
+            if np.all(np.real(beta) > 0.0) and np.all(np.imag(beta) == 0.0):
+                warnings.warn(
+                    f"eme_2d: num_modes={N} leaves section {side} with no "
+                    "evanescent mode in its basis (all kept modes propagate). "
+                    "The junction fields cannot be matched and the S-matrix "
+                    "will not conserve power; raise num_modes above the number "
+                    "of propagating modes and check EMEResult.power_balance().",
+                    RuntimeWarning, stacklevel=2)
+                break
 
     # Cascade: [prop sec0] * [iface 0->1] * [prop sec1] * ...
     S = _prop_smatrix(modes[0][0], sections[0].length, N)

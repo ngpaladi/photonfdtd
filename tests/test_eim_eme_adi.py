@@ -1,5 +1,5 @@
 """Tests for the 2.5-D effective-index method, eigenmode expansion, and the
-unconditionally-stable ADI-FDTD stepper (NumPy + Rust)."""
+unconditionally-stable ADI-FDTD stepper (JAX)."""
 import math
 import warnings
 
@@ -8,7 +8,6 @@ import pytest
 from scipy.optimize import brentq
 
 import photonfdtd as pf
-from photonfdtd.rustbackend import rust_available
 
 
 # ======================================================================= #
@@ -66,11 +65,30 @@ def test_eim_soi_reduction():
         etched_layers=[pf.Layer(0.22e-6, 1.44)],
         wavelength=lam, polarization="TE",
         substrate_index=1.44, cladding_index=1.0)
-    # 220 nm SOI TE0 slab index is ~2.83; background < core.
+    # 220 nm SOI TE0 slab index is ~2.83. The etched region (oxide on oxide
+    # under air) guides nothing, so the background must be the oxide index
+    # itself - not a box mode of the finite solve window.
     assert 2.6 < eim.n_core < 3.0
-    assert eim.n_background < eim.n_core
+    assert eim.n_background == pytest.approx(1.44, abs=1e-12)
     mc, mb = eim.effective_index_media()
     assert mc.eps_r > mb.eps_r
+
+
+def test_slab_nonguiding_stack_returns_no_modes():
+    """A stack with no index above its surroundings has no guided mode. The
+    solver must say so (empty result, ``effective_index`` raises) rather than
+    hand back the top eigenpair of the Dirichlet-walled pad, whose index
+    depends on the pad thickness."""
+    lam = 1.55e-6
+    for pad in (0.8 * lam, 3.0 * lam):
+        sm = pf.slab_modes([pf.Layer(0.22e-6, 1.44)], lam, polarization="TE",
+                           num_modes=2, substrate_index=1.44,
+                           cladding_index=1.0, pad=pad)
+        assert sm.n_eff.size == 0
+        assert sm.profiles.shape[0] == 0
+    with pytest.raises(ValueError, match="no guided slab mode"):
+        pf.effective_index([pf.Layer(0.22e-6, 1.44)], lam, polarization="TE",
+                           substrate_index=1.44, cladding_index=1.0)
 
 
 # ======================================================================= #
@@ -112,15 +130,37 @@ def test_eme_step_reflection_matches_fresnel():
     y = (np.arange(ny) - ny / 2) * dy
     r = pf.eme_2d([pf.Section(_wg_eps(y, 0.5e-6), 3e-6),
                    pf.Section(_wg_eps(y, 0.3e-6), 3e-6)],
-                  dy, lam, num_modes=8)
+                  dy, lam, num_modes=32)
     n1, n2 = r.n_eff_in[0], r.n_eff_out[0]
     fresnel = ((n1 - n2) / (n1 + n2)) ** 2
     R = abs(r.reflection(0, 0)) ** 2
     assert abs(R - fresnel) / fresnel < 0.15
 
 
+def test_eme_step_conserves_power_with_evanescent_modes():
+    """The junction fields are matched by the evanescent modes. With only
+    propagating modes in the basis the step reports more power out than in;
+    with evanescent modes included it conserves power."""
+    lam, dy, ny = 1.55e-6, 20e-9, 200
+    y = (np.arange(ny) - ny / 2) * dy
+    secs = [pf.Section(_wg_eps(y, 0.5e-6), 3e-6),
+            pf.Section(_wg_eps(y, 0.3e-6), 3e-6)]
+
+    with pytest.warns(RuntimeWarning, match="no evanescent mode"):
+        few = pf.eme_2d(secs, dy, lam, num_modes=4)
+    assert few.num_propagating_in == 4           # every kept mode propagates
+    assert few.power_balance() > 1.01            # unphysical, as warned
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")           # no warning expected now
+        many = pf.eme_2d(secs, dy, lam, num_modes=32)
+    assert many.num_propagating_in < 32
+    assert abs(many.power_balance() - 1.0) < 2e-3
+    assert abs(many.transmission(0, 0)) ** 2 < 1.0
+
+
 # ======================================================================= #
-# ADI-FDTD (CFL-free), NumPy + Rust
+# ADI-FDTD (CFL-free)
 # ======================================================================= #
 def _gauss(f0, fwhm):
     sig = fwhm / (2 * math.sqrt(2 * math.log(2)))
@@ -178,41 +218,16 @@ def test_adi_absorber_dissipates():
     assert final_l2("absorber") < 1e-3 * final_l2("pec")
 
 
-@pytest.mark.skipif(not rust_available(),
-                    reason="Rust extension not built")
-@pytest.mark.parametrize("boundary", ["pec", "absorber"])
-def test_adi_rust_matches_numpy(boundary):
-    nx, ny, dx = 80, 60, 40e-9
-    eps = np.ones((nx, ny)); eps[30:50, 25:35] = 4.0
-    src = pf.ADISource(20, 30, _gauss(pf.C_0 / 1e-6, 8e-15))
-
-    def run(backend):
-        sim = pf.ADISimulation2D(eps, dx, courant_factor=2.0, boundary=boundary,
-                                 sources=[src], backend=backend)
-        return sim.run(400, snapshot_interval=100, probes=[(40, 30), (55, 40)])
-
-    a, b = run("numpy"), run("rust")
-    sa = a.snapshots["Ez"][-1]
-    np.testing.assert_allclose(b.snapshots["Ez"][-1], sa, rtol=0.0,
-                               atol=1e-10 * np.abs(sa).max())
-    for key in a.probes:
-        pa = a.probes[key]
-        np.testing.assert_allclose(b.probes[key], pa, rtol=0.0,
-                                   atol=1e-10 * np.abs(pa).max())
-
-
-@pytest.mark.skipif(not rust_available(),
-                    reason="Rust extension not built")
-def test_adi_rust_float32():
+def test_adi_float32_tracks_float64():
     nx, ny, dx = 60, 50, 40e-9
     eps = np.ones((nx, ny))
     src = pf.ADISource(20, 25, _gauss(pf.C_0 / 1e-6, 8e-15))
 
-    def run(backend, prec):
+    def run(prec):
         sim = pf.ADISimulation2D(eps, dx, courant_factor=2.0, boundary="pec",
-                                 sources=[src], backend=backend, precision=prec)
-        return sim.run(300, snapshot_interval=299)
+                                 sources=[src], precision=prec)
+        return sim.run(300, snapshot_interval=299).snapshots["Ez"][-1]
 
-    a = run("numpy", "float64").snapshots["Ez"][-1]
-    b = run("rust", "float32").snapshots["Ez"][-1]
+    a, b = run("float64"), run("float32")
+    assert b.dtype == np.float32
     assert np.abs(a - b).max() < 1e-4 * np.abs(a).max()

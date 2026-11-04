@@ -8,6 +8,7 @@
 """
 import math
 import sys
+import warnings
 
 import matplotlib
 matplotlib.use("Agg")
@@ -50,16 +51,25 @@ def main():
         return e
     Ltaper = 6e-6
     counts = [2, 4, 8, 16, 32, 64]
-    Ts = []
-    for nsec in counts:
-        widths = np.linspace(0.5e-6, 0.2e-6, nsec)
-        secs = [pf.Section(wg(w), Ltaper / nsec) for w in widths]
-        r = pf.eme_2d(secs, dy, lam, num_modes=6)
-        Ts.append(abs(r.transmission(0, 0)) ** 2)
-    ax[1].plot(counts, Ts, "o-", color=ACCENT, lw=2, ms=6)
+    # 32 modes: the box holds 8 propagating modes, so most of the basis is
+    # evanescent and the junction fields can be matched. 6 modes (all
+    # propagating) cannot, and the result overshoots unity.
+    for nmodes, color, style, label in ((6, MUTED, "s--", "6 modes (no evanescent): unphysical, > 1"),
+                                        (32, ACCENT, "o-", "32 modes (evanescent included)")):
+        Ts = []
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # the 6-mode run warns, as it should
+            for nsec in counts:
+                widths = np.linspace(0.5e-6, 0.2e-6, nsec)
+                secs = [pf.Section(wg(w), Ltaper / nsec) for w in widths]
+                r = pf.eme_2d(secs, dy, lam, num_modes=nmodes)
+                Ts.append(abs(r.transmission(0, 0)) ** 2)
+        ax[1].plot(counts, Ts, style, color=color, lw=2, ms=5, label=label)
+    ax[1].axhline(1.0, color=MUTED, lw=0.8, ls=":")
     ax[1].set_xscale("log", base=2)
     ax[1].set_xlabel("taper sections (EME staircase)", color=INK)
     ax[1].set_ylabel("|T00|^2  (fundamental)", color=INK)
+    ax[1].legend(fontsize=7.5, frameon=False, loc="upper right")
     ax[1].set_title("(2) EME taper transmission\n"
                     "adiabatic limit, S-matrix only", color=INK, loc="left")
 
@@ -75,8 +85,7 @@ def main():
         return lambda t: np.exp(-((t - t0) / sig) ** 2) * np.sin(2 * math.pi * f0 * (t - t0))
     src = pf.ADISource(nx // 2, nyg // 2 + 24, gauss(pf.C_0 / 1e-6, 8e-15))
     sim = pf.ADISimulation2D(eps, dx, courant_factor=4.0, boundary="absorber",
-                             sources=[src], pml_cells=16,
-                             backend="rust" if _rust() else "numpy")
+                             sources=[src], pml_cells=16)
     res = sim.run(500, snapshot_interval=499)
     snap = res.snapshots["Ez"][-1]
     v = np.percentile(np.abs(snap), 99.5)
@@ -96,11 +105,6 @@ def main():
     out = f"{outdir}/demo_eim_eme_adi.png"
     fig.savefig(out, dpi=110)
     print("wrote", out)
-
-
-def _rust():
-    from photonfdtd.rustbackend import rust_available
-    return rust_available()
 
 
 if __name__ == "__main__":

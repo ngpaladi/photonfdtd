@@ -214,3 +214,63 @@ def test_cherenkov_cone_angle_matches_theory():
         f"measured Mach angle {math.degrees(mu_meas):.1f} deg vs "
         f"theory {math.degrees(mu_true):.1f} deg (rel err {rel_err:.1%})"
     )
+
+
+def test_moving_charge_near_field_is_evanescent():
+    """Below the Cherenkov threshold a charge carries no radiation, only an
+    evanescent near field: every spatial-frequency component ``k_x`` of its
+    transverse field decays away from the trajectory as ``exp(-k_x |y| / gamma)``
+    (equivalently ``exp(-omega |y| / (gamma v))``). This tail is what couples a
+    particle in a vacuum channel to a dielectric wall, so the solver has to get
+    both its slope and its amplitude right. Compared against the analytic
+    Lorentz-contracted field of a 2-D line charge (``examples/05_cherenkov_tube.py``
+    shows the same law on a figure).
+    """
+    beta = 0.9
+    gamma = 1.0 / math.sqrt(1.0 - beta ** 2)
+    Lx, Ly, dx = 30e-6, 5e-6, 50e-9
+    grid = pf.Grid(size=(Lx, Ly), cell_size=dx, pml_layers=(12, 12, 0))
+    x0 = -13.5e-6
+    particle = pf.ChargedParticle(charge=2e-9, velocity=(beta * pf.C_0, 0.0),
+                                  start=(x0, 0.0))
+    # Snapshot when the turn-on light shell (radius c t) has pulled W ahead of
+    # the particle (at 0.9 c t), so a +-W window around it holds only the
+    # steady field.
+    W = 2.5e-6
+    t_snap = W / (pf.C_0 * (1.0 - beta))
+    mon = pf.FieldMonitor(name="snap", components=("Ey",), times=[t_snap])
+    sim = pf.Simulation(grid, structures=[], sources=[particle], monitors=[mon],
+                        run_time=t_snap + 1e-16)
+    res = sim.run()
+    Ey = res.fields["snap"]["Ey"][0, :, :, 0]
+    x, y = grid.coords[0], grid.coords[1]
+    x_p = particle.position_at(res.monitor_times["snap"][0])[0]
+    assert x_p + W < x0 + pf.C_0 * res.monitor_times["snap"][0]   # shell is ahead
+    assert x_p + W < x[-1] - 12 * dx                                # window inside PML
+
+    ix = np.flatnonzero((x > x_p - W) & (x < x_p + W))
+    k = 2 * np.pi * np.fft.rfftfreq(ix.size, dx)
+    sigma = particle.cloud_cells * dx
+    bins = [2, 3, 4]                       # lam_x = 2.5, 1.67, 1.25 um
+    rows_y, amps = [], []
+    for y_t in (0.3e-6, 0.5e-6, 0.75e-6, 1.0e-6):
+        j = int(np.argmin(np.abs(y - y_t)))
+        yy = y[j] + 0.5 * dx               # Ey sits on the half-cell in y
+        amp = np.abs(np.fft.rfft(Ey[ix, j])) * dx
+        # 2-D line charge: Ey(k_x, y) = q/(2 eps0) exp(-k_x|y|/gamma), softened
+        # by the Gaussian deposition cloud.
+        exact = particle.charge / (2 * pf.EPS_0) * np.exp(-k * yy / gamma) \
+            * np.exp(-0.5 * (k * sigma) ** 2)
+        for b in bins:
+            assert abs(amp[b] / exact[b] - 1.0) < 0.10, (
+                f"lam_x={2*np.pi/k[b]*1e6:.2f} um, y={yy*1e6:.2f} um: "
+                f"sim/analytic = {amp[b]/exact[b]:.3f}")
+        rows_y.append(yy)
+        amps.append(amp[bins])
+    rows_y = np.asarray(rows_y)
+    amps = np.asarray(amps)
+    for col, b in enumerate(bins):
+        slope = np.polyfit(rows_y, np.log(amps[:, col]), 1)[0]
+        assert abs(-slope * gamma / k[b] - 1.0) < 0.10, (
+            f"lam_x={2*np.pi/k[b]*1e6:.2f} um: decay rate {-slope*1e-6:.2f}/um "
+            f"vs k_x/gamma = {k[b]/gamma*1e-6:.2f}/um")

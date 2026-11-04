@@ -90,19 +90,19 @@ class ModeResult:
     ----------
     wavelength : float
         Free-space wavelength, metres.
-    n_eff : np.ndarray, shape (num_modes,)
+    n_eff : np.ndarray, (num_modes,)
         Real effective indices, sorted in descending order.
-    psi : np.ndarray, shape (num_modes, ny, nz)
+    psi : np.ndarray, (num_modes, ny, nz)
         Back-compat dominant transverse-field magnitude of each mode,
         normalised to unit maximum.  This is ``|E_t| = sqrt(|Ey|^2+|Ez|^2)``.
     y, z : np.ndarray
         Transverse coordinate axes (metres).
-    Ey, Ez : np.ndarray, shape (num_modes, ny, nz)
+    Ey, Ez : np.ndarray, (num_modes, ny, nz)
         Complex transverse electric-field components (the solved unknowns).
-    Ex : np.ndarray, shape (num_modes, ny, nz)
+    Ex : np.ndarray, (num_modes, ny, nz)
         Longitudinal electric field, recovered from the divergence condition
         (convenience/visualisation field).
-    Hx, Hy, Hz : np.ndarray, shape (num_modes, ny, nz)
+    Hx, Hy, Hz : np.ndarray, (num_modes, ny, nz)
         Magnetic-field components recovered from Faraday's law
         (convenience/visualisation fields).
     fields : dict

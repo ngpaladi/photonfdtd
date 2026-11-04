@@ -21,7 +21,7 @@ any counter-propagating reflection on the same plane. With a unit-power
 unidirectional source ``S_ij = alpha_i^{out}``.
 
 The functions are written with plain array operations (``*``, ``.conj()``,
-``.sum()``), so they run unchanged on NumPy, CuPy, and JAX arrays. Passing the
+``.sum()``), so they run unchanged on NumPy and JAX arrays. Passing the
 simulated fields as JAX arrays (e.g. ``out['dft'][name][comp]`` inside a loss)
 makes ``|S_ij|**2`` differentiable through the time-domain adjoint - the modes
 are treated as constants, as in every adjoint FDTD.
@@ -60,7 +60,7 @@ def mode_amplitudes(sim_fields: Dict, mode_fields: Dict, dA: float):
     ----------
     sim_fields : dict
         ``'Ey','Ez','Hy','Hz'`` on the port plane, each shaped ``(n_freq, ...)``
-        (any spatial layout; a size-1 plane axis is fine). NumPy/CuPy/JAX.
+        (any spatial layout; a size-1 plane axis is fine). NumPy or JAX.
     mode_fields : dict
         The solved mode's ``'Ey','Ez','Hy','Hz'`` on the same transverse grid,
         broadcastable against one frequency slice.

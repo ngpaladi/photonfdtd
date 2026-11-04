@@ -8,14 +8,13 @@ def _sim(run_time=200e-15, pml=(0, 0, 0)):
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[3e14])
     grid = pf.Grid(size=(3e-6, 3e-6, 2e-6), cell_size=1e-6 / 12, pml_layers=pml)
     return pf.Simulation(grid, sources=[src], monitors=[mon],
-                         run_time=run_time, use_jax=True)
+                         run_time=run_time)
 
 
 def test_mode_ordering():
-    """Adjoint memory: reversible < nested < none; out-of-core < forward."""
+    """Adjoint memory: reversible < nested < none."""
     est = pf.estimate_memory(_sim())
     assert est["adjoint_reversible"] < est["adjoint_nested"] < est["adjoint_none"]
-    assert est["out_of_core"] < est["forward"]
     assert est["forward"] == est["working_set"]
 
 
@@ -37,10 +36,11 @@ def test_recommend_fits_budget():
     # fastest (no checkpointing).
     assert pf.recommend_mode(sim, est["adjoint_reversible"] + 1) == "adjoint_reversible"
     assert pf.recommend_mode(sim, est["adjoint_none"] + 1) == "adjoint_none"
-    # Below even the reversible adjoint -> fall back to tiling.
-    assert pf.recommend_mode(sim, est["out_of_core"] + 1) == "out_of_core"
+    # Below even the reversible adjoint -> nothing fits.
+    assert pf.recommend_mode(sim, est["adjoint_reversible"] - 1) == "infeasible"
     # Forward-only planning.
     assert pf.recommend_mode(sim, est["forward"] + 1, differentiable=False) == "forward"
+    assert pf.recommend_mode(sim, est["forward"] - 1, differentiable=False) == "infeasible"
 
 
 def test_pml_increases_estimate():

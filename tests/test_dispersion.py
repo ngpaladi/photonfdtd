@@ -117,15 +117,11 @@ def test_at_wavelength_fallback():
     assert np.sqrt(fixed.eps_r) == pytest.approx(1.44402, abs=2e-4)
 
 
-def test_dispersion_backend_support():
-    """Dispersion is supported on the JAX backend and rejected only on Numba."""
+def test_dispersion_rejects_subpixel():
+    """Dispersive media construct fine, but not combined with subpixel."""
     grid = pf.Grid(size=(3e-6,), cell_size=1e-7, pml_layers=(6,))
     box = pf.Box(center=(0.0,), size=(1e-6,),
                  medium=DispersiveMedium.drude(1.0, 100e12, 5e12))
-    pytest.importorskip("jax")
-    pf.Simulation(grid, structures=[box], use_jax=True)   # accepted
-
-    from photonfdtd import simulation as _s
-    if _s._NUMBA_AVAILABLE:
-        with pytest.raises(ValueError):
-            pf.Simulation(grid, structures=[box], use_numba=True)
+    pf.Simulation(grid, structures=[box])                 # accepted
+    with pytest.raises(NotImplementedError):
+        pf.Simulation(grid, structures=[box], subpixel=True)

@@ -37,7 +37,7 @@ templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # Optional / heavy dependencies that autodoc must not need to import.
-autodoc_mock_imports = ["gdsfactory", "numba"]
+autodoc_mock_imports = ["gdsfactory"]
 
 autosummary_generate = True
 

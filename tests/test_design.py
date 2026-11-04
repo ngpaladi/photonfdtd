@@ -4,7 +4,7 @@ import pytest
 
 import photonfdtd as pf
 
-jax = pytest.importorskip("jax")
+import jax
 import jax.numpy as jnp   # noqa: E402
 jax.config.update("jax_enable_x64", True)
 
@@ -50,7 +50,7 @@ def _grad_setup():
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[f0],
                         plane_axis="x", plane_position=0.8e-6)
     sim = pf.Simulation(grid, sources=[src], monitors=[mon],
-                        run_time=90e-15, use_jax=True)
+                        run_time=90e-15)
     ec = pf.EtchedCore(eps_solid=3.48 ** 2, eps_void=1.44 ** 2,
                        eps_sub=1.44 ** 2, eps_clad=1.0,
                        core_z=(-0.11e-6, 0.11e-6), filter_radius=140e-9, beta=6.0)

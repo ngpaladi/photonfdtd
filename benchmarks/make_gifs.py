@@ -1,9 +1,9 @@
-"""Render the grating-coupler benchmark movies (one GIF per backend).
+"""Render the grating-coupler benchmark movies (one GIF per run tag).
 
-    python benchmarks/make_gifs.py <datadir> <backend> [<backend> ...]
+    python benchmarks/make_gifs.py <datadir> <tag> [<tag> ...]     # jax, jax_f32
 
-Reads <datadir>/gc_<backend>.npz (from bench_grating_coupler.py) and writes
-<datadir>/photonfdtd_gc_<backend>.gif. Field polarity is a diverging encoding:
+Reads <datadir>/gc_<tag>.npz (from bench_grating_coupler.py) and writes
+<datadir>/photonfdtd_gc_<tag>.gif. Field polarity is a diverging encoding:
 RdBu, white at zero, symmetric robust limits; the structure outline is a
 recessive single-hue overlay.
 """
@@ -18,13 +18,11 @@ from matplotlib import animation
 INK = "#3d3d3d"
 MUTED = "#8a8a8a"
 
-DISPLAY = {"rust": "Rust CPU", "rust-cuda": "Rust CUDA",
-           "rust-cuda_f32": "Rust CUDA f32", "jax": "JAX",
-           "jax_f32": "JAX f32", "numpy": "NumPy"}
+DISPLAY = {"jax": "JAX f64", "jax_f32": "JAX f32"}
 
 
-def make_gif(datadir, backend):
-    d = np.load(f"{datadir}/gc_{backend}.npz")
+def make_gif(datadir, tag):
+    d = np.load(f"{datadir}/gc_{tag}.npz")
     frames, eps = d["frames"], d["eps"]
     x, y, times = d["x"] * 1e6, d["y"] * 1e6, d["times"] * 1e15
     wall = float(d["wall"])
@@ -46,7 +44,7 @@ def make_gif(datadir, backend):
         s.set_color(MUTED)
         s.set_linewidth(0.6)
     ax.set_title(f"Elliptic grating coupler — "
-                 f"{DISPLAY.get(backend, backend)} backend\n"
+                 f"{DISPLAY.get(tag, tag)}\n"
                  f"{wall:.1f} s wall · {peak/1024:.2f} GB peak RSS · "
                  f"{int(d['n_steps'])} steps on {int(d['n_cells'])/1e6:.2f}M cells",
                  color=INK, fontsize=11, loc="left", pad=10)
@@ -65,7 +63,7 @@ def make_gif(datadir, backend):
         return im, tcounter
 
     anim = animation.FuncAnimation(fig, update, frames=len(frames), blit=False)
-    out = f"{datadir}/photonfdtd_gc_{backend}.gif"
+    out = f"{datadir}/photonfdtd_gc_{tag}.gif"
     anim.save(out, writer=animation.PillowWriter(fps=14))
     plt.close(fig)
     print("wrote", out)
@@ -73,5 +71,5 @@ def make_gif(datadir, backend):
 
 if __name__ == "__main__":
     datadir = sys.argv[1]
-    for backend in sys.argv[2:]:
-        make_gif(datadir, backend)
+    for tag in sys.argv[2:]:
+        make_gif(datadir, tag)

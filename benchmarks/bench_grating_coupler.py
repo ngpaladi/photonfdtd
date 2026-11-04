@@ -1,4 +1,4 @@
-"""Backend benchmark: 2D elliptic (focusing) grating coupler, plan view.
+"""Benchmark: 2D elliptic (focusing) grating coupler, plan view.
 
 A focusing grating coupler on an SOI-like slab, treated by the effective-
 index method in the chip plane (Ez polarization): a single-mode access
@@ -14,14 +14,13 @@ of plane, but it exercises exactly the update stencil, CPML, and a curved
 multi-structure geometry - a realistic benchmark workload with a photogenic
 field.
 
-Run one backend per process (clean wall-clock + peak-RSS accounting):
+Run one precision per process (clean wall-clock + peak-RSS accounting):
 
-    python benchmarks/bench_grating_coupler.py numpy|jax|rust|rust-cuda \
-        [outdir] [float64|float32]
+    python benchmarks/bench_grating_coupler.py [outdir] [float64|float32]
 
 Writes <outdir>/gc_<tag>.npz with the Ez movie, timings, and peak RSS
-(tag = backend, plus "_f32" for float32). For GPU JAX, put the nvidia pip
-wheels' lib dirs on LD_LIBRARY_PATH.
+(tag = "jax", plus "_f32" for float32). The run includes the one-time XLA
+compile. For GPU JAX, put the nvidia pip wheels' lib dirs on LD_LIBRARY_PATH.
 """
 import json
 import math
@@ -88,7 +87,7 @@ def build_structures():
     return structures
 
 
-def build_sim(backend, precision="float64"):
+def build_sim(precision="float64"):
     grid = pf.Grid(size=SIZE, cell_size=DX, pml_layers=PML)
     freq0 = pf.C_0 / LAM0
     yprof = np.linspace(-0.75e-6, 0.75e-6, 61)
@@ -97,24 +96,23 @@ def build_sim(backend, precision="float64"):
         waveform=pf.GaussianPulse(freq0=freq0, fwhm=15e-15),
         profile=np.exp(-(yprof / 0.25e-6) ** 2), profile_coords=(yprof,))
     # interval chosen for ~N_FRAMES frames; exact value fixed by n_steps below.
-    probe = pf.Simulation(grid, run_time=RUN_TIME, backend="numpy")
+    probe = pf.Simulation(grid, run_time=RUN_TIME)
     interval = max(probe.n_steps // N_FRAMES, 1)
     mon = pf.FieldMonitor(name="movie", components=("Ez",),
                           interval=interval, downsample=DOWNSAMPLE)
-    # Monitor storage stays float64 for the cross-backend parity probe even
+    # Monitor storage stays float64 for the f64-vs-f32 parity probe even
     # when the compute precision is float32.
     prec = {"compute": precision, "monitors": "float64"}
     return pf.Simulation(grid, structures=build_structures(), sources=[src],
-                         monitors=[mon], run_time=RUN_TIME, backend=backend,
+                         monitors=[mon], run_time=RUN_TIME,
                          precision=prec)
 
 
 def main():
-    backend = sys.argv[1]
-    outdir = sys.argv[2] if len(sys.argv) > 2 else "."
-    precision = sys.argv[3] if len(sys.argv) > 3 else "float64"
-    tag = backend + ("_f32" if precision == "float32" else "")
-    sim = build_sim(backend, precision)
+    outdir = sys.argv[1] if len(sys.argv) > 1 else "."
+    precision = sys.argv[2] if len(sys.argv) > 2 else "float64"
+    tag = "jax" + ("_f32" if precision == "float32" else "")
+    sim = build_sim(precision)
     n_cells = int(np.prod(sim.grid.shape))
 
     t0 = time.perf_counter()
@@ -134,7 +132,7 @@ def main():
         wall=wall, peak_mb=peak_mb,
         n_steps=sim.n_steps, n_cells=n_cells)
     print(json.dumps(dict(
-        backend=tag, wall_s=round(wall, 2), peak_rss_mb=round(peak_mb),
+        run=tag, wall_s=round(wall, 2), peak_rss_mb=round(peak_mb),
         n_steps=sim.n_steps, n_cells=n_cells,
         mcellsteps_per_s=round(n_cells * sim.n_steps / wall / 1e6),
     )))

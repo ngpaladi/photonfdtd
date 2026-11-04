@@ -4,8 +4,8 @@ Covers:
 1. The overlap inner product separates forward/backward modes and is
    normalization-agnostic (a mode fed into itself gives alpha=1).
 2. A plane-restricted DFTMonitor records exactly the full-domain DFT sliced on
-   that plane - on both the NumPy and JAX backends (the port-plane monitor is
-   what keeps a PIC S-parameter run memory-light).
+   that plane (the port-plane monitor is what keeps a PIC S-parameter run
+   memory-light).
 3. End-to-end: a mode launched down a straight lossless waveguide has |S21|~=1.
 """
 import numpy as np
@@ -56,7 +56,7 @@ def test_overlap_separates_forward_backward():
     assert abs(ap[0]) < 0.1
 
 
-def _plane_parity(use_jax):
+def test_plane_dft_matches_full():
     lam = 1.0e-6
     f0 = pf.C_0 / lam
     dx = lam / 16
@@ -68,7 +68,7 @@ def _plane_parity(use_jax):
     plane = pf.DFTMonitor(name="plane", components=("Ey", "Hz"), freqs=[f0],
                           plane_axis="x", plane_position=x0)
     sim = pf.Simulation(grid, sources=[src], monitors=[full, plane],
-                        run_time=40e-15, use_jax=use_jax)
+                        run_time=40e-15)
     res = sim.run()
     xi = int(np.argmin(np.abs(grid.coords[0] - x0)))
     for c in ("Ey", "Hz"):
@@ -78,20 +78,10 @@ def _plane_parity(use_jax):
         assert np.allclose(p, f, rtol=1e-6, atol=1e-12 * np.abs(f).max())
 
 
-def test_plane_dft_matches_full_numpy():
-    _plane_parity(use_jax=False)
-
-
-def test_plane_dft_matches_full_jax():
-    pytest.importorskip("jax")
-    _plane_parity(use_jax=True)
-
-
 @pytest.mark.slow
 def test_waveguide_s21_energy_conserving():
     """A mode launched down a straight lossless waveguide transmits |S21|~=1
-    between two downstream port planes, on the JAX backend."""
-    pytest.importorskip("jax")
+    between two downstream port planes."""
     lam = 1.55e-6
     f0 = pf.C_0 / lam
     dy = dz = 40e-9
@@ -110,7 +100,7 @@ def test_waveguide_s21_energy_conserving():
     p2 = pf.DFTMonitor(name="p2", components=("Ey", "Ez", "Hy", "Hz"),
                        freqs=[f0], plane_axis="x", plane_position=2.0e-6)
     sim = pf.Simulation(grid, structures=[core], sources=[src],
-                        monitors=[p1, p2], run_time=200e-15, use_jax=True)
+                        monitors=[p1, p2], run_time=200e-15)
     res = sim.run()
     dA = dy * dz
     a1p, _ = pf.s_parameters(res, "p1", mr, 0, dA)
@@ -122,7 +112,6 @@ def test_waveguide_s21_energy_conserving():
 def test_unidirectional_source_extinction():
     """UniModeSource launches predominantly one way: backward amplitude is far
     below forward, unlike the bidirectional soft ModeSource (~0 dB)."""
-    pytest.importorskip("jax")
     lam = 1.55e-6
     f0 = pf.C_0 / lam
     dy = dz = 40e-9
@@ -140,7 +129,7 @@ def test_unidirectional_source_extinction():
     dn = pf.DFTMonitor(name="dn", components=("Ey", "Ez", "Hy", "Hz"),
                        freqs=[f0], plane_axis="x", plane_position=1.5e-6)
     sim = pf.Simulation(grid, structures=[core], sources=[src],
-                        monitors=[up, dn], run_time=220e-15, use_jax=True)
+                        monitors=[up, dn], run_time=220e-15)
     res = sim.run()
     dA = dy * dz
     fwd, _ = pf.s_parameters(res, "dn", mr, 0, dA)   # forward, downstream

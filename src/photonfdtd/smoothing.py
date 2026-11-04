@@ -53,7 +53,7 @@ References
 ----------
 * A. Farjadpour, D. Roundy, A. Rundquist, M. Ibanescu, S. G. Johnson et al.,
   "Improving accuracy by subpixel smoothing in the finite-difference time
-  domain," *Optics Letters* **31**(20), 2972-2974 (2006).
+  domain," *Optics Letters* **31** (20), 2972-2974 (2006).
   https://doi.org/10.1364/OL.31.002972
 * C. A. Kottke, A. Farjadpour, S. G. Johnson, "Perturbation theory for
   anisotropic dielectric interfaces, and application to subpixel smoothing of

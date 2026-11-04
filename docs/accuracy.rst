@@ -38,9 +38,8 @@ supersampling (``subpixel_factor``).
    sim = pf.Simulation(grid, structures=[...], sources=[...],
                        run_time=..., subpixel=True, subpixel_factor=3)
 
-Runs on the NumPy and JAX backends (the JAX path carries a per-component
-coefficient, so the smoothed result is JIT-compiled *and* differentiable, and
-matches the NumPy reference to floating-point reordering). The payoff is easy to
+The JAX stepper carries a per-component coefficient, so the smoothed result is
+JIT-compiled *and* differentiable (see :doc:`backends`). The payoff is easy to
 see and hard to argue with (``tests/test_smoothing.py``,
 ``tests/test_jax_accuracy.py``): slide an interface across a single cell and
 watch a transmitted-phase observable. Without smoothing it sits perfectly still
@@ -104,7 +103,7 @@ poles. (Fitting a stable low-order model over your band, which is what Tidy3D's
 dispersion fitter does, is the obvious next step.) The stepper itself matches the
 analytic phase index of a Lorentz medium to ~1% (``tests/test_dispersion.py``).
 
-Runs on NumPy and JAX. On the JAX path each pole's polarization rides along in
+Each pole's polarization rides along in
 the ``lax.scan`` carry, so a dispersive run is JIT-compiled and
 **differentiable**: ``jax.grad`` of a monitor loss flows all the way back to the
 pole strengths (checked against finite differences in
@@ -193,7 +192,7 @@ Everything here is built so that peak memory tracks the problem's real size, not
 its bounding box:
 
 * **Dispersion** keeps the auxiliary polarization only on the dispersive cells
-  (NumPy and JAX both), so a metal nanostructure in a large domain costs what the
+  so a metal nanostructure in a large domain costs what the
   nanostructure costs, not what the domain costs.
 * **Subpixel smoothing** supersamples one x-slab at a time, so the transient
   build memory is a single refined slab rather than the whole
@@ -224,17 +223,12 @@ its bounding box:
   to reach for.
 * **Planning a big run.** :func:`~photonfdtd.estimate_memory` /
   :func:`~photonfdtd.recommend_mode` / :func:`~photonfdtd.format_report` estimate
-  the peak bytes of each mode (forward, the three adjoints, disk-tiled
-  out-of-core) and pick one that fits your budget — so you find out a run won't
-  fit *before* it OOMs, not after. For a volume that doesn't fit at all, the
-  out-of-core stepper (``Simulation.run(out_of_core=True)``) memory-maps the
-  fields to disk and marches in tiles bounded by ``tile_cells`` planes. Turn on
-  the legacy CuPy backend (``use_gpu=True``) and it becomes a full
-  **GPU/host/disk hierarchy**: each disk-backed tile is worked on the GPU and
-  sent back, so the GPU only ever holds one tile while the full arrays sit on
-  disk — a volume bigger than your VRAM still runs. Validated on an RTX 4080
-  (bit-identical to the in-core CPU result; peak GPU memory scales with
-  ``tile_cells``, not the grid).
+  the peak bytes of each mode (forward and the three adjoints) and pick one that
+  fits your budget — so you find out a run won't fit *before* it OOMs, not
+  after. ``recommend_mode`` defaults its budget to what
+  :func:`~photonfdtd.available_memory` detects on the machine (GPU VRAM if there
+  is one, else host RAM), and returns ``"infeasible"`` when nothing fits: the
+  whole domain has to live on the device.
 
 References:
 

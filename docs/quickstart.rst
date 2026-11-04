@@ -56,7 +56,12 @@ guided modes directly, as an eigenvalue problem:
    result = ms.solve()
    print(result.n_eff)            # array of effective indices
 
+Neither of these says anything about *where* it runs, and that's deliberate:
+the FDTD time loop is a JIT-compiled JAX program, so it runs on the GPU if you
+have a CUDA ``jaxlib`` installed and on the CPU otherwise. See :doc:`backends`.
+
 From here, the :doc:`examples` walk through runnable scripts that produce
-figures, and the :doc:`accuracy` guide covers the parts that make the answers
+figures, the :doc:`accuracy` guide covers the parts that make the answers
 trustworthy — subpixel smoothing, dispersion, full-vectorial modes, and the
-differentiable inverse-design stack.
+differentiable inverse-design stack — and :doc:`layout_scale` is for when the
+device is a whole circuit rather than a component.

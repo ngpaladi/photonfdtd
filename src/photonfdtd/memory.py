@@ -12,21 +12,14 @@ run can be sized *before* it OOMs. The modes:
                            O(levels * n_steps**(1/levels)) working sets.
 * ``adjoint_reversible`` - the reversible adjoint (:mod:`photonfdtd.reversible`):
                            O(1) working sets (a few), independent of n_steps.
-* ``out_of_core``        - disk-tiled forward stepping
-                           (:mod:`photonfdtd.outofcore`): the working set is
-                           bounded by the tile, not the grid.
 
 The estimate is the dominant field/coefficient/psi/monitor array memory; it is
 approximate (it omits framework overhead and transient temporaries) but the
 *ratios* between modes are exact by construction and are what matter for
-choosing one. The GPU/host/disk hierarchy (``Simulation(use_gpu=True).run(out_of_core=True)``,
-see :mod:`photonfdtd.outofcore`) processes each disk-backed tile on the device,
-so the resident-on-GPU figure is the ``out_of_core`` tile working set while the
-full arrays live on disk; peak device memory scales with ``tile_cells``, not the
-grid (validated on an RTX 4080).
+choosing one.
 """
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict
 import math
 import numpy as np
 
@@ -46,23 +39,18 @@ def _working_set_bytes(sim) -> int:
     return (n_fields + n_coeff + n_psi) * n_cell * itemsize
 
 
-def estimate_memory(sim, checkpoint_levels: int = 2,
-                    tile_cells: Optional[int] = None) -> Dict[str, int]:
+def estimate_memory(sim, checkpoint_levels: int = 2) -> Dict[str, int]:
     """Estimated peak bytes per execution mode for ``sim`` (see module docstring)."""
     ws = _working_set_bytes(sim)
     n = max(int(sim.n_steps), 1)
     levels = max(1, int(checkpoint_levels))
     nested_states = levels * int(math.ceil(n ** (1.0 / levels)))
-    if tile_cells is None:
-        tile_cells = max(sim.grid.shape[0] // 8, 1)
-    tile_frac = min(1.0, (tile_cells + 1) / max(sim.grid.shape[0], 1))
     return {
         "working_set": ws,
         "forward": ws,
         "adjoint_none": ws * n,
         "adjoint_nested": ws * nested_states,
         "adjoint_reversible": ws * 3,
-        "out_of_core": int(ws * tile_frac),
     }
 
 
@@ -133,8 +121,8 @@ def recommend_mode(sim, budget_bytes=None, differentiable: bool = True,
     ``budget_bytes`` defaults to the memory actually available on this machine
     (GPU VRAM if present, else host RAM). For a differentiable (adjoint) run the
     preference order is none -> nested -> reversible (increasing compute,
-    decreasing memory); for a forward-only run, forward -> out_of_core. Returns
-    the mode name, or ``'out_of_core'`` / ``'infeasible'`` as the last resort.
+    decreasing memory); for a forward-only run, just forward. Returns the mode
+    name, or ``'infeasible'`` if nothing fits the device.
     """
     if budget_bytes is None:
         budget_bytes = available_memory()[0]
@@ -147,11 +135,9 @@ def recommend_mode(sim, budget_bytes=None, differentiable: bool = True,
             if est[mode] <= budget_bytes:
                 return mode
         # reversible is the least-memory adjoint; if even it doesn't fit, the
-        # grid itself is too big for a single device -> needs tiling/offload.
-        return "out_of_core" if est["out_of_core"] <= budget_bytes else "infeasible"
-    if est["forward"] <= budget_bytes:
-        return "forward"
-    return "out_of_core" if est["out_of_core"] <= budget_bytes else "infeasible"
+        # grid itself is too big for the device.
+        return "infeasible"
+    return "forward" if est["forward"] <= budget_bytes else "infeasible"
 
 
 def format_report(sim, checkpoint_levels: int = 2) -> str:
@@ -160,6 +146,6 @@ def format_report(sim, checkpoint_levels: int = 2) -> str:
     lines = [f"Peak-memory estimate  (grid {tuple(sim.grid.shape)}, "
              f"{sim.n_steps} steps, {np.dtype(sim.dtypes['Ex']).name}):"]
     for k in ("forward", "adjoint_none", "adjoint_nested",
-              "adjoint_reversible", "out_of_core"):
+              "adjoint_reversible"):
         lines.append(f"  {k:20s} {est[k] / 1e9:8.3f} GB")
     return "\n".join(lines)

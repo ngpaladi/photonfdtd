@@ -5,8 +5,7 @@ into an in-plane pattern on a substrate under a cladding. A full 3-D FDTD of a
 whole device is enormous; the EIM collapses the vertical (z) dimension into an
 *effective index* so the device is simulated as a 2-D problem in the chip plane
 (x, y) - two to three orders of magnitude fewer cells and timesteps, and the
-resulting 2-D :class:`~photonfdtd.Simulation` runs unchanged on every backend
-(NumPy / JAX / Rust / Rust-CUDA).
+resulting 2-D :class:`~photonfdtd.Simulation` runs unchanged.
 
 The reduction is the textbook two-step EIM (e.g. Chuang, *Physics of
 Photonic Devices*, or Okamoto, *Fundamentals of Optical Waveguides*):
@@ -157,7 +156,9 @@ def slab_modes(
     polarization : {"TE", "TM"}
         Slab polarization (see module docstring).
     num_modes : int
-        Number of guided modes to return.
+        Maximum number of guided modes to return. A stack that guides fewer
+        (or none, e.g. a fully etched region) returns fewer; ``n_eff`` is then
+        shorter than ``num_modes`` and may be empty.
     substrate_index, cladding_index : float or Medium
         Semi-infinite media below and above the stack.
     dz : float, optional
@@ -220,11 +221,12 @@ def slab_modes(
     n_eff_all = np.sqrt(np.clip(beta2, 0.0, None)) / k0
 
     # Keep genuinely guided modes: n_eff between the higher cladding index and
-    # the peak stack index.
+    # the peak stack index. Anything at or below the floor is a box mode of
+    # the finite Dirichlet-walled pad (its index moves with ``pad``), not a
+    # mode of the stack, so a non-guiding stack returns no modes at all rather
+    # than an artefact.
     n_floor = max(n_sub, n_clad)
     guided = np.flatnonzero((n_eff_all > n_floor + 1e-6) & (n_eff_all <= n_hi + 1e-6))
-    if guided.size == 0:                    # fall back to the top eigenpairs
-        guided = np.arange(min(num_modes, n_eff_all.size))
     guided = guided[:num_modes]
 
     n_eff = n_eff_all[guided]

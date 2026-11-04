@@ -1,13 +1,16 @@
 # photonfdtd
 
-A small, fully-local open-source FDTD + waveguide mode solver written in
-Python/NumPy. It implements a Yee-grid FDTD time-stepper with CPML
-absorbing boundaries, dispersive materials, anisotropic subpixel smoothing,
-and a full-vectorial waveguide mode solver, with an API intentionally similar
-in spirit to Tidy3D.
+A small, fully-local open-source FDTD + waveguide mode solver for integrated
+photonics: a Yee-grid FDTD time-stepper with CPML absorbing boundaries,
+dispersive materials, anisotropic subpixel smoothing, and a full-vectorial
+waveguide mode solver, with an API intentionally similar in spirit to Tidy3D.
+The time loop runs on JAX/XLA, one code path for CPU, GPU and TPU, and the whole
+solver is differentiable. Everything runs on your own machine.
 
-This is alpha-stage software (v0.1). The pieces that exist are tested and
-correct; the pieces that don't, don't. See *Status* below.
+This is alpha-stage software. The pieces that exist are tested and correct; the
+pieces that don't, don't. See *Known limitations* below.
+
+**Documentation:** https://www.noahpaladino.com/photonfdtd/
 
 ## Install
 
@@ -29,27 +32,12 @@ cd photonfdtd
 pip install -e .
 ```
 
-The PyPI wheel is pure Python (NumPy core; `photonfdtd[jax]` for the
-differentiable XLA backend). The optional compiled Rust / CUDA backends
-(`backend="rust"`, `backend="rust-cuda"`) are built separately from the Rust
-sources shipped in the sdist — see [`benchmarks/README.md`](benchmarks/README.md).
+The PyPI wheel is pure Python and pulls in JAX (the CPU `jaxlib`). For an
+NVIDIA GPU, install the CUDA build of JAX alongside it:
 
-### Releasing (maintainers)
-
-Releases publish to PyPI automatically via
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) using PyPI
-**Trusted Publishing** (OIDC — no API token stored). To cut a release:
-
-1. Bump the version in `pyproject.toml` **and** `src/photonfdtd/__init__.py`
-   (kept in sync by `tests/test_version.py`).
-2. Publish a GitHub Release tagged `vX.Y.Z` matching that version. The workflow
-   runs the tests, guards tag-vs-version, builds the sdist + wheel, and
-   publishes.
-
-One-time setup before the first release: on PyPI, add a *trusted publisher* for
-the project (Publishing → add a GitHub Actions publisher) with owner `ngpaladi`,
-repo `photonfdtd`, workflow `publish.yml`, environment `pypi`. Until the project
-exists, use PyPI's *pending publisher* form with the same values.
+```bash
+pip install "jax[cuda12]"
+```
 
 ## Quick start
 
@@ -96,7 +84,7 @@ result = ms.solve()
 print(result.n_eff)            # array of effective indices
 ```
 
-## What v0.2 actually does
+## What it does today
 
 - **Yee-grid FDTD** in 1D / 2D / 3D, with the Courant-stable time step
   selected automatically.
@@ -118,103 +106,113 @@ print(result.n_eff)            # array of effective indices
 - **Geometry primitives**: axis-aligned `Box` and arbitrary-polygon
   `PolySlab` (a polygon in xy extruded between two z bounds).
 - **Sources**: soft point-dipole (`PointDipole`), distributed line/area
-  mode injection (`ModeSource`), an energy-normalised `SinglePhotonSource`
-  whose amplitude is set so the launched wavepacket carries exactly
-  $h\,\nu$ of total electromagnetic energy, and a moving-charge
+  mode injection (`ModeSource`, and the one-way `UniModeSource` built from
+  equivalence-principle current sheets), an energy-normalised
+  `SinglePhotonSource` whose amplitude is set so the launched wavepacket
+  carries exactly $h\,\nu$ of total electromagnetic energy, and a moving-charge
   `ChargedParticle` current source that emits **Cherenkov radiation** when
-  it outruns the local phase velocity (see `examples/04_cherenkov.py`).
+  it outruns the local phase velocity (`examples/04_cherenkov.py`), and whose
+  evanescent near field below threshold matches the analytic
+  `exp(-k_x |y| / gamma)` law to a few percent, the coupling that drives a
+  Cherenkov radiator in a hollow tube (`examples/05_cherenkov_tube.py`).
 - **Monitors**: time-domain field snapshots (`FieldMonitor`), Poynting flux
   (`FluxMonitor`), and a frequency-domain `DFTMonitor` that accumulates a
   running Fourier transform at chosen frequencies so storage scales with the
   number of frequencies rather than the number of timesteps (routinely
   50-1000x smaller than an equivalent time-domain monitor, exact at those
   frequencies).
-- **Memory efficiency for large volumes**: per-array `float32`/`float64`
-  precision, the permittivity grid released during stepping, a shared curl
-  scratch buffer that avoids per-step full-domain temporaries, and
-  `FieldMonitor(compression=...)`, which streams snapshots to disk as
-  per-frame-scaled, quantised, compressed blocks - keeping RAM flat regardless
-  of recording length and shrinking stored data ~10-30x (8-bit) or ~5-7x
-  (16-bit) versus an uncompressed float64 monitor.
-- **Out-of-core stepping** (`sim.run(out_of_core=True, tile_cells=...)`): for a
-  volume whose fields do not fit in RAM, the six field arrays, `ce_field` and
-  the CPML state are memory-mapped to disk and each timestep sweeps the domain
-  in slabs along one axis, so **peak RAM is bounded by the tile size, not the
-  grid**. Reproduces the in-core result to machine precision. NumPy backend,
-  point sources and `FieldMonitor` (incl. `compression=`) supported; see
-  `photonfdtd.outofcore`.
-- **Differentiable PIC inverse design.** A substrate/etched-core/cladding stack
-  driven by a 2-D etch density `ρ(x,y)` (`EtchedCore`) maps — conic filter →
-  `tanh` projection → anisotropic subpixel sidewalls → 3-D ε — entirely in JAX,
-  so `value_and_grad_density` returns `d(loss)/d(ρ)` through the full time
-  evolution (topology optimization; gradient matches finite differences to
-  ~1e-8). Ports are launched one-way with `UniModeSource` (equivalence-principle
-  current sheets). See [`docs/accuracy.rst`](docs/accuracy.rst).
 - **Mode-decomposition S-parameters** (`s_parameters`, `mode_amplitudes`):
   project the frequency-domain fields on a memory-light port plane (any axis via
   `DFTMonitor(plane_axis=..., plane_position=...)`) onto a solved mode to get
   complex forward/backward modal amplitudes and hence S-parameters. A mode down
-  a straight lossless guide gives `|S21|≈1`; the overlap is backend-agnostic
-  (NumPy/CuPy/JAX) so `|S_ij|²` is differentiable through the adjoint — the PIC
-  inverse-design objective. See [`docs/accuracy.rst`](docs/accuracy.rst).
+  a straight lossless guide gives `|S21|≈1`; the overlap works on NumPy or JAX
+  arrays, so `|S_ij|²` is differentiable through the adjoint — the PIC inverse-design
+  objective.
 - **Full-vectorial waveguide mode solver** (`ModeSolver`): a finite-difference
   eigenproblem for the transverse fields on the Yee grid that distinguishes TE
   from TM and captures high-index-contrast boundary effects. Validated against
   the exact symmetric-slab dispersion to better than 0.01% on both TE0 and TM0
   (Zhu & Brown 2002; Fallahkhair et al. 2008).
+- **Layout-scale methods** for whole circuits (`docs/layout_scale.rst`):
+  - the **2.5-D effective-index method** (`EffectiveIndex2D`, `slab_modes`)
+    collapses a vertical layer stack to effective indices so a patterned layer
+    becomes an ordinary 2-D run (1-D slab solver validated against the
+    analytic dispersion, second-order convergent);
+  - **eigenmode expansion** (`eme_2d`, `Section`, `sections_from_eps`) for
+    piecewise-uniform 2-D devices — local modes, power-orthonormal interface
+    matching, Redheffer star product; cost set by mode count, not device
+    length; a width step's reflection reproduces the Fresnel value;
+  - **unconditionally-stable ADI-FDTD** (`ADISimulation2D`) for the 2-D
+    `(Ez, Hx, Hy)` system, stable and bounded at 8x the explicit CFL step;
+    the time loop is a JAX `lax.scan` with each sweep's line solves batched
+    into one tridiagonal solve.
+- **Differentiable PIC inverse design.** A substrate/etched-core/cladding stack
+  driven by a 2-D etch density `ρ(x,y)` (`EtchedCore`) maps — conic filter →
+  `tanh` projection → anisotropic subpixel sidewalls → 3-D ε — entirely in JAX,
+  so `value_and_grad_density` returns `d(loss)/d(ρ)` through the full time
+  evolution (topology optimization; gradient matches finite differences to
+  ~1e-8). Adjoint memory is kept in check by two-level gradient checkpointing
+  and, for closed/periodic domains, an O(1)-in-timesteps **reversible adjoint**
+  (`jax_value_and_grad_eps_reversible`, plus a PML-shell-tape variant).
+- **Memory planning**: per-array `float32`/`float64` precision (the stepping
+  arrays share one dtype; monitor storage may differ) and a memory planner
+  (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)
+  that sizes a run against the device before it OOMs.
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout
   `Component`, maps its layers onto user-supplied materials, and returns a
   pre-built `Simulation`.
-- **Optional acceleration backends** for time-stepping: a Numba JIT path and
-  a CuPy GPU path (`use_gpu=True`). The GPU path uses only generic CuPy array
-  ops, so it runs on either an **NVIDIA** GPU (CuPy's CUDA build,
-  `cupy-cuda12x`) or an **AMD** GPU (CuPy's ROCm build, `cupy-rocm-5-0`).
-  Both are optional; without them the plain NumPy core runs.
-- **Differentiable JAX backend** (`use_jax=True`): a pure-functional
-  reimplementation of the Yee + CPML step under `jax.lax.scan`, JIT-compiled
-  through XLA (CPU/GPU/TPU from one path) and matching the in-core solver to
-  machine precision. Because the stepper is a pure function of the
-  permittivity, `pf.jax_value_and_grad_eps(sim, loss)` returns the gradient of
-  any monitor-based scalar w.r.t. `eps_r` — a **time-domain adjoint for
-  gradient-based inverse design / topology optimization**. See
-  `photonfdtd.jaxbackend`. (`pip install "photonfdtd[jax]"`.)
+
+## Running on JAX
+
+Every time loop — `Simulation.run()`, the adjoints, and `ADISimulation2D` —
+is a JIT-compiled `jax.lax.scan`, so the same code runs on CPU, GPU or TPU
+depending on which `jaxlib` is installed. Float64 runs switch on
+`jax_enable_x64` for you; `precision="float32"` halves memory and roughly
+doubles throughput. See [`docs/backends.rst`](docs/backends.rst).
 
 ### Running on GPU
 
-**JAX is the GPU backend.** With `use_jax=True` the forward run and the
-differentiable / reversible adjoints run on the GPU automatically once a CUDA
-`jaxlib` is present — no code change: `pip install "jax[cuda12]"`. Validated on
-an NVIDIA RTX 4080 (CUDA 12): forward matches NumPy to ~1e-16, and both adjoints
-run on-device. If JAX falls back to CPU with a "cuSPARSE not found"-style error,
-the nvidia CUDA libraries just aren't on the loader path — add them, e.g.
+With a CUDA `jaxlib` present (`pip install "jax[cuda12]"`) the forward run and
+both adjoints run on-device. Validated on an NVIDIA RTX 4080 (CUDA 12). If JAX
+falls back to CPU with a "cuSPARSE not found"-style error, the nvidia CUDA
+libraries just aren't on the loader path — add them, e.g.
 `export LD_LIBRARY_PATH=$(python -c "import nvidia,glob,os;print(':'.join(glob.glob(os.path.dirname(nvidia.__file__)+'/*/lib')))")`.
-Large differentiable runs fit in GPU memory thanks to gradient checkpointing and
-the O(1)-memory reversible adjoint (`photonfdtd.reversible`).
+Set `XLA_PYTHON_CLIENT_PREALLOCATE=false` if you want JAX to allocate VRAM on
+demand rather than grabbing most of the card up front.
 
-The **CuPy backend** (`use_gpu=True`) is a deprecated legacy path — superseded by
-JAX for GPU work, but retained (optional; `pip install cupy-cuda12x`) for
-AMD/ROCm GPUs and for **GPU/host/disk out-of-core** (`use_gpu=True` +
-`run(out_of_core=True)`), where fields live on disk and each tile is processed on
-the GPU so peak device memory is one tile — a volume larger than GPU memory still
-runs (JAX cannot stream to disk).
+## Known limitations
 
-## What v0.2 does *not* do (yet)
+- The whole domain (fields, CPML state and recorded monitor frames) has to fit
+  in device memory; there is no out-of-core / disk-tiled stepping. Use
+  `estimate_memory` to check first, and `plane_z=` / `downsample=` /
+  `DFTMonitor` to keep monitor storage small.
+- The effective-index method assumes the vertical mode is separable from the
+  in-plane confinement — good for routing, poor for deep sub-wavelength gaps
+  and out-of-plane diffraction. EME is 2-D, single-polarisation, straight-axis
+  only. ADI-FDTD is 2-D `(Ez, Hx, Hy)` with PEC or a conductivity absorber,
+  not CPML.
+- The reversible adjoint with CPML is exact but only saves memory when the PML
+  shell is a small fraction (under ~5%) of the volume; for ordinary PML runs
+  use checkpointing.
+- Media are isotropic (the subpixel tensor is the only anisotropy); there is
+  no TFSF plane-wave injection.
 
-Items below are intentional out-of-scope and tracked in the issue
-tracker:
+## Releasing (maintainers)
 
-- Dispersive media (Lorentz / Drude / Debye) - planned next, via the
-  auxiliary-differential-equation method.
-- Full-vectorial 2D mode solving with E and H couplings.
-- Anisotropic media.
-- Sub-cell averaging for polygon edges.
-- Total-field / scattered-field plane wave injection.
+Releases publish to PyPI automatically via
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) using PyPI
+**Trusted Publishing** (OIDC — no API token stored). To cut a release:
 
-## Roadmap
+1. Bump the version in `pyproject.toml` **and** `src/photonfdtd/__init__.py`
+   (kept in sync by `tests/test_version.py`).
+2. Publish a GitHub Release tagged `vX.Y.Z` matching that version. The workflow
+   runs the tests, guards tag-vs-version, builds the sdist + wheel, and
+   publishes.
 
-- v0.3: dispersive media (Lorentz pole-residue), full-vectorial mode
-  solver, anisotropic materials.
-- v0.4: Numba/JAX backend for ~10-100x speed-up.
+The docs build and deploy from `main` via
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml) with
+`sphinx-build -W`, so a docstring that doesn't parse as reStructuredText fails
+the build.
 
 ## License
 

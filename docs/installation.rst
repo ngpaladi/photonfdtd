@@ -1,17 +1,23 @@
 Installation
 ============
 
-From source
------------
+From PyPI
+---------
 
-photonfdtd isn't on PyPI yet, so ``pip install photonfdtd`` won't get you
-anywhere. Install it from source instead — either straight from GitHub:
+The straightforward way:
 
 .. code-block:: bash
 
-   pip install "git+https://github.com/ngpaladi/photonfdtd"
+   pip install photonfdtd
 
-or from a checkout, which is what you want if you plan to poke at the code:
+The wheel is pure Python. It depends on NumPy, SciPy, Matplotlib and JAX (the
+CPU ``jaxlib``, which runs the time loop). Everything that follows on this page
+is optional.
+
+From source
+-----------
+
+If you plan to poke at the code, install from a checkout:
 
 .. code-block:: bash
 
@@ -19,67 +25,36 @@ or from a checkout, which is what you want if you plan to poke at the code:
    cd photonfdtd
    pip install -e .
 
-Once there's a release on PyPI, plain ``pip install photonfdtd`` will work too.
+Installing straight from GitHub works too:
+
+.. code-block:: bash
+
+   pip install "git+https://github.com/ngpaladi/photonfdtd"
 
 Optional extras
 ---------------
 
 .. code-block:: bash
 
-   pip install -e ".[test]"   # pytest
-   pip install -e ".[docs]"   # sphinx + the Read the Docs theme, to build these docs
+   pip install -e ".[test]"             # pytest, for the test suite
+   pip install -e ".[docs]"             # sphinx + the Read the Docs theme, to build these docs
 
-photonfdtd needs Python 3.10+ and leans on NumPy, SciPy, and Matplotlib, and
-nothing else for the core. The ``gdsfactory`` adapter and the optional Numba
-acceleration are imported lazily, so you don't need either one for a base
-install — they only cost you anything if you actually reach for them.
+photonfdtd needs Python 3.10+. The ``gdsfactory`` adapter is imported lazily,
+so it costs you nothing until you actually reach for it.
 
 GPU acceleration
 ----------------
 
-The GPU story is JAX. Pass ``use_jax=True`` to a simulation and, once a
-CUDA-enabled ``jaxlib`` is installed, the forward run *and* the differentiable /
-reversible adjoints run on the GPU through XLA — no code change on your end:
+Install a CUDA-enabled ``jaxlib`` and the forward run *and* the differentiable
+and reversible adjoints run on the GPU through XLA. Your code doesn't change:
 
 .. code-block:: bash
 
    pip install "jax[cuda12]"   # NVIDIA / CUDA 12 GPU
 
-This is validated on an NVIDIA RTX 4080: the GPU forward run matches the NumPy
-reference to floating-point rounding, and both adjoints run on-device. If JAX
-quietly falls back to CPU with a "cuSPARSE not found"-style error, the CUDA
-libraries just aren't on the loader path yet; point ``LD_LIBRARY_PATH`` at the
-``nvidia/*/lib`` directories the ``jax[cuda12]`` install dropped in your
-site-packages and it'll find them.
-
-There's also a legacy `CuPy <https://cupy.dev>`_ backend behind
-``use_gpu=True``. It's superseded by JAX for GPU work (and deprecated), but it's
-kept around for two things JAX can't do: AMD/ROCm hardware, and streaming
-disk-backed tiles through the GPU for a run that's larger than your VRAM. If you
-want either, install the CuPy build that matches your card:
-
-.. code-block:: bash
-
-   pip install cupy-cuda12x    # NVIDIA / CUDA GPU
-   pip install cupy-rocm-5-0   # AMD / ROCm GPU
-
-CuPy is optional and imported lazily; with neither it nor a CUDA ``jaxlib``
-installed, the plain NumPy core still runs everything on the CPU.
-
-Which backend actually runs
----------------------------
-
-You don't have to think about any of this most of the time. By default
-(``backend="auto"``) a simulation picks its own engine: if JAX is installed and
-the run is big enough that compiling it pays off, it uses the JAX backend (on the
-GPU, if there's one) — and otherwise it stays on the plain NumPy core, which is
-instant and needs no extra dependency. On a large 3-D forward run that hands you
-roughly a 4x speedup on CPU and ~40x on GPU without changing a line of code.
-
-It also checks that the run will actually *fit*: it estimates the working set
-and compares it to what your machine has (GPU VRAM if there's a GPU, otherwise
-host RAM), and if a JAX run would overflow that, auto quietly stays on NumPy and
-points you at ``run(out_of_core=True)`` rather than handing you an out-of-memory
-crash. If you'd rather pin the backend, pass ``backend="numpy"`` (deterministic,
-dependency-light) or ``backend="jax"`` outright; out-of-core runs always take the
-NumPy tiling path, since JAX can't stream to disk.
+This is validated on an NVIDIA RTX 4080, with both adjoints running on-device.
+If JAX quietly falls back to CPU with a "cuSPARSE not found"-style error, the
+CUDA libraries just aren't on the loader path yet. Point ``LD_LIBRARY_PATH`` at
+the ``nvidia/*/lib`` directories the ``jax[cuda12]`` install dropped in your
+site-packages and it'll find them. Devices, precision and memory planning are
+covered on the :doc:`backends` page.

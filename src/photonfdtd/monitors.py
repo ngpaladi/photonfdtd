@@ -29,7 +29,7 @@ class FieldMonitor:
     downsample : int, optional
         Spatial stride for stored snapshots: keep every ``downsample``-th cell
         on every axis (default 1 = full resolution). Cuts snapshot memory by
-        ``downsample**ndim`` and, on the GPU backend, the host transfer too.
+        ``downsample**ndim`` and the device-to-host transfer too.
         The stored array aligns to ``grid.coords[axis][::downsample]`` on each
         axis. Snapshots are stored in the simulation's ``'monitors'`` dtype
         (``precision={'monitors': 'float32'}`` halves snapshot memory even on a
@@ -38,29 +38,8 @@ class FieldMonitor:
         If given, record only the single z-plane nearest this z-coordinate (m)
         instead of the whole volume. The stored array keeps a size-1 z axis so
         downstream indexing is unchanged. For a top-down field movie this cuts
-        snapshot memory — and the GPU host transfer — by the full z-cell count
+        snapshot memory — and the device-to-host transfer — by the full z-cell count
         (often 30-100x), since only the one displayed plane is kept.
-    compression : {None, True, 'zstd', 'zlib'}, optional
-        If set, stream snapshots to a temporary file as lossily-compressed
-        frames instead of keeping them all in RAM. Each frame is stored as a
-        per-frame float16-scaled, then compressed, block (see
-        :class:`photonfdtd.storage.CompressedFieldSeries`), which keeps the
-        run's memory footprint flat for arbitrarily long/large recordings and
-        typically shrinks stored data ~10-20x versus an uncompressed float64
-        monitor. ``True`` selects zstd if the ``zstandard`` package is present
-        and falls back to stdlib zlib; ``'zstd'`` requires that package;
-        ``'zlib'`` is always available. The result
-        (``result.fields[name][component]``) is a lazily-decompressing,
-        array-like series rather than a plain ``ndarray``: ``series[i]`` reads
-        one frame, ``np.asarray(series)`` materialises all of them. This mode is
-        lossy; use ``compression=None`` for exact snapshots.
-    compression_bits : {8, 16}, optional
-        Quantisation depth for the compressed mode (default 8). ``8`` (int8)
-        gives ~10-30x reduction versus an uncompressed float64 monitor at
-        ~4e-3 relative error - it comfortably meets a 10x target and suits
-        field movies / visualisation. ``16`` (float16) trades ratio for
-        fidelity (~5-7x, ~2e-4 relative error). Ignored when
-        ``compression`` is None.
     name : str
         Identifier used to retrieve results from sim.run().
     """
@@ -70,8 +49,6 @@ class FieldMonitor:
     times: Optional[Sequence[float]] = None
     downsample: int = 1
     plane_z: Optional[float] = None
-    compression: object = None
-    compression_bits: int = 8
 
     def __post_init__(self):
         if self.interval is None and self.times is None:
@@ -81,14 +58,6 @@ class FieldMonitor:
         if int(self.downsample) != self.downsample or self.downsample < 1:
             raise ValueError("downsample must be a positive integer")
         self.downsample = int(self.downsample)
-        if self.compression is not None and \
-                self.compression not in (True, "auto", "zstd", "zlib"):
-            raise ValueError(
-                "compression must be None, True, 'zstd', or 'zlib', got "
-                f"{self.compression!r}"
-            )
-        if self.compression_bits not in (8, 16):
-            raise ValueError("compression_bits must be 8 or 16")
 
 
 @dataclass

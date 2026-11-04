@@ -1,8 +1,7 @@
-"""JAX backend: a pure-functional FDTD time step under ``jax.lax.scan``.
+"""JAX engine: a pure-functional FDTD time step under ``jax.lax.scan``.
 
-This is a functional reimplementation of the Yee + CPML update the NumPy/Numba
-backends run imperatively. JAX arrays are immutable, so every field/psi update
-is expressed functionally (``x.at[region].add(...)``) and the whole time loop is
+This is the time-stepping core behind :meth:`Simulation.run`. JAX arrays are
+immutable, so every field/psi update is expressed functionally (``x.at[region].add(...)``) and the whole time loop is
 a ``lax.scan`` over a carry of (fields, psi, monitor accumulators). That makes
 the solver:
 
@@ -17,12 +16,9 @@ the solver:
 
 Accuracy features: anisotropic subpixel smoothing (``subpixel=True``, via a
 per-component coefficient) and dispersive media (Lorentz/Drude/Sellmeier poles
-advanced by the ADE recursion inside the ``lax.scan`` carry) both run on this
-path and match the NumPy reference to floating-point reordering.
+advanced by the ADE recursion inside the ``lax.scan`` carry).
 
-The per-cell arithmetic mirrors the fused Numba kernel's ``cy - cz`` form (dense
-CPML psi), so results track the in-core backends to floating reordering
-(~1e-6 single / ~1e-11 double), like the Numba backend.
+The per-cell update uses the ``cy - cz`` curl form with dense CPML psi.
 
 Sources: soft point/dipole sources (so expanded ModeSource / SinglePhoton
 sources work too) and moving ``ChargedParticle`` charges (Cherenkov). The
@@ -32,8 +28,7 @@ current cloud is precomputed per step on host and injected inside the scan via
 symbolic, so gradients still flow through it.
 
 Monitors: ``FieldMonitor`` / ``DFTMonitor`` / ``FluxMonitor``. CPML, 1D/2D/3D,
-float32/float64. The disk-side ``FieldMonitor(compression=)`` / ``out_of_core``
-machinery is not part of the JAX device path and raises a clear error.
+float32/float64.
 """
 from __future__ import annotations
 import math
@@ -135,8 +130,11 @@ def _particle_plan(sim, static):
     The trajectory is deterministic and field-independent, so the stencil
     location and the normalised weights are fully known on host - only the
     ``ce_field`` factor stays symbolic (kept in the kernel via a dynamic slice),
-    so gradients w.r.t. ``eps_r`` still flow through the deposit. Reproduces the
-    in-core :meth:`Simulation._inject_particle_currents` exactly: each step's
+    so gradients w.r.t. ``eps_r`` still flow through the deposit. A charge ``q``
+    at velocity ``v`` is a current density ``J = q v``; it is smeared over a
+    Gaussian cloud (``cloud_cells`` wide) to band-limit the radiated spectrum and
+    deposited as ``dE = -(q v / dV) * weight * ce_field`` only while the
+    particle centre is inside the physical (non-PML) interior. Each step's
     deposit is embedded in a fixed-size window ``R`` (so ``lax.dynamic_slice``
     can place it), zero-padded outside the actual [i0,i1) stencil, and zero on
     steps where the particle centre is outside the physical interior / time
@@ -167,7 +165,7 @@ def _particle_plan(sim, static):
         wblocks = np.zeros((n_steps,) + R, dtype=npdt)
 
         for si in range(n_steps):
-            t_now = (si + 1.0) * dt                       # E-time, as in-core
+            t_now = (si + 1.0) * dt                       # E-time
             if not (p.t_start <= t_now <= p.t_stop):
                 continue
             pos = p.position_at(t_now)
@@ -290,10 +288,6 @@ def _monitor_plan(sim):
     plans = []
     for m in sim.monitors:
         if isinstance(m, FieldMonitor):
-            if m.compression is not None:
-                raise NotImplementedError(
-                    "FieldMonitor(compression=) is a host-side store, not part "
-                    "of the JAX device path; drop compression for use_jax.")
             rec = (sorted({int(round(t / dt)) for t in m.times
                            if 0 <= int(round(t / dt)) < n_steps})
                    if m.times is not None else list(range(0, n_steps, m.interval)))
@@ -463,7 +457,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         for comp, i, j, k, vals in src_H:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
         # Gather E^n at the dispersive cells before the curl E-update, so the
-        # pole recursion uses the pre-update field (matches the in-core ADE).
+        # pole recursion uses the pre-update field (P^{n+1} = aP^n + bP^{n-1} + cE^n).
         if ade is not None:
             En = jnp.stack([fields["Ex"][ade_idx], fields["Ey"][ade_idx],
                             fields["Ez"][ade_idx]], axis=0)   # (3, n_disp)
@@ -479,7 +473,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
             ade_state = (Pnew, Pcur)
         for comp, i, j, k, vals in src_E:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
-        # Moving-charge currents, injected at the E-time as in the in-core loop.
+        # Moving-charge currents, injected at the E-time.
         if pplans:
             fields = deposit_particles(fields, step_idx)
 
@@ -598,16 +592,14 @@ def _enable_x64_if_needed(sim):
 
 
 def _validate(sim):
-    if sim.use_gpu or sim.use_numba:
-        raise NotImplementedError("use_jax is exclusive of use_gpu / use_numba.")
     if len({sim.dtypes[k] for k in
             ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz", "eps_r")}) > 1:
         raise NotImplementedError(
-            "the JAX backend requires one uniform precision for the fields.")
+            "the stepping arrays (fields, eps_r) must share one precision.")
 
 
 def run_jax(sim, jit: bool = True):
-    """Run ``sim`` on the JAX backend and return a Result (see module docstring)."""
+    """Run ``sim`` on JAX and return a Result (see module docstring)."""
     import jax
     import jax.numpy as jnp
     from .simulation import Result
