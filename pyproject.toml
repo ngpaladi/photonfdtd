@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "photonfdtd"
-version = "0.14.0"
+version = "0.14.1"
 description = "Local-only, differentiable JAX/XLA FDTD + waveguide mode solver for integrated photonics."
 readme = "README.md"
 license = { text = "MIT" }
