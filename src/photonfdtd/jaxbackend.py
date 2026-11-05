@@ -111,14 +111,27 @@ def _build_static(sim):
                               dl=cell[ax], pshape=rshape))
         comps.append(dict(Fkey=Fkey, region=region, is_E=is_E, terms=terms))
 
-    src_H, src_E = [], []
+    # Sources grouped per component: (comp, I, J, K, V) with index arrays of
+    # length n_src and V of shape (n_steps, n_src), so each step adds them all
+    # with one scatter, ``F.at[I, J, K].add(V[n])``. One op per source instead
+    # (a mode source expands to thousands of dipoles) makes XLA's compile time
+    # explode: 7000 dipoles took ~40 s to compile on jax 0.6 and >10 min on 0.12.
     steps = np.arange(n_steps)
+    groups: Dict[str, list] = {}
     for src in sim.sources:
         i, j, k = grid.index_at(src.position)
         t = (steps + (0.5 if src.component[0] == "H" else 1.0)) * dt
         vals = np.asarray(src.amplitude * src.waveform(t), dtype=npdt)
-        entry = (src.component, int(i), int(j), int(k), vals)
-        (src_H if src.component[0] == "H" else src_E).append(entry)
+        groups.setdefault(src.component, []).append((i, j, k, vals))
+    src_H, src_E = [], []
+    for comp in sorted(groups):
+        g = groups[comp]
+        entry = (comp,
+                 np.array([e[0] for e in g], dtype=np.int32),
+                 np.array([e[1] for e in g], dtype=np.int32),
+                 np.array([e[2] for e in g], dtype=np.int32),
+                 np.stack([e[3] for e in g], axis=1).astype(npdt))
+        (src_H if comp[0] == "H" else src_E).append(entry)
 
     return dict(shape=shape, cell=cell, dt=dt, n_steps=n_steps, npdt=npdt,
                 comps=comps, ch_field=float(dt / MU_0), src_H=src_H, src_E=src_E)

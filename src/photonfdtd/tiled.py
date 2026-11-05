@@ -260,16 +260,11 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                         np.asarray(b_src[ax], dtype=npdt).reshape(shp),
                         np.asarray(c_src[ax], dtype=npdt).reshape(shp))
 
-        # Sources grouped per component: indices + full waveform tables.
+        # Sources, already grouped per component (see _build_static), with x
+        # moved to padded indices and the table as (n_src, n_steps).
         def src_table(entries):
-            out = {}
-            for comp in {e[0] for e in entries}:
-                es = [e for e in entries if e[0] == comp]
-                out[comp] = (np.array([e[1] + h for e in es], np.int32),
-                             np.array([e[2] for e in es], np.int32),
-                             np.array([e[3] for e in es], np.int32),
-                             np.stack([e[4] for e in es]).astype(npdt))
-            return out
+            return {comp: (I + h, J, Kk, np.ascontiguousarray(V.T))
+                    for comp, I, J, Kk, V in entries}
         srcH, srcE = src_table(static["src_H"]), src_table(static["src_E"])
 
         # -------------------------------------------------------------- #
