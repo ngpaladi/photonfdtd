@@ -1,12 +1,12 @@
 """Monitors record field data during the time-stepping loop.
 
-v0.1 ships two:
     FieldMonitor - take full-domain field snapshots at chosen times
+    DFTMonitor   - accumulate a running Fourier transform at chosen frequencies
     FluxMonitor  - integrate Poynting flux through an axis-aligned plane
 
-The FluxMonitor in this release evaluates the time-averaged real Poynting
-flux over the whole run. For frequency-resolved analysis run a discrete
-Fourier transform over the recorded field samples in post-processing.
+The FluxMonitor returns the time-integrated real Poynting flux over the
+whole run. For frequency-resolved flux use a plane DFTMonitor with
+:func:`photonfdtd.photon_spectrum`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -111,7 +111,10 @@ class DFTMonitor:
     # normal to that axis - essential for a memory-light port monitor on a
     # waveguide (a y-z plane at a given x is KB, not the GB a full-volume DFT
     # would cost). ``plane_z`` is the back-compatible shorthand for
-    # ``plane_axis='z'``.
+    # ``plane_axis='z'``. On a plane, components staggered half a cell along
+    # the normal (the normal E and the tangential H) are averaged over their
+    # two neighbours, so every component is recorded on the plane itself and
+    # flux / mode overlaps from it are second-order accurate.
     plane_axis: Optional[str] = None
     plane_position: Optional[float] = None
 
@@ -144,7 +147,19 @@ class DFTMonitor:
 
 @dataclass
 class FluxMonitor:
-    """Integrate time-averaged Poynting flux through an axis-aligned plane.
+    """Time-integrated Poynting flux (J; J/m in 2-D) through an axis-aligned plane.
+
+    The plane is snapped to the nearest tangential-E grid plane. The two
+    tangential H components sit half a cell off it, so each is averaged over
+    its two half-offset neighbours before forming ``E x H``. This makes the
+    one-sided flux second-order accurate in the cell size; pairing the
+    samples without averaging biased it by O(dx), e.g. about 5% at 20 cells
+    per wavelength.
+
+    H is also half a step off E in time, so each step contributes
+    ``E^n x (H^{n-1/2} + H^{n+1/2}) / 2``: the Yee discrete energy flux. The
+    band integral of :func:`photonfdtd.photon_spectrum` on the same plane
+    reproduces it to round-off.
 
     Parameters
     ----------

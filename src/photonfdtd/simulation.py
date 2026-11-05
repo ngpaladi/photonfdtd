@@ -360,16 +360,51 @@ class Simulation:
         self._b_h = bh; self._c_h = ch
 
     # ------------------------------------------------------------------ #
-    def run(self) -> Result:
+    def run(self, disk_tiled: Optional[bool] = None,
+            tile_cells: Optional[int] = None, steps_per_tile: int = 8,
+            workdir: Optional[str] = None) -> Result:
         """Time-step the simulation on JAX/XLA and return the recorded monitor
-        data (see :func:`photonfdtd.jaxbackend.run_jax`)."""
-        from .jaxbackend import run_jax
+        data (see :func:`photonfdtd.jaxbackend.run_jax`).
+
+        Parameters
+        ----------
+        disk_tiled : bool or None
+            ``False``: always run in memory. ``True``: run disk-tiled
+            (:func:`photonfdtd.tiled.run_tiled`), with fields on disk and the
+            domain streamed through the device in x-slabs. ``None`` (default):
+            run in memory unless the forward estimate of
+            :func:`photonfdtd.memory.estimate_memory` exceeds the memory
+            available on the device, in which case fall back to disk tiling
+            with a warning.
+        tile_cells, steps_per_tile, workdir
+            Passed to :func:`~photonfdtd.tiled.run_tiled` when tiling.
+        """
+        if disk_tiled is None:
+            disk_tiled = self._needs_disk_tiling()
+            if disk_tiled:
+                import warnings
+                warnings.warn(
+                    "the fields do not fit in device memory; falling back to "
+                    "disk-tiled stepping (pass disk_tiled=False to force an "
+                    "in-memory run)", RuntimeWarning, stacklevel=2)
         if self.verbose:
             import jax
+            mode = "disk-tiled" if disk_tiled else "in memory"
             print(f"[photonfdtd] JAX {jax.__version__} on "
                   f"{jax.devices()[0]}, grid {self.grid.shape}, "
-                  f"{self.n_steps} steps")
-        result = run_jax(self)
+                  f"{self.n_steps} steps, {mode}")
+        if disk_tiled:
+            from .tiled import run_tiled
+            result = run_tiled(self, tile_cells=tile_cells,
+                               steps_per_tile=steps_per_tile, workdir=workdir)
+        else:
+            from .jaxbackend import run_jax
+            result = run_jax(self)
         if self.progress_callback is not None:
             self.progress_callback(self.n_steps, self.n_steps)
         return result
+
+    def _needs_disk_tiling(self) -> bool:
+        from .memory import estimate_memory, available_memory
+        budget = available_memory()[0]
+        return budget is not None and estimate_memory(self)["forward"] > budget

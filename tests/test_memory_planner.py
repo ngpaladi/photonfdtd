@@ -2,11 +2,11 @@
 import photonfdtd as pf
 
 
-def _sim(run_time=200e-15, pml=(0, 0, 0)):
+def _sim(run_time=200e-15, pml=(0, 0, 0), size=(3e-6, 3e-6, 2e-6)):
     src = pf.PointDipole(position=(0, 0, 0), component="Ez",
                          waveform=pf.GaussianPulse(freq0=3e14, fwhm=6e-15))
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[3e14])
-    grid = pf.Grid(size=(3e-6, 3e-6, 2e-6), cell_size=1e-6 / 12, pml_layers=pml)
+    grid = pf.Grid(size=size, cell_size=1e-6 / 12, pml_layers=pml)
     return pf.Simulation(grid, sources=[src], monitors=[mon],
                          run_time=run_time)
 
@@ -40,7 +40,23 @@ def test_recommend_fits_budget():
     assert pf.recommend_mode(sim, est["adjoint_reversible"] - 1) == "infeasible"
     # Forward-only planning.
     assert pf.recommend_mode(sim, est["forward"] + 1, differentiable=False) == "forward"
-    assert pf.recommend_mode(sim, est["forward"] - 1, differentiable=False) == "infeasible"
+    # A forward run that does not fit falls back to disk tiling when a slab
+    # fits in half the budget (true once the grid is long in x)...
+    long = _sim(size=(12e-6, 3e-6, 2e-6))
+    f_long = pf.estimate_memory(long)["forward"]
+    assert pf.recommend_mode(long, f_long - 1, differentiable=False) == "disk_tiled"
+    # ...unless not even a one-plane slab fits.
+    assert pf.recommend_mode(sim, 1, differentiable=False) == "infeasible"
+
+
+def test_disk_tiled_estimates():
+    sim = _sim(pml=(6, 6, 6))
+    small = pf.estimate_memory(sim, tile_cells=2, steps_per_tile=1)
+    big = pf.estimate_memory(sim, tile_cells=20, steps_per_tile=1)
+    assert small["disk_tiled"] < big["disk_tiled"]
+    assert small["disk_tiled"] < small["forward"]
+    # the whole grid (padded by the halos) lives on disk
+    assert small["disk_tiled_disk"] >= small["forward"]
 
 
 def test_pml_increases_estimate():

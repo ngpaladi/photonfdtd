@@ -12,6 +12,10 @@ run can be sized *before* it OOMs. The modes:
                            O(levels * n_steps**(1/levels)) working sets.
 * ``adjoint_reversible`` - the reversible adjoint (:mod:`photonfdtd.reversible`):
                            O(1) working sets (a few), independent of n_steps.
+* ``disk_tiled``         - a forward run with the fields on disk, streamed
+                           through the device in x-slabs
+                           (:mod:`photonfdtd.tiled`): one slab's working set
+                           on the device, the grid's on disk.
 
 The estimate is the dominant field/coefficient/psi/monitor array memory; it is
 approximate (it omits framework overhead and transient temporaries) but the
@@ -19,7 +23,7 @@ approximate (it omits framework overhead and transient temporaries) but the
 choosing one.
 """
 from __future__ import annotations
-from typing import Dict
+from typing import Dict, Optional
 import math
 import numpy as np
 
@@ -39,19 +43,30 @@ def _working_set_bytes(sim) -> int:
     return (n_fields + n_coeff + n_psi) * n_cell * itemsize
 
 
-def estimate_memory(sim, checkpoint_levels: int = 2) -> Dict[str, int]:
-    """Estimated peak bytes per execution mode for ``sim`` (see module docstring)."""
+def estimate_memory(sim, checkpoint_levels: int = 2,
+                    tile_cells: Optional[int] = None,
+                    steps_per_tile: int = 8) -> Dict[str, int]:
+    """Estimated peak bytes per execution mode for ``sim`` (see module docstring).
+
+    With ``tile_cells`` the result also has ``disk_tiled`` (device bytes of one
+    slab) and ``disk_tiled_disk`` (scratch bytes on disk).
+    """
     ws = _working_set_bytes(sim)
     n = max(int(sim.n_steps), 1)
     levels = max(1, int(checkpoint_levels))
     nested_states = levels * int(math.ceil(n ** (1.0 / levels)))
-    return {
+    est = {
         "working_set": ws,
         "forward": ws,
         "adjoint_none": ws * n,
         "adjoint_nested": ws * nested_states,
         "adjoint_reversible": ws * 3,
     }
+    if tile_cells is not None:
+        from .tiled import tile_bytes, disk_bytes
+        est["disk_tiled"] = tile_bytes(sim, int(tile_cells), steps_per_tile)
+        est["disk_tiled_disk"] = disk_bytes(sim, int(tile_cells), steps_per_tile)
+    return est
 
 
 def available_host_ram():
@@ -121,8 +136,9 @@ def recommend_mode(sim, budget_bytes=None, differentiable: bool = True,
     ``budget_bytes`` defaults to the memory actually available on this machine
     (GPU VRAM if present, else host RAM). For a differentiable (adjoint) run the
     preference order is none -> nested -> reversible (increasing compute,
-    decreasing memory); for a forward-only run, just forward. Returns the mode
-    name, or ``'infeasible'`` if nothing fits the device.
+    decreasing memory); for a forward-only run, forward, then ``disk_tiled``
+    if a one-plane slab fits (the adjoints have no disk-tiled form). Returns
+    the mode name, or ``'infeasible'`` if nothing fits the device.
     """
     if budget_bytes is None:
         budget_bytes = available_memory()[0]
@@ -137,15 +153,26 @@ def recommend_mode(sim, budget_bytes=None, differentiable: bool = True,
         # reversible is the least-memory adjoint; if even it doesn't fit, the
         # grid itself is too big for the device.
         return "infeasible"
-    return "forward" if est["forward"] <= budget_bytes else "infeasible"
+    if est["forward"] <= budget_bytes:
+        return "forward"
+    from .tiled import choose_tile_cells
+    # Same rule run_tiled applies: a one-plane, one-step slab in half the budget.
+    return ("disk_tiled" if choose_tile_cells(sim, 0.5 * budget_bytes) > 0
+            else "infeasible")
 
 
-def format_report(sim, checkpoint_levels: int = 2) -> str:
-    """A human-readable peak-memory table for ``sim``."""
-    est = estimate_memory(sim, checkpoint_levels)
+def format_report(sim, checkpoint_levels: int = 2, tile_cells: int = 16,
+                  steps_per_tile: int = 8) -> str:
+    """A human-readable peak-memory table for ``sim``, including a disk-tiled
+    run with the given slab (device bytes, and scratch bytes on disk)."""
+    est = estimate_memory(sim, checkpoint_levels, tile_cells=tile_cells,
+                          steps_per_tile=steps_per_tile)
     lines = [f"Peak-memory estimate  (grid {tuple(sim.grid.shape)}, "
              f"{sim.n_steps} steps, {np.dtype(sim.dtypes['Ex']).name}):"]
     for k in ("forward", "adjoint_none", "adjoint_nested",
               "adjoint_reversible"):
         lines.append(f"  {k:20s} {est[k] / 1e9:8.3f} GB")
+    lines.append(f"  {'disk_tiled':20s} {est['disk_tiled'] / 1e9:8.3f} GB  "
+                 f"(slab {tile_cells} + halo, {steps_per_tile} steps/load; "
+                 f"{est['disk_tiled_disk'] / 1e9:.3f} GB on disk)")
     return "\n".join(lines)

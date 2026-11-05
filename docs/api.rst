@@ -68,6 +68,11 @@ Time stepping (differentiable)
 
 .. automodule:: photonfdtd.jaxbackend
 
+Disk-tiled stepping
+~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.tiled
+
 Reversible adjoint
 ~~~~~~~~~~~~~~~~~~
 
@@ -92,6 +97,11 @@ S-parameters
 ------------
 
 .. automodule:: photonfdtd.smatrix
+
+Photon counts
+-------------
+
+.. automodule:: photonfdtd.photons
 
 Inverse design
 --------------

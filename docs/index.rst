@@ -50,6 +50,9 @@ Capabilities
   frequencies rather than timesteps.
 - **Mode-decomposition S-parameters** (:func:`~photonfdtd.s_parameters`) from a
   memory-light port plane. See :doc:`accuracy`.
+- **Photon-count estimates**: photon spectra and band counts through a DFT
+  plane (:func:`~photonfdtd.photon_spectrum`), with analytic Frank-Tamm
+  references (:func:`~photonfdtd.frank_tamm_spectrum`) and charge rescaling.
 - A **full-vectorial** finite-difference :class:`~photonfdtd.ModeSolver`
   (distinguishes TE/TM; validated against analytic slab dispersion).
 - **Layout-scale methods**: the 2.5-D effective-index reduction

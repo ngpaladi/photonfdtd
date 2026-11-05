@@ -227,8 +227,9 @@ its bounding box:
   fits your budget — so you find out a run won't fit *before* it OOMs, not
   after. ``recommend_mode`` defaults its budget to what
   :func:`~photonfdtd.available_memory` detects on the machine (GPU VRAM if there
-  is one, else host RAM), and returns ``"infeasible"`` when nothing fits: the
-  whole domain has to live on the device.
+  is one, else host RAM). A forward run that doesn't fit can stream from disk
+  (``"disk_tiled"``, see :doc:`backends`); an adjoint has to fit on the device,
+  and ``"infeasible"`` means it doesn't.
 
 References:
 

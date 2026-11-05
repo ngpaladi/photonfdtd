@@ -320,6 +320,26 @@ def _snap(field, m, plane):
     return field[tuple(sl)]
 
 
+def _dft_snap(field, comp, m, plane):
+    """Sample ``comp`` for a DFT monitor, on the monitor plane itself.
+
+    A plane monitor sits at ``coord[ci]`` along its normal axis. Components
+    staggered half a cell along that axis (E along it, H across it) are
+    averaged over their two half-offset neighbours ``ci-1`` and ``ci``, so
+    every recorded component lives on the same plane and ``E x H`` products
+    are second-order accurate. Without a plane restriction, or at the first
+    plane, the raw samples are returned.
+    """
+    s = _snap(field, m, plane)
+    if plane is None:
+        return s
+    ax, ci = plane
+    a = "xyz".index(comp[1])
+    if ci == 0 or (a == ax) != (comp[0] == "E"):
+        return s
+    return 0.5 * (s + _snap(field, m, (ax, ci - 1)))
+
+
 def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                      ade=None, ce_particle=None, remat="none", checkpoint_levels=2):
     """Pure device-side time loop. Returns the raw monitor accumulators (field
@@ -461,6 +481,11 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         if ade is not None:
             En = jnp.stack([fields["Ex"][ade_idx], fields["Ey"][ade_idx],
                             fields["Ez"][ade_idx]], axis=0)   # (3, n_disp)
+        # FluxMonitor is time-centred: half of E^n x H^{n+1/2} (here) plus half
+        # of E^{n+1} x H^{n+1/2} (after the E update), which sums to the Yee
+        # discrete energy flux E^n x (H^{n-1/2} + H^{n+1/2}) / 2.
+        flux_pre = {p["m"].name: _flux(fields, p["m"], sim.grid, jnp)
+                    for p in plans if p["kind"] == "flux"}
         fields, psis = apply_pass(fields, psis, is_E_pass=True)
         if ade is not None:
             # P^{n+1} = a P^n + b P^{n-1} + c E^n; scatter the increment into E.
@@ -489,11 +514,12 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 for c in m.components:
                     tt = (step_idx + (1.0 if c[0] == "E" else 0.5)) * dt
                     ph = jnp.exp(1j * jnp.asarray(p["omega"]) * tt).astype(cdt)
-                    s = _snap(fields[c], m, p["plane"]).astype(cdt)
+                    s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
                     ph = ph.reshape((-1,) + (1,) * s.ndim)
                     sd[m.name][c] = sd[m.name][c] + active * ph * s[None] * dt
             elif p["kind"] == "flux":
-                sfx[m.name] = sfx[m.name] + _flux(fields, m, sim.grid, jnp) * dt
+                sfx[m.name] = sfx[m.name] + 0.5 * (
+                    flux_pre[m.name] + _flux(fields, m, sim.grid, jnp)) * dt
         return (fields, psis, ade_state, sf, sd, sfx), None
 
     init = (fields, psis, ade_state, state_field, state_dft, state_flux)
@@ -565,23 +591,37 @@ def _run_time_loop(step, init, n_steps, remat, levels=2):
 
 
 def _flux(fields, m, grid, jnp):
+    """Poynting flux through the plane of ``m`` at one instant.
+
+    The plane sits on the tangential-E sub-grid (``coord[idx]`` along the
+    normal), where the two tangential H components are half a cell off. Each
+    H is averaged over the two half-offset neighbours ``idx-1`` and ``idx``, so
+    every ``E x H`` product pairs samples at the same point, which is
+    second-order accurate in the cell size. Along a collapsed normal axis there
+    is no offset to correct.
+    """
     axis = _FLUX_AXIS[m.plane_axis]
     coord = grid.coords[axis]
     idx = 0 if coord.size == 1 else int(np.argmin(np.abs(coord - m.plane_position)))
-    Ex, Ey, Ez = fields["Ex"], fields["Ey"], fields["Ez"]
-    Hx, Hy, Hz = fields["Hx"], fields["Hy"], fields["Hz"]
-    if axis == 0:
-        S = Ey[idx] * Hz[idx] - Ez[idx] * Hy[idx]
-        dA = (grid.cell_size[1] if grid.shape[1] > 1 else 1.0) * \
-             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
-    elif axis == 1:
-        S = Ez[:, idx] * Hx[:, idx] - Ex[:, idx] * Hz[:, idx]
-        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
-             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
-    else:
-        S = Ex[:, :, idx] * Hy[:, :, idx] - Ey[:, :, idx] * Hx[:, :, idx]
-        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
-             (grid.cell_size[1] if grid.shape[1] > 1 else 1.0)
+    lo = max(idx - 1, 0)
+
+    def plane(F):
+        return jnp.take(F, idx, axis=axis)
+
+    def plane_avg(F):
+        if coord.size == 1:
+            return plane(F)
+        return 0.5 * (jnp.take(F, lo, axis=axis) + jnp.take(F, idx, axis=axis))
+
+    E1, E2, H1, H2 = {0: ("Ey", "Ez", "Hy", "Hz"),
+                      1: ("Ez", "Ex", "Hz", "Hx"),
+                      2: ("Ex", "Ey", "Hx", "Hy")}[axis]
+    S = (plane(fields[E1]) * plane_avg(fields[H2])
+         - plane(fields[E2]) * plane_avg(fields[H1]))
+    dA = 1.0
+    for a in range(3):
+        if a != axis and grid.shape[a] > 1:
+            dA *= grid.cell_size[a]
     return jnp.sum(S) * dA
 
 

@@ -72,10 +72,14 @@ def test_plane_dft_matches_full():
     res = sim.run()
     xi = int(np.argmin(np.abs(grid.coords[0] - x0)))
     for c in ("Ey", "Hz"):
-        f = np.asarray(res.dft["full"][c])[:, xi:xi + 1]
+        full_c = np.asarray(res.dft["full"][c])
+        f = full_c[:, xi:xi + 1]
+        if c == "Hz":       # half a cell off the plane: averaged onto it
+            f = 0.5 * (f + full_c[:, xi - 1:xi])
         p = np.asarray(res.dft["plane"][c])
         assert p.shape == f.shape
-        assert np.allclose(p, f, rtol=1e-6, atol=1e-12 * np.abs(f).max())
+        # Same samples; Hz differs only by when the 0.5*(a+b) average is taken.
+        assert np.abs(p - f).max() <= 1e-14 * np.abs(f).max()
 
 
 @pytest.mark.slow

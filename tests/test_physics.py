@@ -274,3 +274,22 @@ def test_moving_charge_near_field_is_evanescent():
         assert abs(-slope * gamma / k[b] - 1.0) < 0.10, (
             f"lam_x={2*np.pi/k[b]*1e6:.2f} um: decay rate {-slope*1e-6:.2f}/um "
             f"vs k_x/gamma = {k[b]/gamma*1e-6:.2f}/um")
+
+
+def test_flux_monitor_symmetric_dipole():
+    """A symmetric dipole sends equal energy through planes at +-x and +-y.
+    With H averaged onto the E plane the two sides agree to 1.2e-6 (the grid's
+    O(dx^2) mirror asymmetry); the old co-located pairing was ~5% apart."""
+    f0 = pf.C_0 / 1e-6
+    dx = 50e-9
+    grid = pf.Grid(size=(3e-6, 3e-6), cell_size=dx, pml_layers=(8, 8, 0))
+    src = pf.PointDipole(position=(0, 0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=f0, fwhm=5e-15))
+    mons = [pf.FluxMonitor(name=f"{a}{'+' if s > 0 else '-'}", plane_axis=a,
+                           plane_position=s * 0.5e-6)
+            for a in "xy" for s in (1, -1)]
+    f = pf.Simulation(grid, sources=[src], monitors=mons, run_time=60e-15).run().flux
+    assert f["x+"] > 0 and f["x-"] < 0
+    assert abs(f["x+"] + f["x-"]) < 2e-6 * f["x+"]
+    assert abs(f["y+"] + f["y-"]) < 2e-6 * f["y+"]
+    assert abs(f["x+"] - f["y+"]) < 1e-14 * f["x+"]

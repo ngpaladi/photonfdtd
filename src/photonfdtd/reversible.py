@@ -35,7 +35,8 @@ import numpy as np
 from .constants import EPS_0
 from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
 from .jaxbackend import (_build_static, _monitor_plan, _validate,
-                         _enable_x64_if_needed, _snap, _FLUX_AXIS)
+                         _enable_x64_if_needed, _snap, _dft_snap, _FLUX_AXIS,
+                         _flux)
 
 
 def reversible_available(sim):
@@ -118,13 +119,21 @@ def _make_reversible(sim, static, plans, ce_e):
             for c in m.components:
                 t = (n + (1.0 if c[0] == "E" else 0.5)) * dt
                 ph = jnp.exp(1j * jnp.asarray(p["omega"]) * t).astype(cdt)
-                s = _snap(fields[c], m, p["plane"]).astype(cdt)
+                s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
                 ph = ph.reshape((-1,) + (1,) * s.ndim)
                 dft[m.name][c] = dft[m.name][c] + sgn * ph * s[None] * dt
-        for p in flux_plans:
-            flux[p["m"].name] = flux[p["m"].name] + sgn * _flux(
-                fields, p["m"], sim.grid, jnp) * dt
+        flux = _flux_half(fields, flux, sgn)
         return dft, flux
+
+    def _flux_half(fields, flux, sgn):
+        # Half of the time-centred flux increment: called on (E^n, H^{n+1/2})
+        # before the E update and on (E^{n+1}, H^{n+1/2}) after it, as in
+        # jaxbackend.
+        flux = dict(flux)
+        for p in flux_plans:
+            flux[p["m"].name] = flux[p["m"].name] + sgn * 0.5 * _flux(
+                fields, p["m"], sim.grid, jnp) * dt
+        return flux
 
     def forward_step(carry, ce_e, n):
         fields, dft, flux = dict(carry[0]), carry[1], carry[2]
@@ -132,6 +141,7 @@ def _make_reversible(sim, static, plans, ce_e):
             fields[F] = fields[F].at[reg].add(v)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
+        flux = _flux_half(fields, flux, +1.0)
         for F, (reg, v) in _pass_increment(fields, True, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(v)
         for c, i, j, k, vals in src_E:
@@ -146,6 +156,7 @@ def _make_reversible(sim, static, plans, ce_e):
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
         for F, (reg, v) in _pass_increment(fields, True, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(-v)
+        flux = _flux_half(fields, flux, -1.0)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
         for F, (reg, v) in _pass_increment(fields, False, ce_e, static, neg_ch).items():
@@ -225,24 +236,3 @@ def value_and_grad_eps_reversible(sim, loss):
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)
     return float(val), np.asarray(grad)
-
-
-def _flux(fields, m, grid, jnp):
-    axis = _FLUX_AXIS[m.plane_axis]
-    coord = grid.coords[axis]
-    idx = 0 if coord.size == 1 else int(np.argmin(np.abs(coord - m.plane_position)))
-    Ex, Ey, Ez = fields["Ex"], fields["Ey"], fields["Ez"]
-    Hx, Hy, Hz = fields["Hx"], fields["Hy"], fields["Hz"]
-    if axis == 0:
-        S = Ey[idx] * Hz[idx] - Ez[idx] * Hy[idx]
-        dA = (grid.cell_size[1] if grid.shape[1] > 1 else 1.0) * \
-             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
-    elif axis == 1:
-        S = Ez[:, idx] * Hx[:, idx] - Ex[:, idx] * Hz[:, idx]
-        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
-             (grid.cell_size[2] if grid.shape[2] > 1 else 1.0)
-    else:
-        S = Ex[:, :, idx] * Hy[:, :, idx] - Ey[:, :, idx] * Hx[:, :, idx]
-        dA = (grid.cell_size[0] if grid.shape[0] > 1 else 1.0) * \
-             (grid.cell_size[1] if grid.shape[1] > 1 else 1.0)
-    return jnp.sum(S) * dA

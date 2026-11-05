@@ -128,6 +128,13 @@ print(result.n_eff)            # array of effective indices
   a straight lossless guide gives `|S21|≈1`; the overlap works on NumPy or JAX
   arrays, so `|S_ij|²` is differentiable through the adjoint — the PIC inverse-design
   objective.
+- **Photon-count estimates** (`photon_spectrum`, `frank_tamm_spectrum`,
+  `frank_tamm_photons`): turn a plane `DFTMonitor` into `dU/df` and `dN/df`
+  (photons per Hz) via Parseval, integrate to a count over any band, and rescale
+  a run made with an exaggerated charge to one electron (`rescale_charge`).
+  Analytic references: the 3-D Frank–Tamm yield and its 2-D line-charge
+  counterpart, both with the charge cloud's form factor. A 2-D Cherenkov run
+  matches the line-charge spectrum to within 1% from 1.5 to 4 µm.
 - **Full-vectorial waveguide mode solver** (`ModeSolver`): a finite-difference
   eigenproblem for the transverse fields on the Yee grid that distinguishes TE
   from TM and captures high-index-contrast boundary effects. Validated against
@@ -182,10 +189,14 @@ demand rather than grabbing most of the card up front.
 
 ## Known limitations
 
-- The whole domain (fields, CPML state and recorded monitor frames) has to fit
-  in device memory; there is no out-of-core / disk-tiled stepping. Use
-  `estimate_memory` to check first, and `plane_z=` / `downsample=` /
-  `DFTMonitor` to keep monitor storage small.
+- A grid whose fields don't fit in device memory runs disk-tiled
+  (`sim.run(disk_tiled=True)`, or automatically with a warning): fields live in
+  memmaps on disk and stream through the device in x-slabs, several steps per
+  load. It matches the in-memory result to ~1e-14 but is forward-only (no
+  adjoint), has no dispersive media, and is a few times slower (2.3–5.6× on a
+  3.5M-cell grid). Monitor outputs stay in RAM, so use `plane_z=` /
+  `downsample=` / `DFTMonitor` to keep them small. `estimate_memory` sizes both
+  modes before you start.
 - The effective-index method assumes the vertical mode is separable from the
   in-plane confinement — good for routing, poor for deep sub-wavelength gaps
   and out-of-plane diffraction. EME is 2-D, single-polarisation, straight-axis

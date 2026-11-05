@@ -52,12 +52,16 @@ GOLDEN = {
         "dft_Ez": [8.059484715031908e-15, 2.0181223427766505e-15, 7.713555045357042e-15, 5.542975049325677e-15],
         "dft_Hx": [0.0, 0.0, 0.0, 0.0],
     },
+    # The flux entries are re-recorded from the JAX engine after FluxMonitor
+    # began averaging tangential H onto the E plane in space and time (the
+    # NumPy core paired E^n with H^{n+1/2} at the next cell, which biased
+    # one-sided flux by O(dx)). The Ez entries are unchanged.
     "flux_float64": {
-        "flux": [3.47262908013893e-26, 3.47262908013893e-26],
+        "flux": [3.9053139687874964e-26, 3.9053139687874964e-26],
         "Ez": [2.36222298190397, 0.47592662919627327],
     },
     "flux_float32": {
-        "flux": [3.4726294899608866e-26, 3.4726294899608866e-26],
+        "flux": [3.905313535120555e-26, 3.905313535120555e-26],
         "Ez": [2.362223083707841, 0.4759267158782559],
     },
     "cherenkov_2D": {

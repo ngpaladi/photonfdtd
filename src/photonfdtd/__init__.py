@@ -13,6 +13,9 @@ Capabilities:
   single-photon, and moving-charge (Cherenkov) sources
 - Field-snapshot, flux, and running-DFT monitors; mode-decomposition
   S-parameters from a port plane (:func:`s_parameters`)
+- Photon-count estimates: photon spectra through a DFT plane
+  (:func:`photon_spectrum`) and analytic Frank-Tamm Cherenkov yields
+  (:mod:`photonfdtd.photons`)
 - Full-vectorial (FDFD) waveguide mode solver
 - 2.5-D effective-index reduction (:mod:`photonfdtd.eim`), eigenmode
   expansion (:mod:`photonfdtd.eme`), and CFL-free ADI-FDTD
@@ -25,7 +28,8 @@ Capabilities:
 
 Every time loop runs on JAX (:mod:`photonfdtd.jaxbackend`, and the ADI-FDTD
 stepper in :mod:`photonfdtd.adi`); :mod:`photonfdtd.memory` sizes a run against
-the device before it starts.
+the device before it starts, and a forward run too big for the device streams
+from disk in x-slabs (:mod:`photonfdtd.tiled`).
 """
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
@@ -51,6 +55,10 @@ from .reversible_pml import (
 )
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
+from .photons import (
+    PhotonSpectrum, photon_spectrum, photon_count, frank_tamm_spectrum,
+    frank_tamm_photons,
+)
 from .eim import (
     Layer, SlabModes, slab_modes, effective_index, EffectiveIndex2D,
 )
@@ -78,6 +86,8 @@ __all__ = [
     "jax_value_and_grad_eps_reversible",
     "jax_value_and_grad_eps_reversible_pml",
     "mode_amplitudes", "port_fields", "s_parameters",
+    "PhotonSpectrum", "photon_spectrum", "photon_count", "frank_tamm_spectrum",
+    "frank_tamm_photons",
     # 2.5-D effective-index reduction, eigenmode expansion, ADI-FDTD
     "Layer", "SlabModes", "slab_modes", "effective_index", "EffectiveIndex2D",
     "Section", "EMEResult", "eme_2d", "sections_from_eps",

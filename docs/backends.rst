@@ -66,15 +66,35 @@ pin to five digits.
 Memory
 ------
 
-The whole domain lives on the device: the six fields, the update coefficients,
-a dense CPML state, and every recorded monitor frame. There's no disk-tiled
-fallback, so size a big run before you start it.
+By default the whole domain lives on the device: the six fields, the update
+coefficients, a dense CPML state, and every recorded monitor frame.
 :func:`~photonfdtd.estimate_memory`, :func:`~photonfdtd.recommend_mode` and
 :func:`~photonfdtd.format_report` give the peak bytes of a forward run and of
 each adjoint mode. :func:`~photonfdtd.available_memory` reports what the
 machine actually has (VRAM if a GPU is present, else host RAM), which is also
-what ``recommend_mode`` budgets against by default. It returns
-``"infeasible"`` when nothing fits.
+what ``recommend_mode`` budgets against by default.
+
+When a forward run doesn't fit, it can run **disk-tiled**
+(:mod:`photonfdtd.tiled`). The fields and CPML state live in memory-mapped
+files, and the domain streams through the device in slabs along x. Each slab
+is loaded with a halo and advanced ``steps_per_tile`` steps per load, so disk
+traffic is one pass over the grid per block of steps rather than per step.
+The OS page cache turns host RAM into a middle tier for grids that fit in RAM
+but not in VRAM. Results match the in-memory engine to floating-point
+reassociation (~1e-14 relative)::
+
+    result = sim.run(disk_tiled=True, tile_cells=64, steps_per_tile=16,
+                     workdir="/scratch/run1")
+
+``sim.run()`` falls back to it on its own, with a ``RuntimeWarning``, when the
+forward estimate exceeds the available device memory; ``disk_tiled=False``
+turns that off. ``tile_cells`` defaults to the largest slab that fits half the
+device budget. ``recommend_mode(differentiable=False)`` returns
+``"disk_tiled"`` when a forward run doesn't fit but a slab does, and
+``"infeasible"`` when nothing does. It is forward-only (no adjoint), doesn't
+support dispersive media, and keeps monitor outputs in RAM. It is also a few
+times slower than an in-memory run: 2.3-5.6x on a 240x120x120 float32 grid,
+less with wider slabs and more steps per load.
 
 To keep the monitor side small:
 

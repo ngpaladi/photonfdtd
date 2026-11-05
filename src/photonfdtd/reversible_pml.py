@@ -39,7 +39,7 @@ import numpy as np
 
 from .constants import EPS_0
 from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
-from .jaxbackend import (_build_static, _monitor_plan, _snap, _FLUX_AXIS)
+from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS)
 from .reversible import _pass_increment, _flux
 
 
@@ -149,13 +149,21 @@ def make_pml_reversible(sim, static, plans, ce_e):
             for c in m.components:
                 t = (n + (1.0 if c[0] == "E" else 0.5)) * dt
                 ph = jnp.exp(1j * jnp.asarray(p["omega"]) * t).astype(cdt)
-                s = _snap(fields[c], m, p["plane"]).astype(cdt)
+                s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
                 ph = ph.reshape((-1,) + (1,) * s.ndim)
                 dft[m.name][c] = dft[m.name][c] + sgn * ph * s[None] * dt
-        for p in flux_plans:
-            flux[p["m"].name] = flux[p["m"].name] + sgn * _flux(
-                fields, p["m"], sim.grid, jnp) * dt
+        flux = _flux_half(fields, flux, sgn)
         return dft, flux
+
+    def _flux_half(fields, flux, sgn):
+        # Half of the time-centred flux increment: called on (E^n, H^{n+1/2})
+        # before the E update and on (E^{n+1}, H^{n+1/2}) after it, as in
+        # jaxbackend.
+        flux = dict(flux)
+        for p in flux_plans:
+            flux[p["m"].name] = flux[p["m"].name] + sgn * 0.5 * _flux(
+                fields, p["m"], sim.grid, jnp) * dt
+        return flux
 
     def forward_step(carry, ce_e, n):
         fields, psi, dft, flux = dict(carry[0]), carry[1], carry[2], carry[3]
@@ -164,6 +172,7 @@ def make_pml_reversible(sim, static, plans, ce_e):
             fields[F] = fields[F].at[reg].add(v)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
+        flux = _flux_half(fields, flux, +1.0)
         inc, psi = _pass_with_psi(fields, psi, True, ce_e, static, neg_ch)
         for F, (reg, v) in inc.items():
             fields[F] = fields[F].at[reg].add(v)
@@ -186,6 +195,7 @@ def make_pml_reversible(sim, static, plans, ce_e):
             fields[F] = fields[F].at[reg].add(-v)
         for c in ("Ex", "Ey", "Ez"):
             fields[c] = fields[c].at[field_idx].set(shell_fields[c])
+        flux = _flux_half(fields, flux, -1.0)
         # undo H-sources + bare H-pass (now uses the corrected E^n), overwrite H.
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
