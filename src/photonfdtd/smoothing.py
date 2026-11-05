@@ -72,16 +72,26 @@ import numpy as np
 from .grid import Grid
 
 
-def _fine_grid(grid: Grid, factor: int) -> Grid:
-    """A copy of `grid` with `factor` cells per original cell on each active axis.
+def _fine_axes(grid: Grid, factor: int):
+    """Fine coordinates and spacings with ``factor`` cells per native cell.
 
-    Collapsed (size-0) axes stay collapsed. PML is irrelevant to rasterisation
-    and set to zero. The domain is identically centred, so each native cell maps
-    to a contiguous block of ``factor`` fine cells per active axis.
+    Built from the native cell count rather than the physical ``size``, so
+    each native cell maps to exactly ``factor`` fine cells per active axis
+    (re-deriving the count from ``size`` breaks that whenever ``size`` is not
+    a whole number of cells). Fine coordinates are centred like the native
+    ones, so the mean of a native cell's block is that cell's coordinate.
+    Collapsed axes stay a single point.
     """
-    size = grid.size
-    cs = tuple((c / factor) if c > 0 else 0.0 for c in grid.cell_size)
-    return Grid(size=size, cell_size=cs, pml_layers=(0, 0, 0))
+    coords, cs = [], []
+    for n, d in zip(grid.shape, grid.cell_size):
+        if n == 1:
+            coords.append(np.array([0.0]))
+            cs.append(0.0)
+            continue
+        nf = n * factor
+        coords.append((np.arange(nf) - (nf - 1) / 2) * (d / factor))
+        cs.append(d / factor)
+    return tuple(coords), tuple(cs)
 
 
 def _slab_means(grid: Grid, structures, background_eps: float, factor: int):
@@ -95,8 +105,7 @@ def _slab_means(grid: Grid, structures, background_eps: float, factor: int):
     """
     from types import SimpleNamespace
     nx, ny, nz = grid.shape
-    fg = _fine_grid(grid, factor)                 # fine coords / spacing only
-    xf, yf, zf = fg.coords
+    (xf, yf, zf), fine_cs = _fine_axes(grid, factor)
     fx = factor if nx > 1 else 1
     fy = factor if ny > 1 else 1
     fz = factor if nz > 1 else 1
@@ -106,7 +115,7 @@ def _slab_means(grid: Grid, structures, background_eps: float, factor: int):
     for i in range(nx):
         xs = xf[i * fx:(i + 1) * fx]
         duck = SimpleNamespace(shape=(xs.size, yf.size, zf.size),
-                               coords=(xs, yf, zf), cell_size=fg.cell_size)
+                               coords=(xs, yf, zf), cell_size=fine_cs)
         sub = np.full(duck.shape, float(background_eps), dtype=np.float64)
         for s in structures:
             sub[s.region_mask(duck)] = s.medium.eps_r

@@ -125,3 +125,33 @@ def test_subpixel_constructs():
     """subpixel builds a per-component coefficient on the JAX engine."""
     grid = pf.Grid(size=(3e-6, 3e-6), cell_size=1e-7, pml_layers=(4, 4, 0))
     pf.Simulation(grid, subpixel=True)
+
+
+@pytest.mark.parametrize("factor", [2, 3, 4])
+def test_size_not_a_whole_number_of_cells(factor):
+    """A grid whose size is not a whole number of cells (1.25 um at 80 nm
+    rounds to 16 cells) smooths exactly like the same 16-cell grid sized
+    1.28 um: the fine grid follows the native cell count, not the size."""
+    box = Box(center=(0.13e-6, 0.02e-6, 0.0), size=(0.51e-6, 0.37e-6, 0.3e-6),
+              medium=Medium.from_index(2.0))
+    odd = Grid(size=(1.85e-6, 1.25e-6, 0.97e-6), cell_size=80e-9)
+    even = Grid(size=(1.84e-6, 1.28e-6, 0.96e-6), cell_size=80e-9)
+    assert odd.shape == even.shape
+    for a, b in zip(smooth_permittivity(odd, [box], factor=factor),
+                    smooth_permittivity(even, [box], factor=factor)):
+        assert np.array_equal(a, b)
+    assert not np.array_equal(*smooth_permittivity(odd, [box], factor=factor)[:2])
+
+
+def test_subpixel_run_with_fractional_size():
+    """The end-to-end case that used to crash in the slab reshape."""
+    grid = pf.Grid(size=(1.85e-6, 1.25e-6), cell_size=80e-9, pml_layers=(4, 4, 0))
+    box = pf.Box(center=(0.1e-6, 0), size=(0.5e-6, 0.37e-6),
+                 medium=pf.Medium.from_index(2.0))
+    src = pf.PointDipole(position=(-0.4e-6, 0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=pf.C_0 / 1e-6, fwhm=6e-15))
+    mon = pf.FieldMonitor(name="m", components=("Ez",), interval=10)
+    r = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
+                      run_time=10e-15, subpixel=True).run()
+    assert np.isfinite(r.fields["m"]["Ez"]).all()
+    assert np.abs(r.fields["m"]["Ez"]).max() > 0
