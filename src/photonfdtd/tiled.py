@@ -1,4 +1,4 @@
-"""Disk-tiled forward stepping, for grids whose fields do not fit in memory.
+"""Disk-tiled stepping, for grids whose fields do not fit in memory.
 
 The in-memory engine (:mod:`photonfdtd.jaxbackend`) keeps every field, CPML
 ``psi`` and coefficient array resident on the device. :func:`run_tiled` keeps
@@ -25,17 +25,37 @@ in RAM, so the update is equivalent to a synchronous one. The x axis is padded
 by ``h`` zero planes on each side (and rounded up to whole slabs). A per-plane
 update mask reproduces the in-memory engine's boundary planes exactly, so the
 results match :func:`~photonfdtd.jaxbackend.run_jax` to floating-point
-reassociation (about 1e-12 relative in float64).
+reassociation (about 1e-14 relative in float64).
+
+Dispersive media
+----------------
+The pole polarization lives only on the dispersive cells, as in the in-memory
+engine: a ``(2, npole, 3, n_disp)`` memmap with the cells sorted by x, so each
+slab's cells are one contiguous range. The ADE update is cell-local and needs
+no extra halo.
+
+Adjoint
+-------
+:func:`value_and_grad_eps_tiled` differentiates a monitor loss w.r.t. the
+per-cell ``eps_r``. One chunk of K steps maps the whole state to the next
+state; its vector-Jacobian product is assembled slab by slab with
+``jax.vjp`` of the same compiled slab update, seeded with the cotangent of
+the slab's interior outputs and its monitor samples, and scatter-added over
+the slab's full (halo-including) input range. The chunk input states come
+from two-level checkpointing on disk: every ``checkpoint_every`` chunks the
+state is kept, and the chunks in between are recomputed segment by segment
+during the backward pass (about 2x the forward compute in total, plus the
+VJPs).
 
 Scope
 -----
-Forward runs only (no adjoint), with one precision for all stepping arrays.
-Supported: point and expanded soft sources, ``ChargedParticle`` charges,
-subpixel smoothing, ``FieldMonitor``, ``DFTMonitor`` and ``FluxMonitor``.
-Dispersive media raise ``NotImplementedError``. ``eps_r`` is still stamped
-in host RAM (one grid-sized array, plus three more while the subpixel tensor
-is written out, against the ~20 the in-memory run holds), and monitor outputs
-are held in RAM, so record planes or downsampled volumes on a large grid.
+One precision for all stepping arrays. Supported: point and expanded soft
+sources, ``ChargedParticle`` charges, dispersive media, subpixel smoothing
+(forward only), ``FieldMonitor``, ``DFTMonitor`` and ``FluxMonitor``.
+``eps_r`` is still stamped in host RAM (one grid-sized array, plus three more
+while the subpixel tensor is written out, against the ~20 the in-memory run
+holds), as are the dispersive-cell tables, the returned gradient, and the
+monitor outputs, so record planes or downsampled volumes on a large grid.
 """
 from __future__ import annotations
 import functools
@@ -48,9 +68,10 @@ import numpy as np
 
 from .constants import EPS_0
 from .jaxbackend import (_build_static, _monitor_plan, _particle_plan,
-                         _validate, _enable_x64_if_needed)
+                         _build_ade_jax, _validate, _enable_x64_if_needed)
 
 _FIELDS = ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")
+_E = ("Ex", "Ey", "Ez")
 _TANG = {0: ("Ey", "Ez", "Hy", "Hz"),
          1: ("Ez", "Ex", "Hz", "Hx"),
          2: ("Ex", "Ey", "Hx", "Hy")}
@@ -62,28 +83,84 @@ def _half_offset(comp, ax):
     return (a == ax) == (comp[0] == "E")
 
 
-def disk_bytes(sim, tile_cells: int, steps_per_tile: int) -> int:
-    """Bytes of scratch files :func:`run_tiled` writes for ``sim``."""
+def _n_poles_cells(sim, static):
+    """``(npole, n_disp)`` of the dispersive media in ``sim`` (zeros if none)."""
+    ade = _build_ade_jax(sim, static)
+    return (0, 0) if ade is None else (ade["npole"], ade["n_disp"])
+
+
+def _sizing_info(sim):
+    """What the size estimates need: the static plan and ``(npole, n_disp)``."""
+    static = _build_static(sim)
+    return static, _n_poles_cells(sim, static)
+
+
+def _state_bytes(sim, static, px, poles):
+    """Bytes of one full padded state: fields, psi and polarization."""
+    _, ny, nz = static["shape"]
+    item = np.dtype(static["npdt"]).itemsize
+    n_psi = sum(len(c["terms"]) for c in static["comps"])
+    npole, n_disp = poles
+    return ((6 + n_psi) * px * ny * nz + 2 * npole * 3 * n_disp) * item
+
+
+def disk_bytes(sim, tile_cells: int, steps_per_tile: int, n_states: int = 1) -> int:
+    """Bytes of scratch files a disk-tiled run writes for ``sim``.
+
+    ``n_states`` is the number of full states kept at once: 1 for
+    :func:`run_tiled`; see :func:`adjoint_disk_bytes` for the adjoint.
+    """
     static = _build_static(sim)
     nx, ny, nz = static["shape"]
     h = steps_per_tile + 1
     px = int(math.ceil(nx / tile_cells)) * tile_cells + 2 * h
-    n_psi = sum(len(c["terms"]) for c in static["comps"])
     n_ce = 4 if sim.subpixel else 1
-    return (6 + n_psi + n_ce) * px * ny * nz * np.dtype(static["npdt"]).itemsize
+    item = np.dtype(static["npdt"]).itemsize
+    state = _state_bytes(sim, static, px, _n_poles_cells(sim, static))
+    return n_states * state + n_ce * px * ny * nz * item
 
 
-def tile_bytes(sim, tile_cells: int, steps_per_tile: int) -> int:
-    """Estimated peak device bytes of one slab (fields, psi, coefficients,
-    double-buffered across the step, plus monitor buffers)."""
+def _adjoint_states(n_steps, steps_per_tile, checkpoint_every=None):
+    """``(n_chunks, checkpoint_every, n_states)`` of the tiled adjoint: the
+    kept checkpoints, the recomputed segment, the working state and the two
+    cotangent buffers."""
+    nc = max(1, int(math.ceil(n_steps / steps_per_tile)))
+    C = int(checkpoint_every) if checkpoint_every else int(math.ceil(math.sqrt(nc)))
+    C = max(1, min(C, nc))
+    return nc, C, int(math.ceil(nc / C)) + (C - 1) + 1 + 2
+
+
+def adjoint_disk_bytes(sim, tile_cells: int, steps_per_tile: int,
+                       checkpoint_every: Optional[int] = None) -> int:
+    """Bytes of scratch files :func:`value_and_grad_eps_tiled` writes (the
+    states of :func:`_adjoint_states`, the coefficient and its cotangent)."""
+    _, _, n_states = _adjoint_states(sim.n_steps, steps_per_tile, checkpoint_every)
     static = _build_static(sim)
+    nx, ny, nz = static["shape"]
+    h = steps_per_tile + 1
+    px = int(math.ceil(nx / tile_cells)) * tile_cells + 2 * h
+    item = np.dtype(static["npdt"]).itemsize
+    return disk_bytes(sim, tile_cells, steps_per_tile, n_states) \
+        + px * ny * nz * item
+
+
+def tile_bytes(sim, tile_cells: int, steps_per_tile: int,
+               adjoint: bool = False, _info=None) -> int:
+    """Estimated peak device bytes of one slab (fields, psi, coefficients,
+    double-buffered across the step, plus monitor buffers). With ``adjoint``,
+    also the slab VJP's per-step residuals and cotangents."""
+    static, (npole, n_disp) = _info or _sizing_info(sim)
     nx, ny, nz = static["shape"]
     L = tile_cells + 2 * (steps_per_tile + 1)
     item = np.dtype(static["npdt"]).itemsize
     n_psi = sum(len(c["terms"]) for c in static["comps"])
     n_ce = 4 if sim.subpixel else 1
     plane = ny * nz
-    per = (2 * (6 + n_psi) + n_ce) * L * plane * item
+    state = (6 + n_psi) * L * plane * item \
+        + 2 * npole * 3 * min(n_disp, L * plane) * item
+    per = 2 * state + n_ce * L * plane * item
+    if adjoint:
+        per += (steps_per_tile + 2) * state + n_ce * L * plane * item
     for m in sim.monitors:
         name = type(m).__name__
         if name == "FieldMonitor":
@@ -98,139 +175,125 @@ def tile_bytes(sim, tile_cells: int, steps_per_tile: int) -> int:
     return int(per)
 
 
-def choose_tile_cells(sim, budget_bytes: float, steps_per_tile: int = 1) -> int:
+def choose_tile_cells(sim, budget_bytes: float, steps_per_tile: int = 1,
+                      adjoint: bool = False) -> int:
     """Largest ``tile_cells`` whose slab fits ``budget_bytes``, or 0 if even
-    a one-plane slab does not. :func:`run_tiled` sizes slabs against half the
+    a one-plane slab does not. The tiled runs size slabs against half the
     device budget (headroom for XLA temporaries), as does the planner."""
     nx = sim.grid.shape[0]
-    if tile_bytes(sim, 1, steps_per_tile) > budget_bytes:
+    info = _sizing_info(sim)
+    if tile_bytes(sim, 1, steps_per_tile, adjoint, info) > budget_bytes:
         return 0
     lo, hi = 1, nx
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if tile_bytes(sim, mid, steps_per_tile) <= budget_bytes:
+        if tile_bytes(sim, mid, steps_per_tile, adjoint, info) <= budget_bytes:
             lo = mid
         else:
             hi = mid - 1
     return lo
 
 
-def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
-              workdir: Optional[str] = None, budget_bytes: Optional[float] = None):
-    """Run ``sim`` forward with disk-backed fields, tiled along x.
-
-    Parameters
-    ----------
-    sim : Simulation
-    tile_cells : int, optional
-        Interior x-planes per slab. Default: the largest that fits half of
-        ``budget_bytes``, with ``steps_per_tile`` reduced if needed so the
-        slab is not mostly halo.
-    steps_per_tile : int
-        Time steps per slab load (temporal blocking). Larger values cut disk
-        traffic but widen the recomputed halo (``steps_per_tile + 1`` planes
-        per side).
-    workdir : str, optional
-        Directory for the scratch memmaps (default: a new temporary directory,
-        removed afterwards, as are the files in a given ``workdir``).
-    budget_bytes : float, optional
-        Device memory budget used to pick ``tile_cells`` (default: what
-        :func:`photonfdtd.memory.available_memory` reports).
+class _Tiled:
+    """Shared machinery of the disk-tiled forward run and adjoint: scratch
+    memmaps, per-plane data, the compiled K-step slab update and its VJP, and
+    the monitor bookkeeping. Use as a context manager (it removes its files).
     """
-    import jax
-    import jax.numpy as jnp
-    from jax import lax
-    from .simulation import Result
 
-    _validate(sim)
-    if sim._has_dispersion:
-        raise NotImplementedError(
-            "disk-tiled stepping does not support dispersive media.")
-    _enable_x64_if_needed(sim)
-    K = int(steps_per_tile)
-    if K < 1:
-        raise ValueError("steps_per_tile must be >= 1")
-    if sim.grid.shape[0] < 2:
-        raise ValueError("disk-tiled stepping tiles along x, which is collapsed")
-    if tile_cells is None:
-        if budget_bytes is None:
-            from .memory import available_memory
-            budget_bytes = available_memory()[0] or float("inf")
-        # Shrink the temporal block until a slab fits; prefer at least as
-        # many interior planes as halo planes, so halo recompute stays < 2/3.
-        while True:
-            tile_cells = choose_tile_cells(sim, 0.5 * budget_bytes, K)
-            if tile_cells >= K + 1 or K == 1:
-                break
-            K = max(1, K // 2)
-        if tile_cells == 0:
-            raise MemoryError("even a one-plane slab does not fit the device")
-    T = int(tile_cells)
-    if T < 1:
-        raise ValueError("tile_cells must be >= 1")
+    def __init__(self, sim, tile_cells, steps_per_tile, workdir, budget_bytes,
+                 adjoint=False):
+        import jax.numpy as jnp
+        from .simulation import Result
 
-    static = _build_static(sim)
-    plans = _monitor_plan(sim)
-    pplans = _particle_plan(sim, static)
-    grid = sim.grid
-    nx, ny, nz = static["shape"]
-    dt = float(static["dt"])
-    n_steps = static["n_steps"]
-    npdt = np.dtype(static["npdt"])
-    cdt_np = np.complex128 if npdt == np.float64 else np.complex64
-    h = K + 1
-    n_tiles = int(math.ceil(nx / T))
-    L = T + 2 * h
-    px = n_tiles * T + 2 * h                 # padded x extent
-    comps = static["comps"]
-    terms = [t for c in comps for t in c["terms"]]
+        _validate(sim)
+        _enable_x64_if_needed(sim)
+        K = int(steps_per_tile)
+        if K < 1:
+            raise ValueError("steps_per_tile must be >= 1")
+        if sim.grid.shape[0] < 2:
+            raise ValueError("disk-tiled stepping tiles along x, which is collapsed")
+        if tile_cells is None:
+            if budget_bytes is None:
+                from .memory import available_memory
+                budget_bytes = available_memory()[0] or float("inf")
+            # Shrink the temporal block until a slab fits; prefer at least as
+            # many interior planes as halo planes, so halo recompute stays < 2/3.
+            while True:
+                tile_cells = choose_tile_cells(sim, 0.5 * budget_bytes, K, adjoint)
+                if tile_cells >= K + 1 or K == 1:
+                    break
+                K = max(1, K // 2)
+            if tile_cells == 0:
+                raise MemoryError("even a one-plane slab does not fit the device")
+        T = int(tile_cells)
+        if T < 1:
+            raise ValueError("tile_cells must be >= 1")
 
-    # ------------------------------------------------------------------ #
-    # Scratch memmaps: fields, psi (full padded layout), E coefficients.
-    # ------------------------------------------------------------------ #
-    own_dir = workdir is None
-    wd = tempfile.mkdtemp(prefix="photonfdtd_tiled_") if own_dir else workdir
-    os.makedirs(wd, exist_ok=True)
-    need = disk_bytes(sim, T, K)
-    free = shutil.disk_usage(wd).free
-    if need > free:
-        if own_dir:
-            shutil.rmtree(wd, ignore_errors=True)
-        raise OSError(f"disk-tiled run needs {need / 1e9:.2f} GB of scratch in "
-                      f"{wd}, only {free / 1e9:.2f} GB free; pass workdir=")
-    files = []
+        self.sim = sim
+        self.static = static = _build_static(sim)
+        plans = _monitor_plan(sim)
+        pplans = _particle_plan(sim, static)
+        ade = _build_ade_jax(sim, static)
+        nx, ny, nz = static["shape"]
+        self.nx, self.ny, self.nz = nx, ny, nz
+        self.dt = dt = float(static["dt"])
+        self.n_steps = n_steps = static["n_steps"]
+        self.npdt = npdt = np.dtype(static["npdt"])
+        cdt_np = np.complex128 if npdt == np.float64 else np.complex64
+        self.K, self.T = K, T
+        self.h = h = K + 1
+        self.n_tiles = n_tiles = int(math.ceil(nx / T))
+        self.L = L = T + 2 * h
+        self.px = px = n_tiles * T + 2 * h               # padded x extent
+        comps = static["comps"]
+        self.terms = terms = [t for c in comps for t in c["terms"]]
+        self.names = list(_FIELDS) + ["psi_" + t["key"] for t in terms]
 
-    def mm(name, eps=None):
-        """A zeroed padded memmap; with ``eps``, filled slab by slab with the
-        E-update coefficient ``dt / (eps * EPS_0)`` (no grid-sized temporary)."""
-        path = os.path.join(wd, name + ".npy")
-        files.append(path)
-        a = np.lib.format.open_memmap(path, mode="w+", dtype=npdt,
-                                      shape=(px, ny, nz))
-        if eps is not None:
+        # Scratch directory (removed on close if we made it).
+        self.own_dir = workdir is None
+        self.wd = tempfile.mkdtemp(prefix="photonfdtd_tiled_") if self.own_dir \
+            else workdir
+        os.makedirs(self.wd, exist_ok=True)
+        self.files = []
+        self._n_mm = 0
+
+        # Dispersive cells, sorted by x, as padded-x index ranges per slab.
+        self.ade = ade
+        if ade is not None:
+            I, J, Kk = (np.asarray(a, np.int64) for a in ade["idx"])
+            self.pol_shape = (2, ade["npole"], 3, ade["n_disp"])
+            self.ade_Ip = Ip = I + h
+            assert np.all(np.diff(Ip) >= 0)
+            self.ade_J, self.ade_K = J, Kk
+            self.ade_C = np.asarray(ade["C"], npdt)
+            b0s = np.arange(n_tiles) * T
+            self.M = max(1, int((np.searchsorted(Ip, b0s + L)
+                                 - np.searchsorted(Ip, b0s)).max()))
+        self.result = Result(times=np.arange(n_steps) * dt)
+
+        # ------------------------------------------------------------------ #
+        # E-update coefficients on disk.
+        # ------------------------------------------------------------------ #
+        def ce_mm(name, eps):
+            a = self._mm(name, (px, ny, nz))
             for g0 in range(0, nx, T):
                 g1 = min(nx, g0 + T)
                 a[h + g0:h + g1] = (dt / (np.asarray(eps[g0:g1], dtype=npdt)
                                           * EPS_0)).astype(npdt)
-        return a
+            return a
 
-    try:
-        disk = {c: mm(c) for c in _FIELDS}
-        for t in terms:
-            disk["psi_" + t["key"]] = mm("psi_" + t["key"])
         if sim.subpixel:
             smoothed = sim._smoothed_eps_components()
-            ce_disk = {c: mm("ce_" + c, e)
-                       for c, e in zip(("Ex", "Ey", "Ez"), smoothed)}
+            self.ce_disk = {c: ce_mm("ce_" + c, e) for c, e in zip(_E, smoothed)}
             del smoothed
-            ce_disk["particle"] = mm("ce_particle", sim.eps_r)
+            self.ce_disk["particle"] = ce_mm("ce_particle", sim.eps_r)
         else:
-            shared = mm("ce", sim.eps_r)
-            ce_disk = {c: shared for c in ("Ex", "Ey", "Ez", "particle")}
+            shared = ce_mm("ce", sim.eps_r)
+            self.ce_disk = {c: shared for c in _E + ("particle",)}
 
-        # -------------------------------------------------------------- #
+        # ------------------------------------------------------------------ #
         # Padded per-plane x data: update masks and x-axis CPML coefficients.
-        # -------------------------------------------------------------- #
+        # ------------------------------------------------------------------ #
         def xpad(vals_on_real_planes):
             out = np.zeros(px, dtype=npdt)
             out[h:h + nx] = vals_on_real_planes
@@ -241,8 +304,7 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
             reg = c["region"]
             rx = np.zeros(nx); rx[reg[0]] = 1.0
             xmask[c["Fkey"]] = xpad(rx)
-            m = np.ones((1, ny, nz), dtype=npdt)
-            m[:, :, :] = 0.0
+            m = np.zeros((1, ny, nz), dtype=npdt)
             m[(slice(None),) + tuple(reg[1:])] = 1.0
             yzmask[c["Fkey"]] = m
         tcoef = {}
@@ -267,11 +329,10 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                     for comp, I, J, Kk, V in entries}
         srcH, srcE = src_table(static["src_H"]), src_table(static["src_E"])
 
-        # -------------------------------------------------------------- #
-        # Monitor bookkeeping (host-side outputs, device-side block buffers).
-        # -------------------------------------------------------------- #
-        mons = []
-        result = Result(times=np.arange(n_steps) * dt)
+        # ------------------------------------------------------------------ #
+        # Monitor bookkeeping (host-side outputs).
+        # ------------------------------------------------------------------ #
+        self.mons = mons = []
         for p in plans:
             m = p["m"]
             info = dict(kind=p["kind"], m=m)
@@ -303,16 +364,16 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                                for c in m.components}
             else:
                 ax = {"x": 0, "y": 1, "z": 2}[m.plane_axis]
-                coord = grid.coords[ax]
+                coord = sim.grid.coords[ax]
                 idx = 0 if coord.size == 1 else int(
                     np.argmin(np.abs(coord - m.plane_position)))
                 info.update(ax=ax, idx=idx, lo=max(idx - 1, 0),
                             collapsed=coord.size == 1, total=0.0)
             mons.append(info)
 
-        # -------------------------------------------------------------- #
+        # ------------------------------------------------------------------ #
         # The compiled K-step slab update.
-        # -------------------------------------------------------------- #
+        # ------------------------------------------------------------------ #
         neg_ch = -float(static["ch_field"])
         cell = [float(d) for d in static["cell"]]
         d_xmask = {k: jnp.asarray(v) for k, v in xmask.items()}
@@ -324,6 +385,9 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                        starts=jnp.asarray(pp["starts"]),
                        wblocks=jnp.asarray(pp["wblocks"])) for pp in pplans]
         cdt = jnp.complex128 if npdt == np.float64 else jnp.complex64
+        if ade is not None:
+            ade_A = jnp.asarray(np.asarray(ade["A"], npdt)).reshape(-1, 1, 1)
+            ade_B = jnp.asarray(np.asarray(ade["B"], npdt)).reshape(-1, 1, 1)
 
         def diff(src, ax, is_E, dl):
             hi = [slice(None)] * 3; hi[ax] = slice(1, None)
@@ -334,6 +398,7 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
             return jnp.pad(d, pad)
 
         def xslice(a, b0):
+            from jax import lax
             return lax.dynamic_slice_in_dim(a, b0, L, 0).reshape(-1, 1, 1)
 
         def apply_pass(f, psi, ce, b0, is_E):
@@ -385,6 +450,7 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
             return f
 
         def plane_at(F, ax, i):
+            from jax import lax
             return lax.dynamic_index_in_dim(F, i, ax, keepdims=True)
 
         def flux_now(f, info, args, core):
@@ -415,18 +481,39 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                     dA *= cell[a]
             return jnp.sum(S * w) * dA
 
-        def step_block(state, ce, b0, n0, mon_args, k):
+        def step_block(state, ce, b0, n0, mon_args, ade_args, k, remat=False):
+            """Advance one slab ``k`` steps. ``state`` is (fields, psi, pol,
+            monitor buffers) on the L-plane slab; returns the interior planes
+            of fields and psi, the slab's full polarization block and the
+            buffers."""
+            import jax
+            from jax import lax
             core = jnp.arange(L)
             core = ((core >= h) & (core < L - h)).astype(npdt).reshape(-1, 1, 1)
+            if ade is not None:
+                li, jj, kk, Cb = ade_args
+                aidx = (li, jj, kk)
+                Cb = Cb[:, None, :]
+                inv = [ce[c].at[aidx].get(mode="fill", fill_value=0) / dt for c in _E]
 
             def body(carry, s):
-                f, psi, bufs = carry
+                f, psi, pol, bufs = carry
                 n = n0 + s
                 f, psi = apply_pass(f, psi, ce, b0, False)
                 f = add_sources(f, d_srcH, n, b0)
+                if ade is not None:
+                    En = jnp.stack([f[c].at[aidx].get(mode="fill", fill_value=0)
+                                    for c in _E])
                 pre = {i: flux_now(f, info, mon_args[i], core)    # time-centred
                        for i, info in enumerate(mons) if info["kind"] == "flux"}
                 f, psi = apply_pass(f, psi, ce, b0, True)
+                if ade is not None:
+                    P0, P1 = pol
+                    Pn = ade_A * P0 + ade_B * P1 + Cb * En[None]
+                    delta = jnp.sum(Pn - P0, axis=0)
+                    for a, c in enumerate(_E):
+                        f[c] = f[c].at[aidx].add(-inv[a] * delta[a], mode="drop")
+                    pol = (Pn, P0)
                 f = add_sources(f, d_srcE, n, b0)
                 if d_part:
                     f = deposit(f, ce["particle"], n, b0)
@@ -445,9 +532,9 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                         for c in m.components:
                             F = f[c]
                             if plane is not None and plane[0] == 0:
-                                li, llo = mon_args[i]
+                                li_, llo = mon_args[i]
                                 yz = (slice(None),) + info["sel"][1:]
-                                smp = plane_at(F, 0, li)[yz]
+                                smp = plane_at(F, 0, li_)[yz]
                                 if _half_offset(c, 0):
                                     smp = 0.5 * (smp + plane_at(F, 0, llo)[yz])
                             else:
@@ -465,126 +552,276 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
                     else:
                         post = flux_now(f, info, mon_args[i], core)
                         bufs[i] = bufs[i] + 0.5 * (pre[i] + post) * dt
-                return (f, psi, tuple(bufs)), None
+                return (f, psi, pol, tuple(bufs)), None
 
-            f, psi, bufs = state
-            (f, psi, bufs), _ = lax.scan(body, (f, psi, bufs), jnp.arange(k))
+            if remat:                          # the VJP keeps one carry per step
+                body = jax.checkpoint(body)
+            (f, psi, pol, bufs), _ = lax.scan(body, state, jnp.arange(k))
             core_sl = slice(h, L - h)
             return ({c: v[core_sl] for c, v in f.items()},
-                    {c: v[core_sl] for c, v in psi.items()}, bufs)
+                    {c: v[core_sl] for c, v in psi.items()}, pol, bufs)
 
-        jitted = {}
+        def vjp_block(state, ce, b0, n0, mon_args, ade_args, cot, k):
+            import jax
+            fn = lambda st, c: step_block(st, c, b0, n0, mon_args, ade_args, k,
+                                          remat=True)
+            _, pull = jax.vjp(fn, state, ce)
+            return pull(cot)
 
-        def run_block(k, *args):
-            if k not in jitted:                    # one compile per chunk length
-                jitted[k] = jax.jit(functools.partial(step_block, k=k))
-            return jitted[k](*args)
+        self._step_block = step_block
+        self._vjp_block = vjp_block
+        self._jit = {}
+        self._cdt = cdt
 
-        # -------------------------------------------------------------- #
-        # Time loop: chunks of K steps, slabs left to right.
-        # -------------------------------------------------------------- #
-        names = list(_FIELDS) + ["psi_" + t["key"] for t in terms]
-        for n0 in range(0, n_steps, K):
-            k = min(K, n_steps - n0)
-            rolling = {nm: np.zeros((h, ny, nz), npdt) for nm in names}
-            for t_i in range(n_tiles):
-                b0 = t_i * T                       # padded block start
-                front = b0 + h                     # write frontier (padded)
-                blk = {nm: np.concatenate([rolling[nm], disk[nm][front:front + T + h]])
-                       for nm in names}
-                loaded = {}
-                for key, arr in ce_disk.items():
-                    if id(arr) not in loaded:
-                        loaded[id(arr)] = jnp.asarray(arr[b0:b0 + L])
-                ce = {key: loaded[id(arr)] for key, arr in ce_disk.items()}
-                # Per-monitor block arguments and buffers.
-                margs, bufs = [], []
-                gc0, gc1 = b0, b0 + T              # real-cell core range
-                for info in mons:
-                    m = info["m"]
-                    if info["kind"] == "field":
-                        sl = info["slot"][n0:n0 + k]
-                        rec_here = sl[sl >= 0]
-                        r0 = int(rec_here[0]) if rec_here.size else 0
-                        local = np.where(sl >= 0, sl - r0, k + 1).astype(np.int32)
-                        margs.append(jnp.asarray(local))
-                        shp = (k + 1, L, len(range(0, ny, info["ds"])),
-                               len(range(nz)[info["zsel"]]))
-                        bufs.append({c: jnp.zeros(shp, npdt) for c in m.components})
-                        info["_r0"] = r0
-                        info["_nrec"] = int(rec_here.size)
-                    elif info["kind"] == "dft":
-                        pl = info["plane"]
-                        if pl is not None and pl[0] == 0:
-                            ci = pl[1]
-                            lo = ci - 1 if ci > 0 else ci
-                            margs.append((ci + h - b0, lo + h - b0))
-                            xs = 1
-                        else:
-                            margs.append(None)
-                            xs = L
-                        ys = len(range(ny)[info["sel"][1]])
-                        zs = len(range(nz)[info["sel"][2]])
-                        bufs.append({c: jnp.zeros((len(m.freqs), xs, ys, zs), cdt)
-                                     for c in m.components})
-                    else:
-                        if info["ax"] == 0:
-                            ci = info["idx"]
-                            inside = 1.0 if gc0 <= ci < gc1 else 0.0
-                            lo = info["lo"]
-                            margs.append((ci + h - b0, lo + h - b0, inside))
-                        else:
-                            margs.append(None)
-                        bufs.append(jnp.asarray(0.0, npdt))
-                state = ({c: jnp.asarray(blk[c]) for c in _FIELDS},
-                         {t["key"]: jnp.asarray(blk["psi_" + t["key"]]) for t in terms},
-                         tuple(bufs))
-                fo, po, bo = run_block(k, state, ce, b0, n0, tuple(margs))
-                # Keep the old planes the next slab's left halo needs.
-                rolling = {nm: blk[nm][T:T + h].copy() for nm in names}
-                for c in _FIELDS:
-                    disk[c][front:front + T] = np.asarray(fo[c])
-                for t in terms:
-                    disk["psi_" + t["key"]][front:front + T] = np.asarray(po[t["key"]])
-                _collect(mons, bo, gc0, gc1, nx, h, T)
+    # ---------------------------------------------------------------------- #
+    def __enter__(self):
+        return self
 
-        for info in mons:
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self.ce_disk = None                        # drop the maps before unlinking
+        for p in self.files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if self.own_dir:
+            shutil.rmtree(self.wd, ignore_errors=True)
+
+    def check_disk(self, need):
+        free = shutil.disk_usage(self.wd).free
+        if need > free:
+            raise OSError(f"disk-tiled run needs {need / 1e9:.2f} GB of scratch "
+                          f"in {self.wd}, only {free / 1e9:.2f} GB free; pass "
+                          "workdir=")
+
+    def _mm(self, name, shape):
+        """A zeroed scratch memmap."""
+        self._n_mm += 1
+        path = os.path.join(self.wd, f"{self._n_mm:03d}_{name}.npy")
+        self.files.append(path)
+        return np.lib.format.open_memmap(path, mode="w+", dtype=self.npdt,
+                                         shape=shape)
+
+    def new_state(self, tag):
+        """A zeroed full state on disk: padded fields and psi, polarization."""
+        st = {nm: self._mm(f"{tag}_{nm}", (self.px, self.ny, self.nz))
+              for nm in self.names}
+        if self.ade is not None:
+            st["pol"] = self._mm(f"{tag}_pol", self.pol_shape)
+        return st
+
+    @staticmethod
+    def zero(state):
+        for a in state.values():
+            for i in range(a.shape[0]):            # plane by plane: no big temporaries
+                a[i] = 0
+
+    def _compiled(self, kind, k):
+        import jax
+        key = (kind, k)
+        if key not in self._jit:                   # one compile per chunk length
+            fn = self._step_block if kind == "fwd" else self._vjp_block
+            self._jit[key] = jax.jit(functools.partial(fn, k=k))
+        return self._jit[key]
+
+    # ---------------------------------------------------------------------- #
+    def _tile(self, t_i, n0, k):
+        """Host-side per-slab arguments: geometry, monitor arguments and zeroed
+        buffers, and the slab's dispersive cells."""
+        import jax.numpy as jnp
+        h, T, L, ny, nz = self.h, self.T, self.L, self.ny, self.nz
+        b0 = t_i * T
+        tile = dict(b0=b0, front=b0 + h, gc0=b0, gc1=b0 + T)
+        margs, bufs, meta = [], [], []
+        for info in self.mons:
             m = info["m"]
             if info["kind"] == "field":
-                result.fields[m.name] = {c: v.astype(sim.dtypes["monitors"])
+                sl = info["slot"][n0:n0 + k]
+                rec_here = sl[sl >= 0]
+                r0 = int(rec_here[0]) if rec_here.size else 0
+                local = np.where(sl >= 0, sl - r0, k + 1).astype(np.int32)
+                margs.append(jnp.asarray(local))
+                shp = (k + 1, L, len(range(0, ny, info["ds"])),
+                       len(range(nz)[info["zsel"]]))
+                bufs.append({c: jnp.zeros(shp, self.npdt) for c in m.components})
+                meta.append(dict(r0=r0, nrec=int(rec_here.size)))
+            elif info["kind"] == "dft":
+                pl = info["plane"]
+                if pl is not None and pl[0] == 0:
+                    ci = pl[1]
+                    lo = ci - 1 if ci > 0 else ci
+                    margs.append((ci + h - b0, lo + h - b0))
+                    xs = 1
+                else:
+                    margs.append(None)
+                    xs = L
+                ys = len(range(ny)[info["sel"][1]])
+                zs = len(range(nz)[info["sel"][2]])
+                bufs.append({c: jnp.zeros((len(m.freqs), xs, ys, zs), self._cdt)
+                             for c in m.components})
+                meta.append(None)
+            else:
+                if info["ax"] == 0:
+                    ci = info["idx"]
+                    inside = 1.0 if tile["gc0"] <= ci < tile["gc1"] else 0.0
+                    margs.append((ci + h - b0, info["lo"] + h - b0, inside))
+                else:
+                    margs.append(None)
+                bufs.append(jnp.asarray(0.0, self.npdt))
+                meta.append(None)
+        tile.update(margs=tuple(margs), bufs=tuple(bufs), meta=meta)
+        if self.ade is not None:
+            Ip = self.ade_Ip
+            s = lambda x: int(np.searchsorted(Ip, x))
+            lo, hi = s(b0), s(b0 + L)
+            M, n = self.M, hi - lo
+            li = np.full(M, L, np.int32); li[:n] = Ip[lo:hi] - b0
+            jj = np.zeros(M, np.int32); jj[:n] = self.ade_J[lo:hi]
+            kk = np.zeros(M, np.int32); kk[:n] = self.ade_K[lo:hi]
+            Cb = np.zeros((self.ade_C.shape[0], M), self.npdt)
+            Cb[:, :n] = self.ade_C[:, lo:hi]
+            tile.update(lo=lo, hi=hi, n_roll=s(b0 + h) - lo,
+                        roll=(s(b0 + T) - lo, s(b0 + T + h) - lo),
+                        core=(s(b0 + h), s(b0 + h + T)),
+                        ade_args=tuple(jnp.asarray(a) for a in (li, jj, kk, Cb)))
+        else:
+            tile["ade_args"] = None
+        return tile
+
+    def _ce_block(self, b0):
+        import jax.numpy as jnp
+        loaded = {}
+        for key, arr in self.ce_disk.items():
+            if id(arr) not in loaded:
+                loaded[id(arr)] = jnp.asarray(arr[b0:b0 + self.L])
+        return {key: loaded[id(arr)] for key, arr in self.ce_disk.items()}
+
+    def _pol_block(self, pol_src, tile):
+        """The slab's polarization block, zero-padded to M cells."""
+        blk = np.zeros(self.pol_shape[:3] + (self.M,), self.npdt)
+        blk[..., :tile["hi"] - tile["lo"]] = pol_src[..., tile["lo"]:tile["hi"]]
+        return blk
+
+    def forward_chunk(self, src, dst, n0, collect=True):
+        """Advance the full state ``src`` by one chunk of K steps into ``dst``
+        (which may be ``src``: the update is synchronous either way), adding
+        the monitor samples to the outputs if ``collect``."""
+        import jax.numpy as jnp
+        h, T, ny, nz = self.h, self.T, self.ny, self.nz
+        k = min(self.K, self.n_steps - n0)
+        run = self._compiled("fwd", k)
+        rolling = {nm: np.zeros((h, ny, nz), self.npdt) for nm in self.names}
+        roll_pol = None
+        for t_i in range(self.n_tiles):
+            tile = self._tile(t_i, n0, k)
+            b0, front = tile["b0"], tile["front"]
+            blk = {nm: np.concatenate([rolling[nm], src[nm][front:front + T + h]])
+                   for nm in self.names}
+            if self.ade is not None:
+                pblk = self._pol_block(src["pol"], tile)
+                if tile["n_roll"]:
+                    pblk[..., :tile["n_roll"]] = roll_pol
+                pol = (jnp.asarray(pblk[0]), jnp.asarray(pblk[1]))
+            else:
+                pol = ()
+            state = ({c: jnp.asarray(blk[c]) for c in _FIELDS},
+                     {t["key"]: jnp.asarray(blk["psi_" + t["key"]]) for t in self.terms},
+                     pol, tile["bufs"])
+            fo, po, polo, bo = run(state, self._ce_block(b0), b0, n0,
+                                   tile["margs"], tile["ade_args"])
+            # Keep the old planes the next slab's left halo needs.
+            rolling = {nm: blk[nm][T:T + h].copy() for nm in self.names}
+            for c in _FIELDS:
+                dst[c][front:front + T] = np.asarray(fo[c])
+            for t in self.terms:
+                dst["psi_" + t["key"]][front:front + T] = np.asarray(po[t["key"]])
+            if self.ade is not None:
+                r0, r1 = tile["roll"]
+                roll_pol = pblk[..., r0:r1].copy()
+                c0, c1 = tile["core"]
+                lo = tile["lo"]
+                dst["pol"][..., c0:c1] = np.stack(
+                    [np.asarray(polo[0]), np.asarray(polo[1])])[..., c0 - lo:c1 - lo]
+            if collect:
+                _collect(self.mons, bo, tile, self.nx, h)
+
+    def vjp_chunk(self, src, bar_out, bar_in, bar_ce, n0, g):
+        """Pull the cotangent ``bar_out`` of the state after chunk ``n0`` back
+        through it: the state cotangent goes to ``bar_in`` (zeroed by the
+        caller), the coefficient cotangent is added to ``bar_ce``. ``src`` is
+        the chunk's input state; ``g`` the loss cotangent of the outputs."""
+        import jax.numpy as jnp
+        h, T, L = self.h, self.T, self.L
+        k = min(self.K, self.n_steps - n0)
+        pull = self._compiled("vjp", k)
+        for t_i in range(self.n_tiles):
+            tile = self._tile(t_i, n0, k)
+            b0, front = tile["b0"], tile["front"]
+            if self.ade is not None:
+                pblk = self._pol_block(src["pol"], tile)
+                pol = (jnp.asarray(pblk[0]), jnp.asarray(pblk[1]))
+                lo, (c0, c1) = tile["lo"], tile["core"]
+                pcot = np.zeros_like(pblk)
+                pcot[..., c0 - lo:c1 - lo] = bar_out["pol"][..., c0:c1]
+                pcot = (jnp.asarray(pcot[0]), jnp.asarray(pcot[1]))
+            else:
+                pol = pcot = ()
+            state = ({c: jnp.asarray(src[c][b0:b0 + L]) for c in _FIELDS},
+                     {t["key"]: jnp.asarray(src["psi_" + t["key"]][b0:b0 + L])
+                      for t in self.terms},
+                     pol, tile["bufs"])
+            cot = ({c: jnp.asarray(bar_out[c][front:front + T]) for c in _FIELDS},
+                   {t["key"]: jnp.asarray(bar_out["psi_" + t["key"]][front:front + T])
+                    for t in self.terms},
+                   pcot, _buf_cotangent(self.mons, tile, g, self.nx, h, tile["bufs"]))
+            bar_state, bar_c = pull(state, self._ce_block(b0), b0, n0,
+                                    tile["margs"], tile["ade_args"], cot)
+            fb, pb, polb, _ = bar_state
+            for c in _FIELDS:
+                bar_in[c][b0:b0 + L] += np.asarray(fb[c])
+            for t in self.terms:
+                bar_in["psi_" + t["key"]][b0:b0 + L] += np.asarray(pb[t["key"]])
+            if self.ade is not None:
+                n = tile["hi"] - tile["lo"]
+                bar_in["pol"][..., tile["lo"]:tile["hi"]] += np.stack(
+                    [np.asarray(polb[0]), np.asarray(polb[1])])[..., :n]
+            bar_ce[b0:b0 + L] += sum(np.asarray(v) for v in bar_c.values())
+
+    def outputs(self):
+        """The collected monitor outputs as a :class:`Result`."""
+        result = self.result
+        for info in self.mons:
+            m = info["m"]
+            if info["kind"] == "field":
+                result.fields[m.name] = {c: v.astype(self.sim.dtypes["monitors"])
                                          for c, v in info["out"].items()}
-                result.monitor_times[m.name] = np.asarray(info["rec"], float) * dt
+                result.monitor_times[m.name] = np.asarray(info["rec"], float) * self.dt
             elif info["kind"] == "dft":
                 result.dft[m.name] = info["out"]
                 result.dft_freqs[m.name] = np.asarray(m.freqs, float)
             else:
                 result.flux[m.name] = float(info["total"])
         return result
-    finally:
-        disk = ce_disk = None                      # drop the maps before unlinking
-        for p in files:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        if own_dir:
-            shutil.rmtree(wd, ignore_errors=True)
 
 
-def _collect(mons, bufs, gc0, gc1, nx, h, T):
+def _collect(mons, bufs, tile, nx, h):
     """Add one slab's monitor buffers (interior planes only) to the outputs."""
-    g1 = min(gc1, nx)
+    gc0 = tile["gc0"]
+    g1 = min(tile["gc1"], nx)
     if g1 <= gc0:
         return
-    for info, b in zip(mons, bufs):
+    for info, b, meta in zip(mons, bufs, tile["meta"]):
         if info["kind"] == "field":
-            nrec = info.get("_nrec", 0)
+            nrec = meta["nrec"]
             if nrec == 0:
                 continue
             ds = info["ds"]
             xs = np.arange(gc0, g1)
             xs = xs[xs % ds == 0]
-            r0 = info["_r0"]
+            r0 = meta["r0"]
             for c, arr in b.items():
                 arr = np.asarray(arr)[:nrec, xs - gc0 + h]
                 info["out"][c][r0:r0 + nrec, xs // ds] = arr
@@ -602,3 +839,154 @@ def _collect(mons, bufs, gc0, gc1, nx, h, T):
                 info["out"][c][:, xs // ds] += np.asarray(arr)[:, xs - gc0 + h]
         else:
             info["total"] += float(np.asarray(b))
+
+
+def _buf_cotangent(mons, tile, g, nx, h, bufs):
+    """Cotangent of one slab's monitor buffers: the transpose of
+    :func:`_collect`, reading the loss cotangent ``g`` of the outputs."""
+    import jax.numpy as jnp
+    gc0 = tile["gc0"]
+    g1 = min(tile["gc1"], nx)
+    out = []
+    for info, b, meta in zip(mons, bufs, tile["meta"]):
+        m = info["m"]
+        if info["kind"] == "flux":
+            out.append(jnp.asarray(g["flux"][m.name], b.dtype))
+            continue
+        cot = {c: np.zeros(v.shape, v.dtype) for c, v in b.items()}
+        if g1 > gc0:
+            ds = info.get("ds", 1)
+            xs = np.arange(gc0, g1)
+            xs = xs[xs % ds == 0]
+            if info["kind"] == "field":
+                nrec, r0 = meta["nrec"], meta["r0"]
+                for c in cot:
+                    cot[c][:nrec, xs - gc0 + h] = \
+                        np.asarray(g["fields"][m.name][c])[r0:r0 + nrec, xs // ds]
+            else:
+                pl = info["plane"]
+                for c in cot:
+                    gc = np.asarray(g["dft"][m.name][c])
+                    if pl is not None and pl[0] == 0:
+                        if gc0 <= pl[1] < g1:
+                            cot[c][...] = gc
+                    else:
+                        cot[c][:, xs - gc0 + h] = gc[:, xs // ds]
+        out.append({c: jnp.asarray(v) for c, v in cot.items()})
+    return tuple(out)
+
+
+def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
+              workdir: Optional[str] = None, budget_bytes: Optional[float] = None):
+    """Run ``sim`` forward with disk-backed fields, tiled along x.
+
+    Parameters
+    ----------
+    sim : Simulation
+    tile_cells : int, optional
+        Interior x-planes per slab. Default: the largest that fits half of
+        ``budget_bytes``, with ``steps_per_tile`` reduced if needed so the
+        slab is not mostly halo.
+    steps_per_tile : int
+        Time steps per slab load (temporal blocking). Larger values cut disk
+        traffic but widen the recomputed halo (``steps_per_tile + 1`` planes
+        per side).
+    workdir : str, optional
+        Directory for the scratch memmaps (default: a new temporary directory,
+        removed afterwards, as are the files in a given ``workdir``).
+    budget_bytes : float, optional
+        Device memory budget used to pick ``tile_cells`` (default: what
+        :func:`photonfdtd.memory.available_memory` reports).
+    """
+    with _Tiled(sim, tile_cells, steps_per_tile, workdir, budget_bytes) as tr:
+        tr.check_disk(disk_bytes(sim, tr.T, tr.K))
+        state = tr.new_state("s")
+        for n0 in range(0, tr.n_steps, tr.K):
+            tr.forward_chunk(state, state, n0)
+        return tr.outputs()
+
+
+def _out_jax(result):
+    """The loss-facing monitor-output dict (as in
+    :func:`photonfdtd.jaxbackend.value_and_grad_eps`) from a tiled Result."""
+    import jax.numpy as jnp
+    return {"fields": {n: {c: jnp.asarray(v) for c, v in d.items()}
+                       for n, d in result.fields.items()},
+            "dft": {n: {c: jnp.asarray(v) for c, v in d.items()}
+                    for n, d in result.dft.items()},
+            "flux": {n: jnp.asarray(v) for n, v in result.flux.items()}}
+
+
+def value_and_grad_eps_tiled(sim, loss, tile_cells: Optional[int] = None,
+                             steps_per_tile: int = 8,
+                             workdir: Optional[str] = None,
+                             budget_bytes: Optional[float] = None,
+                             checkpoint_every: Optional[int] = None):
+    """``(value, d loss / d eps_r)`` with disk-backed state, tiled along x.
+
+    Same contract as :func:`photonfdtd.jax_value_and_grad_eps` (``loss`` maps
+    the monitor-output dict to a scalar; the gradient is a host array of the
+    grid's shape), for grids whose adjoint does not fit on the device. See the
+    module docstring for the method. ``tile_cells``, ``steps_per_tile``,
+    ``workdir`` and ``budget_bytes`` are as in :func:`run_tiled` (slabs are
+    sized for the VJP, which holds about ``steps_per_tile`` slab states).
+
+    ``checkpoint_every`` is the number of K-step chunks between kept states
+    (default ``sqrt`` of the chunk count, which minimises disk use). Set it to
+    1 to keep every chunk's input state and skip the recomputation, if the
+    disk allows (:func:`adjoint_disk_bytes`).
+
+    Subpixel smoothing is not supported (``eps_r`` does not parameterize the
+    smoothed tensor), as in the in-memory gradient. Dispersive media are: in
+    their cells ``eps_r`` is ``eps_inf``, with the poles held fixed.
+    """
+    import jax
+    if sim.subpixel:
+        raise NotImplementedError(
+            "value_and_grad_eps_tiled differentiates the scalar per-cell eps_r, "
+            "which does not parameterize a subpixel-smoothed tensor.")
+    with _Tiled(sim, tile_cells, steps_per_tile, workdir, budget_bytes,
+                adjoint=True) as tr:
+        nc, C, _ = _adjoint_states(tr.n_steps, tr.K, checkpoint_every)
+        tr.check_disk(adjoint_disk_bytes(sim, tr.T, tr.K, C))
+        K = tr.K
+        n_ck = int(math.ceil(nc / C))
+
+        # Forward: states at chunks 0, C, 2C, ... are kept in their own files;
+        # the chunks in between step a working state in place.
+        ck = [tr.new_state(f"ck{j}") for j in range(n_ck)]
+        work = tr.new_state("w")
+        cur = ck[0]
+        for c in range(nc):
+            nxt = ck[(c + 1) // C] if (c + 1) % C == 0 and c + 1 < nc else work
+            tr.forward_chunk(cur, nxt, c * K)
+            cur = nxt
+        result = tr.outputs()
+        value, pull = jax.vjp(loss, _out_jax(result))
+        (g,) = pull(np.ones((), np.asarray(value).dtype))
+
+        # Backward, segment by segment from the end.
+        seg = [None] + [tr.new_state(f"seg{i}") for i in range(1, C)]
+        bar, bar_new = tr.new_state("bar"), tr.new_state("barn")
+        bar_ce = tr._mm("bar_ce", (tr.px, tr.ny, tr.nz))
+        for s in range(n_ck - 1, -1, -1):
+            c0, c1 = s * C, min((s + 1) * C, nc)
+            seg[0] = ck[s]
+            for i in range(1, c1 - c0):        # recompute the segment's inputs
+                tr.forward_chunk(seg[i - 1], seg[i], (c0 + i - 1) * K,
+                                 collect=False)
+            for c in range(c1 - 1, c0 - 1, -1):
+                tr.zero(bar_new)
+                tr.vjp_chunk(seg[c - c0], bar, bar_new, bar_ce, c * K, g)
+                bar, bar_new = bar_new, bar
+
+        # d ce / d eps_r = -ce / eps_r, on the real planes.
+        h, nx, T = tr.h, tr.nx, tr.T
+        ce = tr.ce_disk["Ex"]
+        grad = np.empty(sim.grid.shape, tr.npdt)
+        eps = np.asarray(sim.eps_r)
+        for g0 in range(0, nx, T):
+            g1 = min(nx, g0 + T)
+            grad[g0:g1] = -bar_ce[h + g0:h + g1] * ce[h + g0:h + g1] \
+                / np.asarray(eps[g0:g1], tr.npdt)
+        return float(value), grad

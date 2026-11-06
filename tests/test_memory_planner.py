@@ -36,15 +36,19 @@ def test_recommend_fits_budget():
     # fastest (no checkpointing).
     assert pf.recommend_mode(sim, est["adjoint_reversible"] + 1) == "adjoint_reversible"
     assert pf.recommend_mode(sim, est["adjoint_none"] + 1) == "adjoint_none"
-    # Below even the reversible adjoint -> nothing fits.
-    assert pf.recommend_mode(sim, est["adjoint_reversible"] - 1) == "infeasible"
     # Forward-only planning.
     assert pf.recommend_mode(sim, est["forward"] + 1, differentiable=False) == "forward"
-    # A forward run that does not fit falls back to disk tiling when a slab
-    # fits in half the budget (true once the grid is long in x)...
+    # A run that does not fit falls back to disk tiling when a slab fits in
+    # half the budget (true once the grid is long in x): forward...
     long = _sim(size=(12e-6, 3e-6, 2e-6))
-    f_long = pf.estimate_memory(long)["forward"]
-    assert pf.recommend_mode(long, f_long - 1, differentiable=False) == "disk_tiled"
+    e_long = pf.estimate_memory(long)
+    assert pf.recommend_mode(long, e_long["forward"] - 1,
+                             differentiable=False) == "disk_tiled"
+    # ...and the adjoint, below even the reversible one...
+    assert pf.recommend_mode(long, e_long["adjoint_reversible"] - 1) == \
+        "adjoint_disk_tiled"
+    # ...unless not even a one-plane slab (and its VJP) fits.
+    assert pf.recommend_mode(sim, est["adjoint_reversible"] - 1) == "infeasible"
     # ...unless not even a one-plane slab fits.
     assert pf.recommend_mode(sim, 1, differentiable=False) == "infeasible"
 
@@ -57,6 +61,11 @@ def test_disk_tiled_estimates():
     assert small["disk_tiled"] < small["forward"]
     # the whole grid (padded by the halos) lives on disk
     assert small["disk_tiled_disk"] >= small["forward"]
+    # The adjoint slab also holds the VJP's per-step states, and the adjoint
+    # keeps several checkpointed states on disk.
+    assert small["disk_tiled"] < small["adjoint_disk_tiled"] < small["adjoint_nested"]
+    assert small["adjoint_disk_tiled_disk"] > 3 * small["disk_tiled_disk"]
+    assert "adjoint_disk_tiled" in pf.format_report(sim)
 
 
 def test_pml_increases_estimate():

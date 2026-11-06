@@ -32,8 +32,8 @@ Capabilities:
 
 Every time loop runs on JAX (:mod:`photonfdtd.jaxbackend`, and the ADI-FDTD
 stepper in :mod:`photonfdtd.adi`); :mod:`photonfdtd.memory` sizes a run against
-the device before it starts, and a forward run too big for the device streams
-from disk in x-slabs (:mod:`photonfdtd.tiled`).
+the device before it starts, and a run too big for the device, forward or
+adjoint, streams from disk in x-slabs (:mod:`photonfdtd.tiled`).
 """
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
@@ -57,6 +57,7 @@ from .reversible import (
 from .reversible_pml import (
     value_and_grad_eps_reversible_pml as jax_value_and_grad_eps_reversible_pml,
 )
+from .tiled import value_and_grad_eps_tiled as jax_value_and_grad_eps_tiled
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
 from .photons import (
@@ -96,7 +97,7 @@ __all__ = [
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "jax_value_and_grad_eps_reversible",
-    "jax_value_and_grad_eps_reversible_pml",
+    "jax_value_and_grad_eps_reversible_pml", "jax_value_and_grad_eps_tiled",
     "mode_amplitudes", "port_fields", "s_parameters",
     "PhotonSpectrum", "photon_spectrum", "photon_count", "frank_tamm_spectrum",
     "frank_tamm_photons",

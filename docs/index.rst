@@ -62,7 +62,8 @@ Capabilities
   (:class:`~photonfdtd.ADISimulation2D`) that steps past the CFL limit. See
   :doc:`layout_scale`.
 - **JAX engine**: a JIT-compiled, **differentiable** ``lax.scan`` time loop
-  (CPU / GPU / TPU) with checkpointed and O(1)-memory reversible adjoints. See
+  (CPU / GPU / TPU) with checkpointed, O(1)-memory reversible, and disk-tiled
+  adjoints, all of which handle dispersive media. See
   :doc:`backends`.
 - **Inverse design**: a differentiable 2-D etch-density pipeline
   (:class:`~photonfdtd.EtchedCore`, :func:`~photonfdtd.value_and_grad_density`)
@@ -73,7 +74,8 @@ Capabilities
   like a neural network (:func:`~photonfdtd.train`). See :doc:`optimization`.
 - **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
   :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
-  before it starts.
+  before it starts, and disk-tiled forward runs and adjoints for grids that
+  don't fit (:mod:`photonfdtd.tiled`).
 - A :func:`~photonfdtd.from_gdsfactory` adapter that turns a gdsfactory
   ``Component`` into a fully-built :class:`~photonfdtd.Simulation`.
 

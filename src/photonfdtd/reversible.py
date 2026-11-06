@@ -15,10 +15,14 @@ of timesteps N, versus O(N) for a plain reverse pass or O(N^{1/L}) for
 checkpointing. This is the memory-optimal adjoint for closed / periodic
 differentiable runs (resonators, photonic crystals, periodic metasurfaces).
 
-Scope / gating: no PML (``pml_layers`` all zero), no dispersion, no moving
-charges, and DFT/Flux monitors only (a FieldMonitor's ``.set`` is not a running
-accumulation). Absorbing-boundary (PML) support needs the interior reconstructed
-while the thin PML shell's state is stored per step - designed, not yet built.
+Scope / gating: no PML (``pml_layers`` all zero), no moving charges, and
+DFT/Flux monitors only (a FieldMonitor's ``.set`` is not a running
+accumulation). Dispersive media are supported when every pole is lossless
+(``gamma == 0``, e.g. Sellmeier glasses such as :func:`~photonfdtd.silica`):
+the pole recursion ``P^{n+1} = a P^n + b P^{n-1} + c E^n`` then has ``b = -1``
+and is inverted exactly for ``P^{n-1}``. A lossy pole has ``|b| < 1``, so the
+inverse amplifies roundoff by ``1/|b|`` per step and is refused. With PML, see
+:mod:`photonfdtd.reversible_pml`.
 Implemented as a ``jax.custom_vjp`` whose backward pass steps the physics
 backward; validated by ``forward-then-reverse`` returning to machine precision
 and by matching the plain (checkpointed) gradient.
@@ -36,21 +40,97 @@ from .constants import EPS_0
 from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
 from .jaxbackend import (_build_static, _monitor_plan, _validate,
                          _enable_x64_if_needed, _snap, _dft_snap, _FLUX_AXIS,
-                         _flux)
+                         _flux, _build_ade_jax)
 
 
 def reversible_available(sim):
     """Whether the reversible adjoint applies to ``sim`` (else use checkpointing)."""
     if any(int(p) > 0 for p in sim.grid.pml_layers):
         return False, "reversible adjoint requires no PML (pml_layers all 0)"
-    if getattr(sim, "_has_dispersion", False):
-        return False, "reversible adjoint does not support dispersive media"
+    if not lossless_poles(sim):
+        return False, ("reversible adjoint needs lossless dispersion poles "
+                       "(gamma == 0); a lossy pole cannot be stepped backward "
+                       "stably")
     if getattr(sim, "particle_sources", None):
         return False, "reversible adjoint does not support moving-charge sources"
     for m in sim.monitors:
         if isinstance(m, FieldMonitor):
             return False, "reversible adjoint supports DFT/Flux monitors only"
     return True, ""
+
+
+def lossless_poles(sim):
+    """True if ``sim`` has no dispersive medium with a lossy (gamma != 0) pole."""
+    for s in sim.structures:
+        med = getattr(s, "medium", None)
+        if getattr(med, "is_dispersive", False) and \
+                any(p.gamma != 0.0 for p in med.poles):
+            return False
+    return True
+
+
+class _ADE:
+    """Lossless-pole polarization stepping, forward and exactly backward.
+
+    Mirrors the ADE update in :func:`photonfdtd.jaxbackend._device_simulate`.
+    The state is ``(Pcur, Pprev)``, each ``(npole, 3, n_disp)``, or ``()``
+    without dispersion (every method is then a no-op).
+    """
+
+    def __init__(self, ade, ce_e, dt):
+        import jax.numpy as jnp
+        self.on = ade is not None
+        if not self.on:
+            return
+        self.idx = tuple(jnp.asarray(i) for i in ade["idx"])
+        self.A = jnp.asarray(ade["A"]).reshape(-1, 1, 1)
+        self.B = jnp.asarray(ade["B"]).reshape(-1, 1, 1)
+        self.C = jnp.asarray(ade["C"])[:, None, :]
+        self.inv = [ce_e[c][self.idx] / dt for c in ("Ex", "Ey", "Ez")]
+        self.shape = (ade["npole"], 3, ade["n_disp"])
+
+    def init(self, jdt):
+        import jax.numpy as jnp
+        if not self.on:
+            return ()
+        return (jnp.zeros(self.shape, jdt), jnp.zeros(self.shape, jdt))
+
+    def gather(self, fields):
+        import jax.numpy as jnp
+        if not self.on:
+            return None
+        return jnp.stack([fields[c][self.idx] for c in ("Ex", "Ey", "Ez")])
+
+    def _correct(self, fields, delta, sgn):
+        for a, c in enumerate(("Ex", "Ey", "Ez")):
+            fields[c] = fields[c].at[self.idx].add(-sgn * self.inv[a] * delta[a])
+        return fields
+
+    def forward(self, fields, pol, En):
+        """After the E curl pass: advance P and apply the correction to E."""
+        import jax.numpy as jnp
+        if not self.on:
+            return fields, pol
+        Pcur, Pprev = pol
+        Pnew = self.A * Pcur + self.B * Pprev + self.C * En[None]
+        fields = self._correct(fields, jnp.sum(Pnew - Pcur, axis=0), +1.0)
+        return fields, (Pnew, Pcur)
+
+    def undo_correction(self, fields, pol):
+        """Remove the correction ``forward`` added to E (state unchanged)."""
+        import jax.numpy as jnp
+        if not self.on:
+            return fields
+        Pnew, Pcur = pol
+        return self._correct(fields, jnp.sum(Pnew - Pcur, axis=0), -1.0)
+
+    def backward(self, fields, pol):
+        """Given E^n (restored) and ``(P^{n+1}, P^n)``, return ``(P^n, P^{n-1})``."""
+        if not self.on:
+            return pol
+        Pnew, Pcur = pol
+        Pprev = (Pnew - self.A * Pcur - self.C * self.gather(fields)[None]) / self.B
+        return (Pcur, Pprev)
 
 
 def _pass_increment(fields, is_E_pass, ce_e, static, neg_ch):
@@ -85,16 +165,19 @@ def _pass_increment(fields, is_E_pass, ce_e, static, neg_ch):
     return out
 
 
-def _make_reversible(sim, static, plans, ce_e):
+def _make_reversible(sim, static, plans, ce_e, ade=None):
     """Build ``forward_step`` / ``reverse_step`` / init / output-extractor for a
     lossless no-PML run. Monitors (DFT, flux) live in the carry and accumulate
-    reversibly. ``ce_e`` is a dict of per-component coefficients (JAX arrays)."""
+    reversibly. ``ce_e`` is a dict of per-component coefficients (JAX arrays);
+    ``ade`` the lossless-pole plan from :func:`_build_ade_jax` (or None). The
+    carry is ``(fields, dft, flux, pol)``."""
     import jax.numpy as jnp
     dt = static["dt"]
     shape = static["shape"]
     jdt = ce_e["Ex"].dtype
     cdt = jnp.complex128 if jdt == jnp.float64 else jnp.complex64
     neg_ch = jnp.asarray(-static["ch_field"], dtype=jdt)
+    pole = _ADE(ade, ce_e, dt)
 
     src_H = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_H"]]
     src_E = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_E"]]
@@ -109,7 +192,7 @@ def _make_reversible(sim, static, plans, ce_e):
             (len(p["m"].freqs),) + _snap(fields[c], p["m"], p["plane"]).shape,
             dtype=cdt) for c in p["m"].components} for p in dft_plans}
         flux = {p["m"].name: jnp.asarray(0.0, dtype=jdt) for p in flux_plans}
-        return (fields, dft, flux)
+        return (fields, dft, flux, pole.init(jdt))
 
     def _accumulate(fields, dft, flux, n, sgn):
         dft = {k: dict(v) for k, v in dft.items()}
@@ -136,35 +219,41 @@ def _make_reversible(sim, static, plans, ce_e):
         return flux
 
     def forward_step(carry, ce_e, n):
-        fields, dft, flux = dict(carry[0]), carry[1], carry[2]
+        pole = _ADE(ade, ce_e, dt)        # its 1/eps factor depends on ce_e
+        fields, dft, flux, pol = dict(carry[0]), carry[1], carry[2], carry[3]
         for F, (reg, v) in _pass_increment(fields, False, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(v)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
         flux = _flux_half(fields, flux, +1.0)
+        En = pole.gather(fields)
         for F, (reg, v) in _pass_increment(fields, True, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(v)
+        fields, pol = pole.forward(fields, pol, En)
         for c, i, j, k, vals in src_E:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
         dft, flux = _accumulate(fields, dft, flux, n, +1.0)
-        return (fields, dft, flux)
+        return (fields, dft, flux, pol)
 
     def reverse_step(carry, ce_e, n):
-        fields, dft, flux = dict(carry[0]), carry[1], carry[2]
+        pole = _ADE(ade, ce_e, dt)
+        fields, dft, flux, pol = dict(carry[0]), carry[1], carry[2], carry[3]
         dft, flux = _accumulate(fields, dft, flux, n, -1.0)
         for c, i, j, k, vals in src_E:
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
+        fields = pole.undo_correction(fields, pol)
         for F, (reg, v) in _pass_increment(fields, True, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(-v)
+        pol = pole.backward(fields, pol)
         flux = _flux_half(fields, flux, -1.0)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
         for F, (reg, v) in _pass_increment(fields, False, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(-v)
-        return (fields, dft, flux)
+        return (fields, dft, flux, pol)
 
     def extract_outputs(carry):
-        _, dft, flux = carry
+        _, dft, flux, _ = carry
         return {"dft": dft, "flux": flux}
 
     return init_carry, forward_step, reverse_step, extract_outputs
@@ -191,28 +280,29 @@ def value_and_grad_eps_reversible(sim, loss):
     npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
+    ade = _build_ade_jax(sim, static)
     n_steps = static["n_steps"]
 
     @jax.custom_vjp
     def rev_run(ce_e):
-        init, fwd, _, extract = _make_reversible(sim, static, plans, ce_e)
+        init, fwd, _, extract = _make_reversible(sim, static, plans, ce_e, ade)
         c, _ = lax.scan(lambda cc, n: (fwd(cc, ce_e, n), None),
                         init(), jnp.arange(n_steps))
         return extract(c)
 
     def rev_fwd(ce_e):
-        init, fwd, _, extract = _make_reversible(sim, static, plans, ce_e)
+        init, fwd, _, extract = _make_reversible(sim, static, plans, ce_e, ade)
         c, _ = lax.scan(lambda cc, n: (fwd(cc, ce_e, n), None),
                         init(), jnp.arange(n_steps))
         return extract(c), (c, ce_e)
 
     def rev_bwd(res, g):
         final_carry, ce_e = res
-        _, fwd, rev_step, _ = _make_reversible(sim, static, plans, ce_e)
+        _, fwd, rev_step, _ = _make_reversible(sim, static, plans, ce_e, ade)
         # Seed the adjoint: the outputs are exactly the carry's monitor
         # accumulators, so their cotangents map straight in; fields start at 0.
-        bar_fields = {c: jnp.zeros_like(final_carry[0][c]) for c in final_carry[0]}
-        bar = (bar_fields, g["dft"], g["flux"])
+        zeros = lambda t: jax.tree_util.tree_map(jnp.zeros_like, t)
+        bar = (zeros(final_carry[0]), g["dft"], g["flux"], zeros(final_carry[3]))
         bar_ce = {c: jnp.zeros_like(ce_e[c]) for c in ce_e}
 
         def body(carry, n):

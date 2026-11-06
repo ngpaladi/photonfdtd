@@ -233,7 +233,11 @@ def _build_ade_jax(sim, static):
 
     Returns None if nothing dispersive occupies the grid. The recursion
     coefficients a, b are per-pole scalars; the driving coefficient c is masked
-    per pole (zero on cells belonging to a different material).
+    per pole (zero on cells belonging to a different material). The cells are
+    in C order, so sorted by x (the disk-tiled stepper relies on this). The
+    ``1/(eps_inf*EPS_0)`` factor of the polarization correction is not stored:
+    the stepper takes it from the E-update coefficient ``ce/dt`` at the cell
+    (eps_r there is eps_inf), so gradients w.r.t. eps_r include it.
     """
     if not getattr(sim, "_has_dispersion", False):
         return None
@@ -274,9 +278,7 @@ def _build_ade_jax(sim, static):
     cell_mat = id_grid[disp]                        # (n_disp,) material id per cell
 
     a_list, b_list, c_rows = [], [], []
-    inv_eps = np.zeros(n_disp, dtype=npdt)
     for mid, med in enumerate(media):
-        inv_eps[cell_mat == mid] = 1.0 / (EPS_0 * med.eps_inf)
         for p in med.poles:
             denom = 1.0 + p.gamma * dt
             a_list.append((2.0 - p.omega0 ** 2 * dt ** 2) / denom)
@@ -288,7 +290,6 @@ def _build_ade_jax(sim, static):
         A=np.asarray(a_list, dtype=npdt),          # (npole,)
         B=np.asarray(b_list, dtype=npdt),          # (npole,)
         C=np.stack(c_rows, axis=0),                # (npole, n_disp)
-        inv_eps=inv_eps,                           # (n_disp,)
         npole=len(a_list),
         n_disp=n_disp,
     )
@@ -385,7 +386,8 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         ade_A = jnp.asarray(ade["A"]).reshape(-1, 1, 1)         # (npole,1,1)
         ade_B = jnp.asarray(ade["B"]).reshape(-1, 1, 1)
         ade_C = jnp.asarray(ade["C"])[:, None, :]               # (npole,1,n_disp)
-        ade_inv = jnp.asarray(ade["inv_eps"])                   # (n_disp,)
+        # 1/(eps_inf*EPS_0) per component, from the E-update coefficient.
+        ade_inv = [ce_e[c][ade_idx] / dt for c in ("Ex", "Ey", "Ez")]
         npole = ade["npole"]
         n_disp = ade["n_disp"]
 
@@ -505,9 +507,9 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
             Pcur, Pprev = ade_state
             Pnew = ade_A * Pcur + ade_B * Pprev + ade_C * En[None]
             delta = jnp.sum(Pnew - Pcur, axis=0)           # (3, n_disp)
-            fields["Ex"] = fields["Ex"].at[ade_idx].add(-ade_inv * delta[0])
-            fields["Ey"] = fields["Ey"].at[ade_idx].add(-ade_inv * delta[1])
-            fields["Ez"] = fields["Ez"].at[ade_idx].add(-ade_inv * delta[2])
+            fields["Ex"] = fields["Ex"].at[ade_idx].add(-ade_inv[0] * delta[0])
+            fields["Ey"] = fields["Ey"].at[ade_idx].add(-ade_inv[1] * delta[1])
+            fields["Ez"] = fields["Ez"].at[ade_idx].add(-ade_inv[2] * delta[2])
             ade_state = (Pnew, Pcur)
         for comp, i, j, k, vals in src_E:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
@@ -722,6 +724,10 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
     the entire time evolution - a time-domain adjoint, i.e. exactly the gradient
     an inverse-design / topology-optimization loop needs.
 
+    Dispersive media are supported: in a dispersive cell ``eps_r`` is the
+    medium's ``eps_inf``, and its gradient includes the polarization
+    correction it scales. The poles themselves are held fixed.
+
     ``remat`` controls adjoint memory (see :func:`_run_time_loop`). The default
     ``"nested"`` uses two-level gradient checkpointing so the backward pass
     stores only ~sqrt(n_steps) segment-boundary states instead of the full
@@ -733,34 +739,27 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
     import jax.numpy as jnp
 
     _validate(sim)
-    if sim.subpixel or getattr(sim, "_has_dispersion", False):
+    if sim.subpixel:
         raise NotImplementedError(
             "value_and_grad_eps differentiates the scalar per-cell eps_r, which "
-            "does not parameterize a subpixel-smoothed tensor or a dispersive "
-            "pole model. Both forward-run and are differentiable under the JAX "
-            "backend: build the coefficient / pole arrays symbolically and call "
-            "jax.grad on _device_simulate directly (see tests/test_jax_accuracy "
-            "for a worked pole-strength gradient)."
+            "does not parameterize a subpixel-smoothed tensor. Use "
+            "value_and_grad_params with a symbolic coefficient builder (see "
+            "photonfdtd.design)."
         )
     _enable_x64_if_needed(sim)
     npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
     pplans = _particle_plan(sim, static)
+    ade = _build_ade_jax(sim, static)
 
     def loss_of_eps(eps_r):
         ce = sim.dt / (eps_r * EPS_0)
         ce_e = {c: ce for c in ("Ex", "Ey", "Ez")}
         sf, sd, sfx = _device_simulate(sim, static, plans, ce_e, pplans,
-                                       ade=None, ce_particle=ce, remat=remat,
+                                       ade=ade, ce_particle=ce, remat=remat,
                                        checkpoint_levels=checkpoint_levels)
-        n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
-        out = {
-            "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},
-            "dft": {n: {c: sd[n][c] for c in sd[n]} for n in sd},
-            "flux": {n: sfx[n] for n in sfx},
-        }
-        return loss(out)
+        return loss(_out_dict(sf, sd, sfx, plans))
 
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)
@@ -780,19 +779,17 @@ def _out_dict(sf, sd, sfx, plans):
 def _prepare(sim):
     """Validate ``sim`` and build its fixed-for-the-run plans once."""
     _validate(sim)
-    if getattr(sim, "_has_dispersion", False):
-        raise NotImplementedError(
-            "design-parameter gradients do not support dispersive media yet.")
     _enable_x64_if_needed(sim)
     static = _build_static(sim)
-    return static, _monitor_plan(sim), _particle_plan(sim, static)
+    return (static, _monitor_plan(sim), _particle_plan(sim, static),
+            _build_ade_jax(sim, static))
 
 
 def _simulate_out(sim, prep, ce_e, remat="nested", checkpoint_levels=2):
     """Run ``sim`` with E coefficients ``ce_e``; return the loss-facing dict."""
-    static, plans, pplans = prep
+    static, plans, pplans, ade = prep
     sf, sd, sfx = _device_simulate(
-        sim, static, plans, ce_e, pplans, ade=None,
+        sim, static, plans, ce_e, pplans, ade=ade,
         ce_particle=ce_e["Ex"], remat=remat,
         checkpoint_levels=checkpoint_levels)
     return _out_dict(sf, sd, sfx, plans)
@@ -840,9 +837,12 @@ def value_and_grad_params(sim, ce_of_params, params, loss,
     JAX array matching ``params``).
 
     The subpixel per-component coefficient path is used, so a plain
-    ``Simulation`` (``subpixel=False``) is fine; dispersion is not supported here
-    (the pole state is not parameterized by ``params``). For an optimization
-    loop use :func:`make_value_and_grad_params`, which compiles once.
+    ``Simulation`` (``subpixel=False``) is fine. Dispersive structures in
+    ``sim`` keep their poles fixed; in their cells the coefficient from
+    ``ce_of_params`` also scales the polarization correction (it plays the
+    role of ``dt/(eps_inf*EPS_0)``), so map those cells to ``eps_inf``. For
+    an optimization loop use :func:`make_value_and_grad_params`, which
+    compiles once.
     """
     vg = make_value_and_grad_params(sim, lambda p: ce_of_params(p), loss,
                                     remat=remat,
