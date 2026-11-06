@@ -23,13 +23,17 @@ Capabilities:
 - JAX/XLA time stepping (CPU / GPU / TPU from one code path), differentiable
   with checkpointed and reversible time-domain adjoints, and a 2-D etch-density inverse-design pipeline
   (:mod:`photonfdtd.design`)
+- Gradient-descent geometry optimization (:mod:`photonfdtd.optimize`): design
+  regions, parametric shapes, Adam / optax, beta continuation, robust
+  (eroded/dilated) objectives, GDS export (:mod:`photonfdtd.gds`), and
+  training a chip like a neural network on a dataset (:mod:`photonfdtd.train`)
 - :func:`from_gdsfactory` adapter that turns a gdsfactory Component into a
   fully-built Simulation
 
 Every time loop runs on JAX (:mod:`photonfdtd.jaxbackend`, and the ADI-FDTD
 stepper in :mod:`photonfdtd.adi`); :mod:`photonfdtd.memory` sizes a run against
-the device before it starts, and a forward run too big for the device streams
-from disk in x-slabs (:mod:`photonfdtd.tiled`).
+the device before it starts, and a run too big for the device, forward or
+adjoint, streams from disk in x-slabs (:mod:`photonfdtd.tiled`).
 """
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
@@ -53,6 +57,7 @@ from .reversible import (
 from .reversible_pml import (
     value_and_grad_eps_reversible_pml as jax_value_and_grad_eps_reversible_pml,
 )
+from .tiled import value_and_grad_eps_tiled as jax_value_and_grad_eps_tiled
 from .mode import ModeSolver
 from .smatrix import mode_amplitudes, port_fields, s_parameters
 from .photons import (
@@ -66,7 +71,15 @@ from .eme import Section, EMEResult, eme_2d, sections_from_eps
 from .adi import ADISimulation2D, ADISource, ADIResult
 from .design import (
     EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
+    DesignRegion, ShapeDesign, polygon_density,
 )
+from .jaxbackend import make_value_and_grad_params, value_and_grad_params
+from .optimize import (
+    Adam, minimize, OptResult, beta_continuation, binarization, robust,
+    ModeTransmission, FieldProjection, combine,
+)
+from .train import PhotonicModel, train, fit_transfer, accuracy
+from .gds import export_gds
 from .memory import (
     estimate_memory, recommend_mode, format_report, available_memory,
 )
@@ -84,7 +97,7 @@ __all__ = [
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "jax_value_and_grad_eps_reversible",
-    "jax_value_and_grad_eps_reversible_pml",
+    "jax_value_and_grad_eps_reversible_pml", "jax_value_and_grad_eps_tiled",
     "mode_amplitudes", "port_fields", "s_parameters",
     "PhotonSpectrum", "photon_spectrum", "photon_count", "frank_tamm_spectrum",
     "frank_tamm_photons",
@@ -93,6 +106,12 @@ __all__ = [
     "Section", "EMEResult", "eme_2d", "sections_from_eps",
     "ADISimulation2D", "ADISource", "ADIResult",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
+    # geometry optimization and chip training
+    "DesignRegion", "ShapeDesign", "polygon_density",
+    "make_value_and_grad_params", "value_and_grad_params",
+    "Adam", "minimize", "OptResult", "beta_continuation", "binarization",
+    "robust", "ModeTransmission", "FieldProjection", "combine",
+    "PhotonicModel", "train", "fit_transfer", "accuracy", "export_gds",
     "estimate_memory", "recommend_mode", "format_report", "available_memory",
     "adapters", "from_gdsfactory",
 ]

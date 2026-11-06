@@ -39,8 +39,9 @@ import numpy as np
 
 from .constants import EPS_0
 from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
-from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS)
-from .reversible import _pass_increment, _flux
+from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS,
+                         _build_ade_jax)
+from .reversible import _pass_increment, _flux, _ADE, lossless_poles
 
 
 def pml_mask(grid):
@@ -97,12 +98,15 @@ def _pass_with_psi(fields, psi, is_E_pass, ce_e, static, neg_ch):
     return inc, psi
 
 
-def make_pml_reversible(sim, static, plans, ce_e):
+def make_pml_reversible(sim, static, plans, ce_e, ade=None):
     """Build init / forward_step / reverse_step for a lossless CPML run.
 
     forward_step advances the full solver (with psi); reverse_step reconstructs
     the previous state from the next one plus the per-step PML-shell tape
     (fields + psi at the PML cells). Monitors (DFT/flux) accumulate reversibly.
+    ``ade`` is a lossless-pole plan (or None); its polarization is inverted
+    exactly, as in :mod:`photonfdtd.reversible`, so it needs no tape. The
+    carry is ``(fields, psi, dft, flux, pol)``.
     """
     import jax.numpy as jnp
     dt = static["dt"]
@@ -110,6 +114,7 @@ def make_pml_reversible(sim, static, plans, ce_e):
     jdt = ce_e["Ex"].dtype
     cdt = jnp.complex128 if jdt == jnp.float64 else jnp.complex64
     neg_ch = jnp.asarray(-static["ch_field"], dtype=jdt)
+    pole = _ADE(ade, ce_e, dt)
     mask = jnp.asarray(pml_mask(sim.grid))
 
     src_H = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_H"]]
@@ -139,7 +144,7 @@ def make_pml_reversible(sim, static, plans, ce_e):
             (len(p["m"].freqs),) + _snap(fields[c], p["m"], p["plane"]).shape,
             dtype=cdt) for c in p["m"].components} for p in dft_plans}
         flux = {p["m"].name: jnp.asarray(0.0, dtype=jdt) for p in flux_plans}
-        return (fields, psi, dft, flux)
+        return (fields, psi, dft, flux, pole.init(jdt))
 
     def _accumulate(fields, dft, flux, n, sgn):
         dft = {k: dict(v) for k, v in dft.items()}
@@ -166,35 +171,43 @@ def make_pml_reversible(sim, static, plans, ce_e):
         return flux
 
     def forward_step(carry, ce_e, n):
-        fields, psi, dft, flux = dict(carry[0]), carry[1], carry[2], carry[3]
+        pole = _ADE(ade, ce_e, dt)        # its 1/eps factor depends on ce_e
+        fields, psi, dft, flux, pol = (dict(carry[0]), carry[1], carry[2],
+                                       carry[3], carry[4])
         inc, psi = _pass_with_psi(fields, psi, False, ce_e, static, neg_ch)
         for F, (reg, v) in inc.items():
             fields[F] = fields[F].at[reg].add(v)
         for c, i, j, k, vals in src_H:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
         flux = _flux_half(fields, flux, +1.0)
+        En = pole.gather(fields)
         inc, psi = _pass_with_psi(fields, psi, True, ce_e, static, neg_ch)
         for F, (reg, v) in inc.items():
             fields[F] = fields[F].at[reg].add(v)
+        fields, pol = pole.forward(fields, pol, En)
         for c, i, j, k, vals in src_E:
             fields[c] = fields[c].at[i, j, k].add(vals[n])
         dft, flux = _accumulate(fields, dft, flux, n, +1.0)
-        return (fields, psi, dft, flux)
+        return (fields, psi, dft, flux, pol)
 
     def reverse_step(carry, shell, ce_e, n):
+        pole = _ADE(ade, ce_e, dt)
         """Reconstruct the previous state. ``shell`` is the stored PML-region
         fields (dict of full-grid arrays, nonzero only on PML) and psi of the
         *previous* state; the bare reverse handles the interior."""
-        fields, _, dft, flux = dict(carry[0]), carry[1], carry[2], carry[3]
+        fields, dft, flux, pol = dict(carry[0]), carry[2], carry[3], carry[4]
         shell_fields, shell_psi = shell
         dft, flux = _accumulate(fields, dft, flux, n, -1.0)
-        # undo E-sources + bare E-pass, then overwrite E PML cells from the tape.
+        # undo E-sources, the pole correction and the bare E-pass, then
+        # overwrite E PML cells from the tape; E^n then gives P^{n-1}.
         for c, i, j, k, vals in src_E:
             fields[c] = fields[c].at[i, j, k].add(-vals[n])
+        fields = pole.undo_correction(fields, pol)
         for F, (reg, v) in _pass_increment(fields, True, ce_e, static, neg_ch).items():
             fields[F] = fields[F].at[reg].add(-v)
         for c in ("Ex", "Ey", "Ez"):
             fields[c] = fields[c].at[field_idx].set(shell_fields[c])
+        pol = pole.backward(fields, pol)
         flux = _flux_half(fields, flux, -1.0)
         # undo H-sources + bare H-pass (now uses the corrected E^n), overwrite H.
         for c, i, j, k, vals in src_H:
@@ -205,7 +218,7 @@ def make_pml_reversible(sim, static, plans, ce_e):
             fields[c] = fields[c].at[field_idx].set(shell_fields[c])
         psi = {k: jnp.zeros(psi_shapes[k], dtype=jdt).at[psi_idx[k]].set(shell_psi[k])
                for k in psi_keys}
-        return (fields, psi, dft, flux)
+        return (fields, psi, dft, flux, pol)
 
     def shell_of(carry):
         """Extract the PML-region tape entry for a state: fields on the boundary
@@ -219,58 +232,58 @@ def make_pml_reversible(sim, static, plans, ce_e):
     return init_carry, forward_step, reverse_step, shell_of
 
 
-def value_and_grad_eps_reversible_pml(sim, loss):
-    """``(value, d loss / d eps_r)`` via the PML-shell reversible adjoint.
+def reversible_pml_run(sim):
+    """``ce_e -> {'fields', 'dft', 'flux'}``, differentiable with the
+    PML-shell reversible adjoint.
 
-    Same contract as :func:`photonfdtd.jax_value_and_grad_eps`, valid for a
-    lossless (non-dispersive) run *with* CPML. The backward pass reconstructs the
-    forward history by reverse-stepping the interior and replaying the stored
-    PML shell (see module docstring). DFT/Flux monitors only.
-
-    Note: this reference implementation stores the shell densely (full-grid,
-    zero off-PML); gathering it to the PML cells only (O(surface*n_steps)) is a
-    mechanical memory optimization on top of the validated reconstruction.
+    The per-component counterpart of :func:`value_and_grad_eps_reversible_pml`
+    (same requirements: lossless poles, no moving charges, DFT/Flux monitors
+    only), for design gradients through
+    :func:`photonfdtd.jaxbackend.make_value_and_grad_params`.
     """
     import jax
     import jax.numpy as jnp
     from jax import lax
     from .jaxbackend import _validate, _enable_x64_if_needed
 
-    if getattr(sim, "_has_dispersion", False) or getattr(sim, "particle_sources", None):
-        raise NotImplementedError("reversible PML adjoint: lossless, no particles.")
+    if not lossless_poles(sim):
+        raise NotImplementedError(
+            "reversible PML adjoint needs lossless dispersion poles (gamma == 0)")
+    if getattr(sim, "particle_sources", None):
+        raise NotImplementedError("reversible PML adjoint: no moving charges.")
     for m in sim.monitors:
         if isinstance(m, FieldMonitor):
             raise NotImplementedError("reversible PML adjoint: DFT/Flux monitors only.")
     _validate(sim)
     _enable_x64_if_needed(sim)
-    npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
+    ade = _build_ade_jax(sim, static)
     n_steps = static["n_steps"]
 
     @jax.custom_vjp
     def rev_run(ce_e):
-        init, fwd, _, _ = make_pml_reversible(sim, static, plans, ce_e)
+        init, fwd, _, _ = make_pml_reversible(sim, static, plans, ce_e, ade)
         c, _ = lax.scan(lambda cc, n: (fwd(cc, ce_e, n), None),
                         init(), jnp.arange(n_steps))
-        _, _, dft, flux = c
+        dft, flux = c[2], c[3]
         return {"dft": dft, "flux": flux}
 
     def rev_fwd(ce_e):
-        init, fwd, _, shell_of = make_pml_reversible(sim, static, plans, ce_e)
+        init, fwd, _, shell_of = make_pml_reversible(sim, static, plans, ce_e, ade)
 
         def body(cc, n):
             return fwd(cc, ce_e, n), shell_of(cc)     # tape the pre-step shell
         final, tape = lax.scan(body, init(), jnp.arange(n_steps))
-        _, _, dft, flux = final
+        dft, flux = final[2], final[3]
         return {"dft": dft, "flux": flux}, (final, tape, ce_e)
 
     def rev_bwd(res, g):
         final, tape, ce_e = res
-        _, fwd, rev_step, _ = make_pml_reversible(sim, static, plans, ce_e)
-        bar_fields = {c: jnp.zeros_like(final[0][c]) for c in final[0]}
-        bar_psi = {k: jnp.zeros_like(final[1][k]) for k in final[1]}
-        bar = (bar_fields, bar_psi, g["dft"], g["flux"])
+        _, fwd, rev_step, _ = make_pml_reversible(sim, static, plans, ce_e, ade)
+        zeros = lambda t: jax.tree_util.tree_map(jnp.zeros_like, t)
+        bar = (zeros(final[0]), zeros(final[1]), g["dft"], g["flux"],
+               zeros(final[4]))
         bar_ce = {c: jnp.zeros_like(ce_e[c]) for c in ce_e}
 
         def body(carry, n):
@@ -288,9 +301,33 @@ def value_and_grad_eps_reversible_pml(sim, loss):
 
     rev_run.defvjp(rev_fwd, rev_bwd)
 
+    def run(ce_e):
+        out = rev_run(dict(ce_e))
+        return {"fields": {}, "dft": out["dft"], "flux": out["flux"]}
+    return run
+
+
+def value_and_grad_eps_reversible_pml(sim, loss):
+    """``(value, d loss / d eps_r)`` via the PML-shell reversible adjoint.
+
+    Same contract as :func:`photonfdtd.jax_value_and_grad_eps`, valid for a
+    lossless run *with* CPML (non-dispersive, or dispersive with lossless
+    poles). The backward pass reconstructs the forward history by
+    reverse-stepping the interior and replaying the stored PML shell (see
+    module docstring). DFT/Flux monitors only.
+
+    Note: this reference implementation stores the shell densely (full-grid,
+    zero off-PML); gathering it to the PML cells only (O(surface*n_steps)) is a
+    mechanical memory optimization on top of the validated reconstruction.
+    """
+    import jax
+    import jax.numpy as jnp
+    run = reversible_pml_run(sim)
+    npdt = np.dtype(sim.dtypes["Ex"])
+
     def loss_of_eps(eps_r):
         ce = sim.dt / (eps_r * EPS_0)
-        return loss(rev_run({c: ce for c in ("Ex", "Ey", "Ez")}))
+        return loss(run({c: ce for c in ("Ex", "Ey", "Ez")}))
 
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)

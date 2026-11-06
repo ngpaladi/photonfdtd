@@ -91,10 +91,30 @@ forward estimate exceeds the available device memory; ``disk_tiled=False``
 turns that off. ``tile_cells`` defaults to the largest slab that fits half the
 device budget. ``recommend_mode(differentiable=False)`` returns
 ``"disk_tiled"`` when a forward run doesn't fit but a slab does, and
-``"infeasible"`` when nothing does. It is forward-only (no adjoint), doesn't
-support dispersive media, and keeps monitor outputs in RAM. It is also a few
+``"infeasible"`` when nothing does. Dispersive media, moving charges and
+subpixel smoothing all work tiled; monitor outputs stay in RAM. It is a few
 times slower than an in-memory run: 2.3-5.6x on a 240x120x120 float32 grid,
 less with wider slabs and more steps per load.
+
+Gradients tile the same way. :func:`~photonfdtd.jax_value_and_grad_eps_tiled`
+has the contract of :func:`~photonfdtd.jax_value_and_grad_eps` and returns
+``d loss / d eps_r`` as a host array::
+
+    value, grad = pf.jax_value_and_grad_eps_tiled(sim, loss, tile_cells=32,
+                                                  workdir="/scratch/adj")
+
+Each block of ``steps_per_tile`` steps is pulled back slab by slab with
+``jax.vjp`` of the same compiled slab update. The block inputs come from
+checkpoints on disk: every ``checkpoint_every`` blocks (default
+``sqrt`` of the block count) the state is kept, and the blocks in between are
+recomputed during the backward pass, so disk holds about
+``2 * sqrt(n_steps / steps_per_tile)`` copies of the state and the compute is
+about twice a forward run plus the VJPs. ``checkpoint_every=1`` keeps every
+block and skips the recomputation. The gradient matches the in-memory reverse
+pass to ~1e-15 (``tests/test_tiled.py``). ``recommend_mode`` returns
+``"adjoint_disk_tiled"`` when no in-memory adjoint fits but a slab and its VJP
+do. Subpixel smoothing is not supported here, as in the in-memory
+``eps_r`` gradient.
 
 To keep the monitor side small:
 
@@ -112,5 +132,9 @@ Because the stepper is a pure function of the permittivity-derived
 coefficients, ``jax.grad`` of any scalar built from the monitor outputs is a
 time-domain adjoint. Start from :func:`~photonfdtd.jax_value_and_grad_eps`
 (checkpointed), :func:`~photonfdtd.jax_value_and_grad_eps_reversible`
-(O(1) memory in timesteps for closed domains), or the etch-density pipeline
+(O(1) memory in timesteps for closed domains),
+:func:`~photonfdtd.jax_value_and_grad_eps_tiled` (disk-tiled, for grids too
+big for the device), or the etch-density pipeline
 :func:`~photonfdtd.value_and_grad_density`; :doc:`accuracy` walks through them.
+All of them handle dispersive media, with the poles held fixed (the reversible
+ones need lossless poles).

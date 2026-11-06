@@ -158,9 +158,23 @@ print(result.n_eff)            # array of effective indices
   `tanh` projection → anisotropic subpixel sidewalls → 3-D ε — entirely in JAX,
   so `value_and_grad_density` returns `d(loss)/d(ρ)` through the full time
   evolution (topology optimization; gradient matches finite differences to
-  ~1e-8). Adjoint memory is kept in check by two-level gradient checkpointing
-  and, for closed/periodic domains, an O(1)-in-timesteps **reversible adjoint**
-  (`jax_value_and_grad_eps_reversible`, plus a PML-shell-tape variant).
+  ~1e-8). Adjoint memory is kept in check by two-level gradient checkpointing,
+  for closed/periodic domains an O(1)-in-timesteps **reversible adjoint**
+  (`jax_value_and_grad_eps_reversible`, plus a PML-shell-tape variant), and for
+  grids too big for the device a **disk-tiled adjoint**
+  (`jax_value_and_grad_eps_tiled`). Dispersive media are differentiable on
+  every path (the reversible ones need lossless poles, e.g. Sellmeier glass).
+- **Geometry optimization and chip training.** Optimize a `DesignRegion` box
+  inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
+  parametric polygons (widths, gaps, tapers), with a compile-once gradient
+  (`make_value_and_grad_params`), Adam or any optax optimizer (`minimize`),
+  beta continuation, robust eroded/dilated objectives, and GDS export
+  (`export_gds`, optional `gdstk`). `train` fits a chip to a dataset like a
+  neural network: the chip is linear, so one simulation per input port gives its
+  transfer matrix and a training step costs N forward + N adjoint runs however
+  big the batch. Every design gradient can use the checkpointed, reversible,
+  PML-reversible or disk-tiled adjoint (`method=`), and dispersive layouts
+  around the design region are supported. See `docs/optimization.rst`.
 - **Memory planning**: per-array `float32`/`float64` precision (the stepping
   arrays share one dtype; monitor storage may differ) and a memory planner
   (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)
@@ -192,11 +206,14 @@ demand rather than grabbing most of the card up front.
 - A grid whose fields don't fit in device memory runs disk-tiled
   (`sim.run(disk_tiled=True)`, or automatically with a warning): fields live in
   memmaps on disk and stream through the device in x-slabs, several steps per
-  load. It matches the in-memory result to ~1e-14 but is forward-only (no
-  adjoint), has no dispersive media, and is a few times slower (2.3–5.6× on a
-  3.5M-cell grid). Monitor outputs stay in RAM, so use `plane_z=` /
-  `downsample=` / `DFTMonitor` to keep them small. `estimate_memory` sizes both
-  modes before you start.
+  load. It matches the in-memory result to ~1e-14 and is a few times slower
+  (2.3–5.6× on a 3.5M-cell grid). The tiled adjoint
+  (`jax_value_and_grad_eps_tiled`) checkpoints the state to disk, about
+  2·√(n_steps / steps_per_tile) copies, and costs about two forward runs plus
+  the VJPs; it does not support subpixel smoothing. Monitor outputs and the
+  returned gradient stay in RAM, so use `plane_z=` / `downsample=` /
+  `DFTMonitor` to keep the outputs small. `estimate_memory` sizes every mode
+  before you start.
 - The effective-index method assumes the vertical mode is separable from the
   in-plane confinement — good for routing, poor for deep sub-wavelength gaps
   and out-of-plane diffraction. EME is 2-D, single-polarisation, straight-axis

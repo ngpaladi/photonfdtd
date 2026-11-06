@@ -133,16 +133,77 @@ def test_gradient_checkpointing_matches_plain_grad():
         assert np.allclose(g0, g1, rtol=1e-10, atol=1e-12 * np.abs(g0).max())
 
 
-def test_grad_eps_guards_on_new_features():
-    """value_and_grad_eps differentiates scalar eps_r only; it must refuse the
-    remapped-coefficient cases rather than return a silently-wrong gradient."""
+def _drude_slab_sim(eps_r=None):
     grid = pf.Grid(size=(3e-6,), cell_size=1e-7, pml_layers=(8,))
     box = pf.Box(center=(0.0,), size=(1e-6,),
-                 medium=DispersiveMedium.drude(1.0, 100e12, 5e12))
+                 medium=DispersiveMedium.drude(1.3, 100e12, 5e12))
     src = pf.PointDipole(position=(-0.8e-6,), component="Ez",
                          waveform=pf.GaussianPulse(freq0=200e12, fwhm=8e-15))
     mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[200e12])
     sim = pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
-                        run_time=20e-15)
-    with pytest.raises(NotImplementedError):
+                        run_time=60e-15)
+    if eps_r is not None:
+        sim.eps_r = eps_r
+    return sim
+
+
+def test_grad_eps_dispersive_cell_matches_fd():
+    """In a dispersive cell eps_r is eps_inf, which scales both the curl
+    update and the polarization correction; the gradient must include both.
+    Checked against a Richardson-extrapolated central difference at a cell
+    inside the Drude slab (a gradient that held the correction's 1/eps_inf
+    fixed is off there by far more than the tolerance)."""
+    jax.config.update("jax_enable_x64", True)
+    loss = lambda out: jnp.sum(jnp.abs(out["dft"]["d"]["Ez"]) ** 2)
+    sim = _drude_slab_sim()
+    _, g = pf.jax_value_and_grad_eps(sim, loss, remat="none")
+    eps0 = np.array(sim.eps_r)
+    c = (int(np.argmin(np.abs(sim.grid.coords[0] - 0.2e-6))), 0, 0)
+    assert eps0[c] == 1.3 and g[c] != 0.0
+
+    def val(d):
+        e = eps0.copy()
+        e[c] += d
+        return pf.jax_value_and_grad_eps(_drude_slab_sim(e), loss, remat="none")[0]
+
+    h = 1e-3
+    fd = lambda h: (val(h) - val(-h)) / (2 * h)
+    fd = (4 * fd(h) - fd(2 * h)) / 3
+    assert abs(g[c] - fd) <= 1e-8 * abs(fd)
+
+
+def test_grad_eps_rejects_subpixel():
+    """value_and_grad_eps differentiates scalar eps_r only; it must refuse the
+    smoothed-tensor case rather than return a silently-wrong gradient."""
+    sim = case_subpixel_sim()
+    with pytest.raises(NotImplementedError, match="subpixel"):
         pf.jax_value_and_grad_eps(sim, lambda out: out["dft"]["d"]["Ez"].real.sum())
+
+
+def case_subpixel_sim():
+    grid = pf.Grid(size=(1e-6, 1e-6), cell_size=1e-7, pml_layers=(3, 3, 0))
+    box = pf.Box(center=(0.05e-6, 0), size=(0.33e-6, 0.3e-6),
+                 medium=pf.Medium.from_index(2.0))
+    src = pf.PointDipole(position=(-0.3e-6, 0), component="Ez",
+                         waveform=pf.GaussianPulse(freq0=200e12, fwhm=8e-15))
+    mon = pf.DFTMonitor(name="d", components=("Ez",), freqs=[200e12])
+    return pf.Simulation(grid, structures=[box], sources=[src], monitors=[mon],
+                         run_time=5e-15, subpixel=True)
+
+
+def test_grad_params_dispersive_matches_grad_eps():
+    """value_and_grad_params with the identity coefficient map reproduces the
+    eps_r gradient (chain-ruled through ce = dt/(eps*EPS_0)) on a dispersive
+    run, so the polarization correction follows the given coefficient."""
+    jax.config.update("jax_enable_x64", True)
+    from photonfdtd.jaxbackend import value_and_grad_params
+    loss = lambda out: jnp.sum(jnp.abs(out["dft"]["d"]["Ez"]) ** 2)
+    sim = _drude_slab_sim()
+    v0, g0 = pf.jax_value_and_grad_eps(sim, loss, remat="none")
+    eps = np.asarray(sim.eps_r)
+    ce0 = jnp.asarray(sim.dt / (eps * pf.EPS_0))
+    v1, gp = value_and_grad_params(sim, lambda p: {c: p for c in ("Ex", "Ey", "Ez")},
+                                   ce0, loss, remat="none")
+    g1 = np.asarray(gp) * (-np.asarray(ce0) / eps)
+    assert abs(v1 - v0) <= 1e-14 * abs(v0)
+    assert np.abs(g1 - g0).max() <= 1e-12 * np.abs(g0).max()

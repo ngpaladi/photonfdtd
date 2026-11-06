@@ -185,6 +185,9 @@ a 3-D design grid, which is often the difference between "fits" and "doesn't."
    loss = lambda out: -abs(mode_overlap(out))**2          # e.g. -|S21|^2
    value, grad = pf.value_and_grad_density(sim, ec, rho, loss)  # grad is (nx, ny)
 
+To optimize only a box of a real layout, run the loop, keep the design robust
+to etch errors, or export GDS, see :doc:`optimization`.
+
 Memory notes
 ------------
 
@@ -205,7 +208,7 @@ its bounding box:
   recompute the rest, and pay ~2x compute for O(sqrt(n_steps)) memory (measured
   ~3-4x lower peak on a few-thousand-step run) — same gradient, to the bit.
 * **Reversible adjoint (O(1) in timesteps).** Here is the nicer trick, when you
-  can use it. A lossless, non-dispersive run with **no absorbing boundaries**
+  can use it. A lossless run with **no absorbing boundaries**
   (``pml_layers`` all zero — closed or periodic domains: resonators, photonic
   crystals, periodic metasurfaces) is *exactly* time-reversible, so
   :func:`~photonfdtd.jax_value_and_grad_eps_reversible` rebuilds the whole forward
@@ -213,7 +216,11 @@ its bounding box:
   no longer cares how many steps you took. Forward-then-reverse returns to
   machine precision, the gradient matches the plain reverse pass to ~1e-15, and
   peak memory came in **14x below the plain adjoint and ~4x below checkpointing**
-  on a ~1800-step 3-D run (``tests/test_reversible.py``). There is a PML variant
+  on a ~1800-step 3-D run (``tests/test_reversible.py``). Dispersive media are
+  fine as long as every pole is lossless (``gamma == 0``, which covers Sellmeier
+  glasses like :func:`~photonfdtd.silica`): the pole recursion is then inverted
+  exactly. A lossy pole would amplify roundoff on the way back, so it is
+  refused. There is a PML variant
   too (:func:`~photonfdtd.jax_value_and_grad_eps_reversible_pml`) that
   reconstructs the interior and replays a per-step PML-shell tape, and it gives
   the exact gradient with CPML — but I'll be straight with you: the tape is
@@ -223,13 +230,18 @@ its bounding box:
   to reach for.
 * **Planning a big run.** :func:`~photonfdtd.estimate_memory` /
   :func:`~photonfdtd.recommend_mode` / :func:`~photonfdtd.format_report` estimate
-  the peak bytes of each mode (forward and the three adjoints) and pick one that
-  fits your budget — so you find out a run won't fit *before* it OOMs, not
-  after. ``recommend_mode`` defaults its budget to what
+  the peak bytes of each mode (forward, the three in-memory adjoints, and the
+  disk-tiled forward run and adjoint) and pick one that fits your budget — so
+  you find out a run won't fit *before* it OOMs, not after. ``recommend_mode`` defaults its budget to what
   :func:`~photonfdtd.available_memory` detects on the machine (GPU VRAM if there
-  is one, else host RAM). A forward run that doesn't fit can stream from disk
-  (``"disk_tiled"``, see :doc:`backends`); an adjoint has to fit on the device,
-  and ``"infeasible"`` means it doesn't.
+  is one, else host RAM). A forward run or an adjoint that doesn't fit can
+  stream from disk (``"disk_tiled"`` and ``"adjoint_disk_tiled"``, see
+  :doc:`backends`); ``"infeasible"`` means not even one slab fits.
+* **Dispersive gradients.** Every adjoint above handles dispersive media with
+  the poles held fixed. In a dispersive cell ``eps_r`` is ``eps_inf``, which
+  scales both the curl update and the polarization correction, and the gradient
+  includes both (checked against finite differences inside a Drude slab,
+  ``tests/test_jax_accuracy.py``).
 
 References:
 

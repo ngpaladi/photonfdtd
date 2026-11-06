@@ -29,8 +29,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7.4"]
+test = ["pytest>=7.4", "gdstk"]
 docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
+# GDS export of optimized designs; optax optimizers for the design loops.
+gds = ["gdstk"]
+optim = ["optax"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"

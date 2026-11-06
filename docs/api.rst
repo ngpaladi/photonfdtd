@@ -108,6 +108,21 @@ Inverse design
 
 .. automodule:: photonfdtd.design
 
+Optimization loops
+------------------
+
+.. automodule:: photonfdtd.optimize
+
+Training a chip
+---------------
+
+.. automodule:: photonfdtd.train
+
+GDS export
+----------
+
+.. automodule:: photonfdtd.gds
+
 Layout-scale methods
 --------------------
 
