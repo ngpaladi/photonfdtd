@@ -21,6 +21,7 @@ don't. See :doc:`api` for the full reference.
    backends
    accuracy
    optimization
+   training_tutorial
    layout_scale
    examples
    api

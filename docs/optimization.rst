@@ -162,6 +162,8 @@ batch or the dataset**.
                   validation=(Xv, Yv))
    print(pf.accuracy(model.predict(res.x, Xv, beta=16), Yv))
 
+:doc:`training_tutorial` goes through a complete run step by step.
+
 The tests check the shortcut against brute force:
 
 * ``T @ x`` matches a direct run with all inputs driven together to 1e-10;
