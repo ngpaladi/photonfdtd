@@ -85,7 +85,12 @@ def _sidewall_eps(rp, eps_solid, eps_void, dx, dy):
     # In-plane surface normal from the density gradient (vertical sidewalls).
     gx = jnp.gradient(rp, dx, axis=0) if rp.shape[0] > 1 else jnp.zeros_like(rp)
     gy = jnp.gradient(rp, dy, axis=1) if rp.shape[1] > 1 else jnp.zeros_like(rp)
-    gmag = jnp.sqrt(gx ** 2 + gy ** 2)
+    # sqrt has an infinite derivative at 0, and 0 * inf = NaN in the backward
+    # pass; uniform patches (gradient exactly 0) are common, so take the
+    # square root only where it is positive. Same values either way.
+    gsq = gx ** 2 + gy ** 2
+    pos = gsq > 0
+    gmag = jnp.where(pos, jnp.sqrt(jnp.where(pos, gsq, 1.0)), 0.0)
     safe = gmag > (jnp.max(gmag) * 1e-9 + 1e-30)
     inv = jnp.where(safe, 1.0 / jnp.where(safe, gmag, 1.0), 0.0)
     nxc, nyc = gx * inv, gy * inv
