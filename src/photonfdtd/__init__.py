@@ -23,6 +23,10 @@ Capabilities:
 - JAX/XLA time stepping (CPU / GPU / TPU from one code path), differentiable
   with checkpointed and reversible time-domain adjoints, and a 2-D etch-density inverse-design pipeline
   (:mod:`photonfdtd.design`)
+- Gradient-descent geometry optimization (:mod:`photonfdtd.optimize`): design
+  regions, parametric shapes, Adam / optax, beta continuation, robust
+  (eroded/dilated) objectives, GDS export (:mod:`photonfdtd.gds`), and
+  training a chip like a neural network on a dataset (:mod:`photonfdtd.train`)
 - :func:`from_gdsfactory` adapter that turns a gdsfactory Component into a
   fully-built Simulation
 
@@ -66,7 +70,15 @@ from .eme import Section, EMEResult, eme_2d, sections_from_eps
 from .adi import ADISimulation2D, ADISource, ADIResult
 from .design import (
     EtchedCore, value_and_grad_density, conic_filter, tanh_projection,
+    DesignRegion, ShapeDesign, polygon_density,
 )
+from .jaxbackend import make_value_and_grad_params, value_and_grad_params
+from .optimize import (
+    Adam, minimize, OptResult, beta_continuation, binarization, robust,
+    ModeTransmission, FieldProjection, combine,
+)
+from .train import PhotonicModel, train, fit_transfer, accuracy
+from .gds import export_gds
 from .memory import (
     estimate_memory, recommend_mode, format_report, available_memory,
 )
@@ -93,6 +105,12 @@ __all__ = [
     "Section", "EMEResult", "eme_2d", "sections_from_eps",
     "ADISimulation2D", "ADISource", "ADIResult",
     "EtchedCore", "value_and_grad_density", "conic_filter", "tanh_projection",
+    # geometry optimization and chip training
+    "DesignRegion", "ShapeDesign", "polygon_density",
+    "make_value_and_grad_params", "value_and_grad_params",
+    "Adam", "minimize", "OptResult", "beta_continuation", "binarization",
+    "robust", "ModeTransmission", "FieldProjection", "combine",
+    "PhotonicModel", "train", "fit_transfer", "accuracy", "export_gds",
     "estimate_memory", "recommend_mode", "format_report", "available_memory",
     "adapters", "from_gdsfactory",
 ]
