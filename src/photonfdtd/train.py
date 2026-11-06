@@ -57,13 +57,20 @@ class PhotonicModel:
     detection : {'power', 'coherent'}
         ``'power'`` returns ``sum_f |a|**2`` per output port, shape (B, M);
         ``'coherent'`` the complex amplitudes, shape (B, n_freq, M).
+    method : {'checkpoint', 'reversible', 'reversible_pml', 'tiled'}
+        The adjoint, as for :func:`~photonfdtd.make_value_and_grad_params`
+        (``remat`` / ``checkpoint_levels`` apply to ``'checkpoint'``,
+        ``tiled_options`` to ``'tiled'``). With ``'tiled'`` the N port
+        simulations are disk-backed and run one after another.
     """
 
     def __init__(self, sims: Sequence, design, readouts: Sequence,
                  detection: str = "power", remat: str = "nested",
-                 checkpoint_levels: int = 2):
+                 checkpoint_levels: int = 2, method: str = "checkpoint",
+                 tiled_options=None):
         import jax
-        from .jaxbackend import _prepare
+        from .jaxbackend import _check_method, _run_fn
+        _check_method(method)
         if detection not in ("power", "coherent"):
             raise ValueError("detection must be 'power' or 'coherent'")
         self.sims = list(sims)
@@ -78,10 +85,13 @@ class PhotonicModel:
                                  "time step, run time and structures")
         self.readouts = list(readouts)
         self.detection = detection
-        self.remat, self.levels = remat, checkpoint_levels
+        self.method = method
+        self.tiled_options = tiled_options
         self.ce_of = _ce_of(design, s0)
-        self.preps = [_prepare(s) for s in self.sims]
-        self._T_jit = jax.jit(self._transfer)
+        if method != "tiled":
+            self.runs = [_run_fn(s, method, remat, checkpoint_levels)
+                         for s in self.sims]
+            self._T_jit = jax.jit(self._transfer)
 
     @property
     def n_inputs(self) -> int:
@@ -91,20 +101,45 @@ class PhotonicModel:
     def n_outputs(self) -> int:
         return len(self.readouts)
 
-    def _transfer(self, params, aux):
+    def _T_of_outs(self, outs):
+        """Transfer matrix (F, M, N) from the N port simulations' outputs."""
         import jax.numpy as jnp
-        from .jaxbackend import _simulate_out
+        return jnp.stack([jnp.stack([jnp.atleast_1d(r.amplitude(out))
+                                     for r in self.readouts], axis=-1)
+                          for out in outs], axis=-1)
+
+    def _transfer(self, params, aux):
         ce = self.ce_of(params, **aux)
-        cols = []
-        for sim, prep in zip(self.sims, self.preps):
-            out = _simulate_out(sim, prep, ce, self.remat, self.levels)
-            cols.append(jnp.stack([jnp.atleast_1d(r.amplitude(out))
-                                   for r in self.readouts], axis=-1))
-        return jnp.stack(cols, axis=-1)                    # (F, M, N)
+        return self._T_of_outs([run(ce) for run in self.runs])
 
     def transfer(self, params, **aux):
         """The transfer matrix ``T`` (n_freq, M, N) for weights ``params``."""
-        return self._T_jit(params, aux)
+        if self.method != "tiled":
+            return self._T_jit(params, aux)
+        import jax
+        from .tiled import _TiledAdjoint
+        with jax.default_device(jax.devices("cpu")[0]):
+            ce = self.ce_of(params, **aux)
+        ce = {c: np.asarray(ce[c]) for c in ("Ex", "Ey", "Ez")}
+        outs = []
+        for s in self.sims:
+            with _TiledAdjoint(s, ce, **dict(self.tiled_options or {})) as a:
+                outs.append(a.forward())
+        return self._T_of_outs(outs)
+
+    def value_and_grad(self, f, has_aux=False):
+        """``vg(params, aux, *extra)``: value and gradient of
+        ``f(T, *extra)`` w.r.t. the weights, through the model's adjoint
+        (compiled once for the in-memory methods)."""
+        import jax
+        if self.method == "tiled":
+            from .jaxbackend import _tiled_value_and_grad
+            return _tiled_value_and_grad(
+                self.sims, self.ce_of,
+                lambda outs, *e: f(self._T_of_outs(outs), *e),
+                self.tiled_options, has_aux=has_aux)
+        return jax.jit(jax.value_and_grad(
+            lambda p, a, *e: f(self._transfer(p, a), *e), has_aux=has_aux))
 
     def apply(self, T, X):
         """Model output for inputs ``X`` given a transfer matrix ``T``.
@@ -206,17 +241,17 @@ def train(model: PhotonicModel, params0, X, Y, loss="cross_entropy",
         raise ValueError("batch_size must be in [1, len(X)]")
     steps_per_epoch = n // bs
 
-    def batch_loss(params, idx, aux):
-        pred = model.apply(model._transfer(params, aux), Xj[idx])
+    def batch_loss(T, idx):
+        pred = model.apply(T, Xj[idx])
         y = Yj[idx]
         acc = (jnp.mean(jnp.argmax(pred, -1) == y) if classify
                else jnp.zeros([]))
         return lossf(pred, y), acc
 
-    fn = jax.jit(jax.value_and_grad(batch_loss, has_aux=True))
+    fn = model.value_and_grad(batch_loss, has_aux=True)
 
     def vg(x, batch, epoch, **aux):
-        (val, acc), g = fn(x, batch, aux)
+        (val, acc), g = fn(x, aux, batch)
         return val, g, ({"accuracy": acc} if classify else {})
 
     def sched(it):
@@ -259,8 +294,7 @@ def fit_transfer(model: PhotonicModel, params0, target_T, global_phase=True,
     if not np.any(np.asarray(target_T)):
         raise ValueError("target_T must not be all zero")
 
-    def loss_T(params, aux):
-        T = model._transfer(params, aux)
+    def loss_T(T):
         tt = jnp.broadcast_to(t, T.shape).astype(T.dtype)
         if global_phase:
             err = (jnp.sum(jnp.abs(T) ** 2) + jnp.sum(jnp.abs(tt) ** 2)
@@ -271,7 +305,7 @@ def fit_transfer(model: PhotonicModel, params0, target_T, global_phase=True,
         # eps would otherwise swamp the gradient of a tiny raw loss).
         return err / jnp.sum(jnp.abs(tt) ** 2)
 
-    fn = jax.jit(jax.value_and_grad(loss_T))
+    fn = model.value_and_grad(loss_T)
 
     def vg(x, **aux):
         return fn(x, aux)

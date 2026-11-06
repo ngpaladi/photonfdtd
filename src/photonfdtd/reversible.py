@@ -259,14 +259,15 @@ def _make_reversible(sim, static, plans, ce_e, ade=None):
     return init_carry, forward_step, reverse_step, extract_outputs
 
 
-def value_and_grad_eps_reversible(sim, loss):
-    """``(value, d loss / d eps_r)`` via the reversible adjoint - O(1) memory in
-    the number of timesteps.
+def reversible_run(sim):
+    """``ce_e -> {'fields', 'dft', 'flux'}``, differentiable with the
+    reversible adjoint (O(1) memory in the number of timesteps).
 
-    Same contract as :func:`photonfdtd.jax_value_and_grad_eps` but the backward
-    pass reconstructs the forward field history by stepping the physics backward
-    (see module docstring) instead of storing or recomputing it. Requires
-    :func:`reversible_available`; raises otherwise.
+    ``ce_e`` is a dict ``{'Ex','Ey','Ez'}`` of per-component E-update
+    coefficients, as for :func:`photonfdtd.jaxbackend.value_and_grad_params`;
+    ``jax.grad`` through the returned function reconstructs the forward
+    history by stepping the physics backward. Requires
+    :func:`reversible_available`.
     """
     import jax
     import jax.numpy as jnp
@@ -277,7 +278,6 @@ def value_and_grad_eps_reversible(sim, loss):
         raise NotImplementedError(why + "; use jax_value_and_grad_eps instead.")
     _validate(sim)
     _enable_x64_if_needed(sim)
-    npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
     ade = _build_ade_jax(sim, static)
@@ -319,9 +319,29 @@ def value_and_grad_eps_reversible(sim, loss):
 
     rev_run.defvjp(rev_fwd, rev_bwd)
 
+    def run(ce_e):
+        out = rev_run(dict(ce_e))
+        return {"fields": {}, "dft": out["dft"], "flux": out["flux"]}
+    return run
+
+
+def value_and_grad_eps_reversible(sim, loss):
+    """``(value, d loss / d eps_r)`` via the reversible adjoint - O(1) memory in
+    the number of timesteps.
+
+    Same contract as :func:`photonfdtd.jax_value_and_grad_eps` but the backward
+    pass reconstructs the forward field history by stepping the physics backward
+    (see module docstring) instead of storing or recomputing it. Requires
+    :func:`reversible_available`; raises otherwise.
+    """
+    import jax
+    import jax.numpy as jnp
+    run = reversible_run(sim)
+    npdt = np.dtype(sim.dtypes["Ex"])
+
     def loss_of_eps(eps_r):
         ce = sim.dt / (eps_r * EPS_0)
-        return loss(rev_run({c: ce for c in ("Ex", "Ey", "Ez")}))
+        return loss(run({c: ce for c in ("Ex", "Ey", "Ez")}))
 
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)

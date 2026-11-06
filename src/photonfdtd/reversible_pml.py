@@ -232,18 +232,14 @@ def make_pml_reversible(sim, static, plans, ce_e, ade=None):
     return init_carry, forward_step, reverse_step, shell_of
 
 
-def value_and_grad_eps_reversible_pml(sim, loss):
-    """``(value, d loss / d eps_r)`` via the PML-shell reversible adjoint.
+def reversible_pml_run(sim):
+    """``ce_e -> {'fields', 'dft', 'flux'}``, differentiable with the
+    PML-shell reversible adjoint.
 
-    Same contract as :func:`photonfdtd.jax_value_and_grad_eps`, valid for a
-    lossless run *with* CPML (non-dispersive, or dispersive with lossless
-    poles). The backward pass reconstructs the forward history by
-    reverse-stepping the interior and replaying the stored PML shell (see
-    module docstring). DFT/Flux monitors only.
-
-    Note: this reference implementation stores the shell densely (full-grid,
-    zero off-PML); gathering it to the PML cells only (O(surface*n_steps)) is a
-    mechanical memory optimization on top of the validated reconstruction.
+    The per-component counterpart of :func:`value_and_grad_eps_reversible_pml`
+    (same requirements: lossless poles, no moving charges, DFT/Flux monitors
+    only), for design gradients through
+    :func:`photonfdtd.jaxbackend.make_value_and_grad_params`.
     """
     import jax
     import jax.numpy as jnp
@@ -260,7 +256,6 @@ def value_and_grad_eps_reversible_pml(sim, loss):
             raise NotImplementedError("reversible PML adjoint: DFT/Flux monitors only.")
     _validate(sim)
     _enable_x64_if_needed(sim)
-    npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
     ade = _build_ade_jax(sim, static)
@@ -306,9 +301,33 @@ def value_and_grad_eps_reversible_pml(sim, loss):
 
     rev_run.defvjp(rev_fwd, rev_bwd)
 
+    def run(ce_e):
+        out = rev_run(dict(ce_e))
+        return {"fields": {}, "dft": out["dft"], "flux": out["flux"]}
+    return run
+
+
+def value_and_grad_eps_reversible_pml(sim, loss):
+    """``(value, d loss / d eps_r)`` via the PML-shell reversible adjoint.
+
+    Same contract as :func:`photonfdtd.jax_value_and_grad_eps`, valid for a
+    lossless run *with* CPML (non-dispersive, or dispersive with lossless
+    poles). The backward pass reconstructs the forward history by
+    reverse-stepping the interior and replaying the stored PML shell (see
+    module docstring). DFT/Flux monitors only.
+
+    Note: this reference implementation stores the shell densely (full-grid,
+    zero off-PML); gathering it to the PML cells only (O(surface*n_steps)) is a
+    mechanical memory optimization on top of the validated reconstruction.
+    """
+    import jax
+    import jax.numpy as jnp
+    run = reversible_pml_run(sim)
+    npdt = np.dtype(sim.dtypes["Ex"])
+
     def loss_of_eps(eps_r):
         ce = sim.dt / (eps_r * EPS_0)
-        return loss(rev_run({c: ce for c in ("Ex", "Ey", "Ez")}))
+        return loss(run({c: ce for c in ("Ex", "Ey", "Ez")}))
 
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
     val, grad = jax.value_and_grad(loss_of_eps)(eps0)

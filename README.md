@@ -172,7 +172,9 @@ print(result.n_eff)            # array of effective indices
   (`export_gds`, optional `gdstk`). `train` fits a chip to a dataset like a
   neural network: the chip is linear, so one simulation per input port gives its
   transfer matrix and a training step costs N forward + N adjoint runs however
-  big the batch. See `docs/optimization.rst`.
+  big the batch. Every design gradient can use the checkpointed, reversible,
+  PML-reversible or disk-tiled adjoint (`method=`), and dispersive layouts
+  around the design region are supported. See `docs/optimization.rst`.
 - **Memory planning**: per-array `float32`/`float64` precision (the stepping
   arrays share one dtype; monitor storage may differ) and a memory planner
   (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)

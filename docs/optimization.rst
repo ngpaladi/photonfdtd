@@ -173,20 +173,73 @@ or a DFT, :func:`~photonfdtd.fit_transfer` minimizes the relative mismatch
 ``||T - T_target||**2``, with the arbitrary global phase factored out.
 
 Training memory scales with the number of input ports, because the ``N``
-adjoints are taken together inside one ``jax.value_and_grad``. Each of them
-uses the usual two-level checkpointing.
+adjoints are taken together inside one ``jax.value_and_grad``. With
+``method="tiled"`` the port simulations are disk-backed instead (see below).
+
+Choosing an adjoint
+-------------------
+
+Every design gradient here (:func:`~photonfdtd.make_value_and_grad_params`,
+and through it :func:`~photonfdtd.minimize` and :func:`~photonfdtd.robust`,
+plus :class:`~photonfdtd.PhotonicModel`, :func:`~photonfdtd.train` and
+:func:`~photonfdtd.fit_transfer`) takes a ``method``. All four give the same
+gradient to rounding error (``tests/test_optimize.py`` checks each against the
+default to 1e-10), so the choice is purely about memory:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 40 42
+
+   * - ``method``
+     - Memory
+     - Restrictions
+   * - ``"checkpoint"`` (default)
+     - about ``sqrt(n_steps)`` field states on the device
+     - none
+   * - ``"reversible"``
+     - independent of ``n_steps``: the backward pass steps the physics
+       backward
+     - no PML; lossless dispersion poles only; no moving charges; DFT and
+       flux monitors only
+   * - ``"reversible_pml"``
+     - the reversible pass plus a stored PML-shell tape, currently held as
+       a full grid array per step
+     - as ``"reversible"``, but with PML
+   * - ``"tiled"``
+     - the device holds one x-slab; field states and checkpoints live on
+       disk
+     - none; ``tiled_options`` sets the slab size, steps per slab, scratch
+       directory and checkpoint spacing
+
+With ``"tiled"`` the coefficient builder runs on the CPU, so the three
+coefficient arrays and their cotangents sit in host RAM, and each iteration is
+a host loop over compiled slab updates rather than one compiled program. Because
+the design hands the tiled run its own per-component coefficients, a
+subpixel-smoothed layout works too, which the scalar
+:func:`~photonfdtd.jax_value_and_grad_eps_tiled` cannot do.
+
+.. code-block:: python
+
+   vg = pf.make_value_and_grad_params(
+       sim, region.ce_builder(sim), loss, method="tiled",
+       tiled_options=dict(steps_per_tile=8, workdir="/scratch/run"))
+
+Dispersive layouts
+------------------
+
+Dispersive materials (metals, or the frequency-dependent glass and
+semiconductor models) can sit anywhere on the chip around a design region, and
+are differentiated with their poles held fixed. The design region itself must
+be a plain dielectric, and building one that overlaps a dispersive structure
+raises an error. The reversible methods need lossless poles; lossy ones such as
+metals need ``"checkpoint"`` or ``"tiled"``.
 
 Limitations
 -----------
 
-* Design-region gradients use the in-memory checkpointed adjoint. The
-  disk-tiled and reversible adjoints differentiate a scalar ``eps_r`` only,
-  and are not yet wired to the per-component design coefficients.
-* The design-gradient path does not support dispersive media yet (the
-  simulation is rejected); dispersive cells inside a design region will stay
-  excluded even once it does.
 * :class:`~photonfdtd.ModeTransmission` ports must be normal to ``x``, like
   the mode solver.
+* The design region cannot contain dispersive material (see above).
 
 The worked examples 6 (a 1x2 splitter) and 7 (a phase classifier trained on a
 dataset) in :doc:`examples` run all of this end to end.

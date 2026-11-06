@@ -795,8 +795,83 @@ def _simulate_out(sim, prep, ce_e, remat="nested", checkpoint_levels=2):
     return _out_dict(sf, sd, sfx, plans)
 
 
+_METHODS = ("checkpoint", "reversible", "reversible_pml", "tiled")
+
+
+def _check_method(method):
+    if method not in _METHODS:
+        raise ValueError(f"method must be one of {_METHODS}, got {method!r}")
+
+
+def _run_fn(sim, method="checkpoint", remat="nested", checkpoint_levels=2):
+    """``ce_e -> out`` for ``sim``, differentiable with the chosen in-memory
+    adjoint (``'checkpoint'``, ``'reversible'`` or ``'reversible_pml'``)."""
+    _check_method(method)
+    if method == "checkpoint":
+        prep = _prepare(sim)
+        return lambda ce_e: _simulate_out(sim, prep, ce_e, remat,
+                                          checkpoint_levels)
+    if method == "reversible":
+        from .reversible import reversible_run
+        return reversible_run(sim)
+    if method == "reversible_pml":
+        from .reversible_pml import reversible_pml_run
+        return reversible_pml_run(sim)
+    raise ValueError("the tiled adjoint is not a JAX function; use "
+                     "_tiled_value_and_grad")
+
+
+def _tiled_value_and_grad(sims, ce_of_params, objective, tiled_options=None,
+                          has_aux=False):
+    """Design gradient through the disk-tiled adjoint, chained on the host.
+
+    Returns ``vg(params, aux, *extra)``. The coefficient builder runs (and is
+    pulled back) on the CPU, so the three coefficient arrays and their
+    cotangents live in host RAM; every simulation in ``sims`` runs forward
+    with them, ``objective(outs, *extra)`` is differentiated in JAX, and each
+    simulation's output cotangent is pulled back through its tiled adjoint.
+    """
+    import jax
+    import jax.numpy as jnp
+    from .tiled import _TiledAdjoint
+    opts = dict(tiled_options or {})
+    cpu = jax.devices("cpu")[0]
+
+    def vg(params, aux, *extra):
+        with jax.default_device(cpu):
+            p_cpu = jax.device_put(params, cpu)
+            ce, pull_p = jax.vjp(lambda p: ce_of_params(p, **aux), p_cpu)
+        ce_host = {c: np.asarray(ce[c]) for c in ("Ex", "Ey", "Ez")}
+        adjs = []
+        try:
+            for s in sims:
+                adjs.append(_TiledAdjoint(s, ce_host, **opts))
+            outs = [a.forward() for a in adjs]
+            if has_aux:
+                val, pull_o, aux_out = jax.vjp(lambda o: objective(o, *extra),
+                                               outs, has_aux=True)
+            else:
+                val, pull_o = jax.vjp(lambda o: objective(o, *extra), outs)
+            (g_outs,) = pull_o(jnp.ones((), jnp.asarray(val).dtype))
+            bar = {c: np.zeros_like(ce_host[c]) for c in ce_host}
+            for a, g in zip(adjs, g_outs):
+                b = a.backward(g, copy=False)
+                for c in bar:
+                    bar[c] += b[c]
+        finally:
+            for a in adjs:
+                a.close()
+        with jax.default_device(cpu):
+            (grad,) = pull_p({c: jnp.asarray(bar[c].astype(ce_host[c].dtype))
+                              for c in bar})
+        grad = jax.tree_util.tree_map(lambda x: jnp.asarray(np.asarray(x)), grad)
+        return ((val, aux_out), grad) if has_aux else (val, grad)
+    return vg
+
+
 def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
-                               checkpoint_levels=2, jit=True):
+                               checkpoint_levels=2, jit=True,
+                               method="checkpoint", tiled_options=None):
     """Compile ``params -> (value, d loss / d params)`` once, for a loop.
 
     The same contract as :func:`value_and_grad_params`, but the setup and the
@@ -805,15 +880,40 @@ def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
     ``beta``) are passed to ``ce_of_params(params, **aux)`` as *traced*
     values, so changing them between calls does not recompile; keep their
     shapes and dtypes fixed. ``vg`` returns ``(value, grad)`` as JAX arrays.
+
+    ``method`` picks the adjoint:
+
+    * ``'checkpoint'`` (default) - the in-memory run with two-level gradient
+      checkpointing (``remat``, ``checkpoint_levels``).
+    * ``'reversible'`` - O(1) memory in the number of timesteps by stepping
+      the physics backward; needs no PML, lossless poles, no moving charges,
+      DFT/Flux monitors only.
+    * ``'reversible_pml'`` - the same with CPML, replaying a stored PML-shell
+      tape; same restrictions apart from the PML.
+    * ``'tiled'`` - the disk-tiled adjoint, for grids whose adjoint does not
+      fit on the device; ``tiled_options`` go to it (``tile_cells``,
+      ``steps_per_tile``, ``workdir``, ``budget_bytes``,
+      ``checkpoint_every``). Not jitted as a whole (the time loop is a host
+      loop over compiled slab updates); the coefficient builder runs on the
+      CPU, so its three grid-sized arrays sit in host RAM.
+
+    All four agree to rounding error.
     """
     import jax
 
-    prep = _prepare(sim)
+    _check_method(method)
+    if method == "tiled":
+        tvg = _tiled_value_and_grad([sim], ce_of_params,
+                                    lambda outs: loss(outs[0]), tiled_options)
+
+        def vg(params, **aux):
+            return tvg(params, aux)
+        return vg
+
+    run = _run_fn(sim, method, remat, checkpoint_levels)
 
     def loss_of_params(params, aux):
-        out = _simulate_out(sim, prep, ce_of_params(params, **aux),
-                            remat, checkpoint_levels)
-        return loss(out)
+        return loss(run(ce_of_params(params, **aux)))
 
     fn = jax.value_and_grad(loss_of_params)
     fn = jax.jit(fn) if jit else fn
@@ -824,7 +924,8 @@ def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
 
 
 def value_and_grad_params(sim, ce_of_params, params, loss,
-                          remat="nested", checkpoint_levels=2):
+                          remat="nested", checkpoint_levels=2,
+                          method="checkpoint", tiled_options=None):
     """Differentiate a monitor loss w.r.t. arbitrary design ``params``.
 
     ``ce_of_params(params)`` must return a dict ``{'Ex','Ey','Ez'}`` of
@@ -842,11 +943,13 @@ def value_and_grad_params(sim, ce_of_params, params, loss,
     ``ce_of_params`` also scales the polarization correction (it plays the
     role of ``dt/(eps_inf*EPS_0)``), so map those cells to ``eps_inf``. For
     an optimization loop use :func:`make_value_and_grad_params`, which
-    compiles once.
+    compiles once. ``method`` and ``tiled_options`` select the adjoint, as
+    for :func:`make_value_and_grad_params`.
     """
     vg = make_value_and_grad_params(sim, lambda p: ce_of_params(p), loss,
                                     remat=remat,
                                     checkpoint_levels=checkpoint_levels,
-                                    jit=False)
+                                    jit=False, method=method,
+                                    tiled_options=tiled_options)
     val, grad = vg(params)
     return float(val), grad

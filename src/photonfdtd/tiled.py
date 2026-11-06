@@ -47,6 +47,10 @@ state is kept, and the chunks in between are recomputed segment by segment
 during the backward pass (about 2x the forward compute in total, plus the
 VJPs).
 
+Design gradients use the same machinery with the design's own per-component
+coefficients and return a cotangent per component, through
+``make_value_and_grad_params(..., method="tiled")``.
+
 Scope
 -----
 One precision for all stepping arrays. Supported: point and expanded soft
@@ -201,7 +205,7 @@ class _Tiled:
     """
 
     def __init__(self, sim, tile_cells, steps_per_tile, workdir, budget_bytes,
-                 adjoint=False):
+                 adjoint=False, ce=None):
         import jax.numpy as jnp
         from .simulation import Result
 
@@ -274,15 +278,21 @@ class _Tiled:
         # ------------------------------------------------------------------ #
         # E-update coefficients on disk.
         # ------------------------------------------------------------------ #
-        def ce_mm(name, eps):
+        def ce_mm(name, eps, coeff=False):
             a = self._mm(name, (px, ny, nz))
             for g0 in range(0, nx, T):
                 g1 = min(nx, g0 + T)
-                a[h + g0:h + g1] = (dt / (np.asarray(eps[g0:g1], dtype=npdt)
-                                          * EPS_0)).astype(npdt)
+                blk = np.asarray(eps[g0:g1], dtype=npdt)
+                a[h + g0:h + g1] = blk if coeff else \
+                    (dt / (blk * EPS_0)).astype(npdt)
             return a
 
-        if sim.subpixel:
+        if ce is not None:
+            # Caller-supplied per-component coefficients (a design); moving
+            # charges deposit with the Ex coefficient, as in the in-memory run.
+            self.ce_disk = {c: ce_mm("ce_" + c, ce[c], coeff=True) for c in _E}
+            self.ce_disk["particle"] = self.ce_disk["Ex"]
+        elif sim.subpixel:
             smoothed = sim._smoothed_eps_components()
             self.ce_disk = {c: ce_mm("ce_" + c, e) for c, e in zip(_E, smoothed)}
             del smoothed
@@ -788,7 +798,8 @@ class _Tiled:
                 n = tile["hi"] - tile["lo"]
                 bar_in["pol"][..., tile["lo"]:tile["hi"]] += np.stack(
                     [np.asarray(polb[0]), np.asarray(polb[1])])[..., :n]
-            bar_ce[b0:b0 + L] += sum(np.asarray(v) for v in bar_c.values())
+            for key, v in bar_c.items():       # shared arrays share a buffer
+                bar_ce[key][b0:b0 + L] += np.asarray(v)
 
     def outputs(self):
         """The collected monitor outputs as a :class:`Result`."""
@@ -917,6 +928,98 @@ def _out_jax(result):
             "flux": {n: jnp.asarray(v) for n, v in result.flux.items()}}
 
 
+class _TiledAdjoint:
+    """A disk-tiled forward run that can then be pulled back.
+
+    ``forward()`` runs the simulation, keeping chunk checkpoints on disk, and
+    returns the loss-facing output dict; ``backward(g)`` takes that dict's
+    cotangent and returns the cotangent of the E-update coefficients,
+    ``{'Ex','Ey','Ez'}`` host arrays of the grid's shape (arrays that share a
+    coefficient - e.g. all three without subpixel smoothing - share one,
+    total, cotangent). ``ce`` optionally supplies the coefficients (a design);
+    by default they come from ``sim`` as in :func:`run_tiled`. Close it (or
+    use it as a context manager) to remove the scratch files.
+    """
+
+    def __init__(self, sim, ce=None, tile_cells=None, steps_per_tile=8,
+                 workdir=None, budget_bytes=None, checkpoint_every=None):
+        self.tr = tr = _Tiled(sim, tile_cells, steps_per_tile, workdir,
+                              budget_bytes, adjoint=True, ce=ce)
+        try:
+            self.nc, self.C, _ = _adjoint_states(tr.n_steps, tr.K,
+                                                 checkpoint_every)
+            n_ce = len({id(a) for a in tr.ce_disk.values()})
+            plane = tr.px * tr.ny * tr.nz * tr.npdt.itemsize
+            tr.check_disk(adjoint_disk_bytes(sim, tr.T, tr.K, self.C)
+                          + 2 * (n_ce - 1) * plane)
+        except BaseException:
+            tr.close()
+            raise
+        self._done = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self.tr.close()
+
+    def forward(self):
+        tr, nc, C, K = self.tr, self.nc, self.C, self.tr.K
+        self.n_ck = n_ck = int(math.ceil(nc / C))
+        # States at chunks 0, C, 2C, ... are kept in their own files; the
+        # chunks in between step a working state in place.
+        self.ck = ck = [tr.new_state(f"ck{j}") for j in range(n_ck)]
+        work = tr.new_state("w")
+        cur = ck[0]
+        for c in range(nc):
+            nxt = ck[(c + 1) // C] if (c + 1) % C == 0 and c + 1 < nc else work
+            tr.forward_chunk(cur, nxt, c * K)
+            cur = nxt
+        self.result = tr.outputs()
+        return _out_jax(self.result)
+
+    def backward(self, g, copy=True):
+        """Cotangent of the coefficients; ``copy=False`` returns views of the
+        scratch memmaps (valid until :meth:`close`)."""
+        if self._done:
+            raise RuntimeError("backward() can only be called once")
+        self._done = True
+        tr, nc, C, K, ck = self.tr, self.nc, self.C, self.tr.K, self.ck
+        seg = [None] + [tr.new_state(f"seg{i}") for i in range(1, C)]
+        bar, bar_new = tr.new_state("bar"), tr.new_state("barn")
+        bufs = {}
+        for key, arr in tr.ce_disk.items():
+            if id(arr) not in bufs:
+                bufs[id(arr)] = tr._mm(f"bar_ce{len(bufs)}", (tr.px, tr.ny, tr.nz))
+        bar_ce = {key: bufs[id(arr)] for key, arr in tr.ce_disk.items()}
+        for s in range(self.n_ck - 1, -1, -1):
+            c0, c1 = s * C, min((s + 1) * C, nc)
+            seg[0] = ck[s]
+            for i in range(1, c1 - c0):        # recompute the segment's inputs
+                tr.forward_chunk(seg[i - 1], seg[i], (c0 + i - 1) * K,
+                                 collect=False)
+            for c in range(c1 - 1, c0 - 1, -1):
+                tr.zero(bar_new)
+                tr.vjp_chunk(seg[c - c0], bar, bar_new, bar_ce, c * K, g)
+                bar, bar_new = bar_new, bar
+        h, nx = tr.h, tr.nx
+        out, copied = {}, {}
+        for c in _E:
+            a = bar_ce[c]
+            if id(a) not in copied:
+                copied[id(a)] = np.array(a[h:h + nx]) if copy else a[h:h + nx]
+            out[c] = copied[id(a)]
+        return out
+
+    def ce(self, comp="Ex"):
+        """The coefficient of ``comp`` on the real planes (a memmap view)."""
+        tr = self.tr
+        return tr.ce_disk[comp][tr.h:tr.h + tr.nx]
+
+
 def value_and_grad_eps_tiled(sim, loss, tile_cells: Optional[int] = None,
                              steps_per_tile: int = 8,
                              workdir: Optional[str] = None,
@@ -945,48 +1048,15 @@ def value_and_grad_eps_tiled(sim, loss, tile_cells: Optional[int] = None,
         raise NotImplementedError(
             "value_and_grad_eps_tiled differentiates the scalar per-cell eps_r, "
             "which does not parameterize a subpixel-smoothed tensor.")
-    with _Tiled(sim, tile_cells, steps_per_tile, workdir, budget_bytes,
-                adjoint=True) as tr:
-        nc, C, _ = _adjoint_states(tr.n_steps, tr.K, checkpoint_every)
-        tr.check_disk(adjoint_disk_bytes(sim, tr.T, tr.K, C))
-        K = tr.K
-        n_ck = int(math.ceil(nc / C))
-
-        # Forward: states at chunks 0, C, 2C, ... are kept in their own files;
-        # the chunks in between step a working state in place.
-        ck = [tr.new_state(f"ck{j}") for j in range(n_ck)]
-        work = tr.new_state("w")
-        cur = ck[0]
-        for c in range(nc):
-            nxt = ck[(c + 1) // C] if (c + 1) % C == 0 and c + 1 < nc else work
-            tr.forward_chunk(cur, nxt, c * K)
-            cur = nxt
-        result = tr.outputs()
-        value, pull = jax.vjp(loss, _out_jax(result))
+    with _TiledAdjoint(sim, None, tile_cells, steps_per_tile, workdir,
+                       budget_bytes, checkpoint_every) as ta:
+        value, pull = jax.vjp(loss, ta.forward())
         (g,) = pull(np.ones((), np.asarray(value).dtype))
-
-        # Backward, segment by segment from the end.
-        seg = [None] + [tr.new_state(f"seg{i}") for i in range(1, C)]
-        bar, bar_new = tr.new_state("bar"), tr.new_state("barn")
-        bar_ce = tr._mm("bar_ce", (tr.px, tr.ny, tr.nz))
-        for s in range(n_ck - 1, -1, -1):
-            c0, c1 = s * C, min((s + 1) * C, nc)
-            seg[0] = ck[s]
-            for i in range(1, c1 - c0):        # recompute the segment's inputs
-                tr.forward_chunk(seg[i - 1], seg[i], (c0 + i - 1) * K,
-                                 collect=False)
-            for c in range(c1 - 1, c0 - 1, -1):
-                tr.zero(bar_new)
-                tr.vjp_chunk(seg[c - c0], bar, bar_new, bar_ce, c * K, g)
-                bar, bar_new = bar_new, bar
-
-        # d ce / d eps_r = -ce / eps_r, on the real planes.
-        h, nx, T = tr.h, tr.nx, tr.T
-        ce = tr.ce_disk["Ex"]
-        grad = np.empty(sim.grid.shape, tr.npdt)
+        bar = ta.backward(g, copy=False)["Ex"]   # shared coefficient: total
+        ce, T, npdt = ta.ce("Ex"), ta.tr.T, ta.tr.npdt
         eps = np.asarray(sim.eps_r)
-        for g0 in range(0, nx, T):
-            g1 = min(nx, g0 + T)
-            grad[g0:g1] = -bar_ce[h + g0:h + g1] * ce[h + g0:h + g1] \
-                / np.asarray(eps[g0:g1], tr.npdt)
+        grad = np.empty(sim.grid.shape, npdt)
+        for g0 in range(0, ta.tr.nx, T):         # d ce / d eps_r = -ce / eps_r
+            g1 = min(ta.tr.nx, g0 + T)
+            grad[g0:g1] = -bar[g0:g1] * ce[g0:g1] / np.asarray(eps[g0:g1], npdt)
         return float(value), grad

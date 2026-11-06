@@ -406,3 +406,120 @@ def test_fit_transfer_reduces_mismatch():
     target = s * np.array([[0.0, 1.0], [1.0, 0.0]])      # a crossing
     res = pf.fit_transfer(model, rho0, target, optimizer=pf.Adam(0.05), n_iter=12)
     assert res.history[-1]["value"] < 0.7 * res.history[0]["value"]
+
+
+# --------------------------------------------------------------------------- #
+# Dispersive layouts and the alternative adjoints
+# --------------------------------------------------------------------------- #
+
+LOSSLESS = pf.DispersiveMedium.lorentz(2.0, [(1.5, 1.4 * F0, 0.0),
+                                             (0.4, 0.7 * F0, 0.0)])
+DRUDE = pf.DispersiveMedium.drude(1.5, 1.2 * F0, 0.05 * F0)
+TILED = dict(tile_cells=9, steps_per_tile=4, checkpoint_every=5)
+
+
+def _dsim(medium=None, pml=6, subpixel=False, amps=(1.0, 0.0),
+          center=(-1.2e-6, 0)):
+    """``_sim`` plus, optionally, a dispersive block (by default between the
+    input stubs, outside the design region)."""
+    s = _sim(amps)
+    structures = list(s.structures)
+    if medium is not None:
+        structures.append(pf.Box(center=center, size=(0.32e-6, 0.24e-6),
+                                 medium=medium))
+    grid = pf.Grid(size=(3.2e-6, 2.4e-6), cell_size=DX, pml_layers=(pml, pml, 0))
+    return pf.Simulation(grid, structures=structures, sources=s.sources,
+                         monitors=s.monitors, run_time=40e-15,
+                         subpixel=subpixel)
+
+
+def _rel_err(a, b):
+    return float(jnp.max(jnp.abs(a - b)) / jnp.max(jnp.abs(b)))
+
+
+def test_design_gradient_with_dispersive_layout_matches_fd():
+    """A lossy Drude block elsewhere on the chip: the design gradient still
+    matches finite differences."""
+    sim = _dsim(DRUDE)
+    assert sim._has_dispersion
+    reg = _region()
+    vg = pf.make_value_and_grad_params(sim, reg.ce_builder(sim), _loss(sim))
+    rho = _rho(reg, sim)
+    v, g = vg(rho, beta=4.0)
+    h = 1e-4
+    i, j = rho.shape[0] // 2, rho.shape[1] // 2 + 3
+    fd = (float(vg(rho.at[i, j].add(h), beta=4.0)[0])
+          - float(vg(rho.at[i, j].add(-h), beta=4.0)[0])) / (2 * h)
+    assert float(g[i, j]) == pytest.approx(fd, rel=1e-6)
+    # And the dispersive block changes the answer (it is really simulated).
+    v0, _ = pf.make_value_and_grad_params(
+        _dsim(None), reg.ce_builder(_dsim(None)), _loss(sim))(rho, beta=4.0)
+    assert abs(float(v) - float(v0)) > 1e-6 * abs(float(v0))
+
+
+def test_region_rejects_dispersive_overlap():
+    sim = _dsim(DRUDE, center=(0.0, 0.0))
+    with pytest.raises(NotImplementedError, match="dispersive"):
+        _region().ce_builder(sim)
+
+
+@pytest.mark.parametrize("method,medium,pml", [
+    ("tiled", DRUDE, 6),
+    ("reversible_pml", LOSSLESS, 6),
+    ("reversible", LOSSLESS, 0),
+])
+def test_design_adjoint_methods_agree(method, medium, pml):
+    """Every adjoint gives the checkpointed design gradient to rounding."""
+    sim = _dsim(medium, pml=pml)
+    reg = _region()
+    rho = _rho(reg, sim)
+    ref_v, ref_g = pf.make_value_and_grad_params(
+        sim, reg.ce_builder(sim), _loss(sim))(rho, beta=4.0)
+    v, g = pf.make_value_and_grad_params(
+        sim, reg.ce_builder(sim), _loss(sim), method=method,
+        tiled_options=TILED)(rho, beta=4.0)
+    assert float(v) == pytest.approx(float(ref_v), rel=1e-11)
+    assert _rel_err(g, ref_g) < 1e-10
+
+
+def test_tiled_design_gradient_with_subpixel_base():
+    """The tiled adjoint takes the design's three per-component coefficients,
+    so a subpixel-smoothed layout works too (the eps_r gradient cannot)."""
+    sim = _dsim(None, subpixel=True)
+    sd = _shape_design()
+    p = jnp.asarray([0.30e-6, 0.37e-6])
+    ref_v, ref_g = pf.make_value_and_grad_params(
+        sim, sd.ce_builder(sim), _loss(sim))(p)
+    v, g = pf.make_value_and_grad_params(
+        sim, sd.ce_builder(sim), _loss(sim), method="tiled",
+        tiled_options=TILED)(p)
+    assert float(v) == pytest.approx(float(ref_v), rel=1e-11)
+    assert _rel_err(g, ref_g) < 1e-10
+
+
+@pytest.mark.parametrize("method", ["tiled", "reversible_pml"])
+def test_training_step_agrees_across_adjoints(method):
+    sims = [_dsim(LOSSLESS, amps=(1.0, 0.0)), _dsim(LOSSLESS, amps=(0.0, 1.0))]
+    reg = _region()
+    ro = _readouts(sims[0])
+    X, Y = _phase_dataset(8)
+    from photonfdtd.train import _cross_entropy
+
+    def f(T, idx):
+        m = pf.PhotonicModel.__new__(pf.PhotonicModel)
+        m.detection = "power"
+        pred = pf.PhotonicModel.apply(m, T, jnp.asarray(X)[idx])
+        return _cross_entropy(pred, jnp.asarray(Y)[idx])
+
+    rho = _rho(reg, sims[0])
+    idx = jnp.arange(8)
+    ref = pf.PhotonicModel(sims, reg, ro).value_and_grad(f)(rho, {}, idx)
+    got = pf.PhotonicModel(sims, reg, ro, method=method,
+                           tiled_options=TILED).value_and_grad(f)(rho, {}, idx)
+    assert float(got[0]) == pytest.approx(float(ref[0]), rel=1e-11)
+    assert _rel_err(got[1], ref[1]) < 1e-10
+    if method == "tiled":
+        T_ref = pf.PhotonicModel(sims, reg, ro).transfer(rho)
+        T = pf.PhotonicModel(sims, reg, ro, method="tiled",
+                             tiled_options=TILED).transfer(rho)
+        assert _rel_err(T, T_ref) < 1e-11
