@@ -777,6 +777,55 @@ def _out_dict(sf, sd, sfx, plans):
     }
 
 
+def _prepare(sim):
+    """Validate ``sim`` and build its fixed-for-the-run plans once."""
+    _validate(sim)
+    if getattr(sim, "_has_dispersion", False):
+        raise NotImplementedError(
+            "design-parameter gradients do not support dispersive media yet.")
+    _enable_x64_if_needed(sim)
+    static = _build_static(sim)
+    return static, _monitor_plan(sim), _particle_plan(sim, static)
+
+
+def _simulate_out(sim, prep, ce_e, remat="nested", checkpoint_levels=2):
+    """Run ``sim`` with E coefficients ``ce_e``; return the loss-facing dict."""
+    static, plans, pplans = prep
+    sf, sd, sfx = _device_simulate(
+        sim, static, plans, ce_e, pplans, ade=None,
+        ce_particle=ce_e["Ex"], remat=remat,
+        checkpoint_levels=checkpoint_levels)
+    return _out_dict(sf, sd, sfx, plans)
+
+
+def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
+                               checkpoint_levels=2, jit=True):
+    """Compile ``params -> (value, d loss / d params)`` once, for a loop.
+
+    The same contract as :func:`value_and_grad_params`, but the setup and the
+    XLA compile happen once and the returned ``vg(params, **aux)`` is reused
+    every iteration. Keyword arguments ``aux`` (e.g. a projection sharpness
+    ``beta``) are passed to ``ce_of_params(params, **aux)`` as *traced*
+    values, so changing them between calls does not recompile; keep their
+    shapes and dtypes fixed. ``vg`` returns ``(value, grad)`` as JAX arrays.
+    """
+    import jax
+
+    prep = _prepare(sim)
+
+    def loss_of_params(params, aux):
+        out = _simulate_out(sim, prep, ce_of_params(params, **aux),
+                            remat, checkpoint_levels)
+        return loss(out)
+
+    fn = jax.value_and_grad(loss_of_params)
+    fn = jax.jit(fn) if jit else fn
+
+    def vg(params, **aux):
+        return fn(params, aux)
+    return vg
+
+
 def value_and_grad_params(sim, ce_of_params, params, loss,
                           remat="nested", checkpoint_levels=2):
     """Differentiate a monitor loss w.r.t. arbitrary design ``params``.
@@ -792,27 +841,12 @@ def value_and_grad_params(sim, ce_of_params, params, loss,
 
     The subpixel per-component coefficient path is used, so a plain
     ``Simulation`` (``subpixel=False``) is fine; dispersion is not supported here
-    (the pole state is not parameterized by ``params``).
+    (the pole state is not parameterized by ``params``). For an optimization
+    loop use :func:`make_value_and_grad_params`, which compiles once.
     """
-    import jax
-    import jax.numpy as jnp
-
-    _validate(sim)
-    if getattr(sim, "_has_dispersion", False):
-        raise NotImplementedError(
-            "value_and_grad_params does not support dispersive media.")
-    _enable_x64_if_needed(sim)
-    static = _build_static(sim)
-    plans = _monitor_plan(sim)
-    pplans = _particle_plan(sim, static)
-
-    def loss_of_params(params):
-        ce_e = ce_of_params(params)
-        sf, sd, sfx = _device_simulate(
-            sim, static, plans, ce_e, pplans, ade=None,
-            ce_particle=ce_e["Ex"], remat=remat,
-            checkpoint_levels=checkpoint_levels)
-        return loss(_out_dict(sf, sd, sfx, plans))
-
-    val, grad = jax.value_and_grad(loss_of_params)(params)
+    vg = make_value_and_grad_params(sim, lambda p: ce_of_params(p), loss,
+                                    remat=remat,
+                                    checkpoint_levels=checkpoint_levels,
+                                    jit=False)
+    val, grad = vg(params)
     return float(val), grad
