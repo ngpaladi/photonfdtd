@@ -20,6 +20,7 @@ don't. See :doc:`api` for the full reference.
    quickstart
    backends
    accuracy
+   optimization
    layout_scale
    examples
    api
@@ -66,6 +67,10 @@ Capabilities
 - **Inverse design**: a differentiable 2-D etch-density pipeline
   (:class:`~photonfdtd.EtchedCore`, :func:`~photonfdtd.value_and_grad_density`)
   for topology optimization of PIC devices. See :doc:`accuracy`.
+- **Geometry optimization and chip training**: design regions inside a real
+  layout, parametric shapes, Adam / optax loops with beta continuation, robust
+  (eroded / dilated) objectives, GDS export, and training a chip on a dataset
+  like a neural network (:func:`~photonfdtd.train`). See :doc:`optimization`.
 - **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
   :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
   before it starts.

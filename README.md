@@ -161,6 +161,15 @@ print(result.n_eff)            # array of effective indices
   ~1e-8). Adjoint memory is kept in check by two-level gradient checkpointing
   and, for closed/periodic domains, an O(1)-in-timesteps **reversible adjoint**
   (`jax_value_and_grad_eps_reversible`, plus a PML-shell-tape variant).
+- **Geometry optimization and chip training.** Optimize a `DesignRegion` box
+  inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
+  parametric polygons (widths, gaps, tapers), with a compile-once gradient
+  (`make_value_and_grad_params`), Adam or any optax optimizer (`minimize`),
+  beta continuation, robust eroded/dilated objectives, and GDS export
+  (`export_gds`, optional `gdstk`). `train` fits a chip to a dataset like a
+  neural network: the chip is linear, so one simulation per input port gives its
+  transfer matrix and a training step costs N forward + N adjoint runs however
+  big the batch. See `docs/optimization.rst`.
 - **Memory planning**: per-array `float32`/`float64` precision (the stepping
   arrays share one dtype; monitor storage may differ) and a memory planner
   (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)

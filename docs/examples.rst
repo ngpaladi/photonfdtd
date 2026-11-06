@@ -1,9 +1,11 @@
 Tutorial: worked examples
 =========================
 
-The ``examples/`` directory holds five self-contained, runnable scripts. They
-climb from a one-dimensional pulse up to a moving charge radiating a Cherenkov
-cone, and then put that charge inside a dielectric tube; each one adds exactly
+The ``examples/`` directory holds seven self-contained, runnable scripts. The
+first five climb from a one-dimensional pulse up to a moving charge radiating a
+Cherenkov cone, and then put that charge inside a dielectric tube; the last two
+turn to design, optimizing a splitter by gradient descent and training a chip
+on a dataset like a neural network. Each one adds exactly
 one new piece of the API or physics, so you can read them in order and never be
 more than a step ahead of yourself. Every script saves the figure shown below;
 run one with, e.g.::
@@ -158,5 +160,68 @@ a regression test.
    half-gap, following ``exp(-k_x a / gamma)``.
 
 .. literalinclude:: ../examples/05_cherenkov_tube.py
+   :language: python
+   :linenos:
+
+
+6. Inverse-designing a 1x2 splitter
+-----------------------------------
+
+The first design example. One input waveguide on the left, two outputs on the
+right, and a :class:`~photonfdtd.DesignRegion` in between whose etch pattern is
+free. The figure of merit is the weaker of the two output-port overlaps,
+normalized by what a straight waveguide delivers, so the optimizer only
+improves if it splits evenly. :func:`~photonfdtd.make_value_and_grad_params`
+compiles the forward and adjoint run once, and :func:`~photonfdtd.minimize`
+steps the density with Adam while
+:func:`~photonfdtd.beta_continuation` doubles the projection sharpness every
+10 iterations. The jumps in the convergence curve at those points are the
+design being pushed toward binary. At the end the design is written to GDS if
+``gdstk`` is installed. In 2-D the port readout is a Gaussian projection, a
+cheap stand-in for modal power. A 3-D device would use
+:class:`~photonfdtd.ModeTransmission`. See :doc:`optimization` for the whole
+toolkit.
+
+.. figure:: ../examples/06_inverse_design_splitter.png
+   :width: 100%
+   :alt: Convergence, optimized permittivity, and field of a 1x2 splitter
+
+   Left: the weaker arm's overlap over 40 iterations. Middle: the optimized
+   permittivity between the fixed waveguide stubs. Right: ``Ez`` as the pulse
+   passes through the splitter.
+
+.. literalinclude:: ../examples/06_inverse_design_splitter.py
+   :language: python
+   :linenos:
+
+
+7. Training a chip like a neural network
+----------------------------------------
+
+Here the chip learns from data instead of from a hand-written figure of merit.
+Two input waveguides carry coherent light, and a sample is the pair of complex
+amplitudes driving them; its class is their relative phase (in phase or
+anti-phase, with noise and random brightness). Detectors read the two output
+powers, and the fraction of power in port ``m`` is the score for class ``m``.
+:func:`~photonfdtd.train` fits the etch to 256 samples by minibatch Adam on a
+cross-entropy loss.
+
+Because the chip is linear, :class:`~photonfdtd.PhotonicModel` simulates each
+input port once to get the 2x2 transfer matrix and evaluates every sample as a
+matrix product. One step therefore costs two forward and two adjoint FDTD
+runs, whatever the batch size. The untrained chip scores 52% on the validation
+set (chance) and the trained one 100%. The right panel shows what it learned:
+the power in port 1 follows ``sin^2(dphi / 2)`` of the input phase difference,
+which is an interferometer.
+
+.. figure:: ../examples/07_train_photonic_classifier.png
+   :width: 100%
+   :alt: Training curves and the learned phase response of a photonic classifier
+
+   Left: batch and validation cross-entropy over the optimizer steps. Middle:
+   validation accuracy at the end of each epoch. Right: the trained chip's
+   port-1 power fraction against the input relative phase, coloured by class.
+
+.. literalinclude:: ../examples/07_train_photonic_classifier.py
    :language: python
    :linenos:

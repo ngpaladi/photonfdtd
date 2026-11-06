@@ -185,6 +185,9 @@ a 3-D design grid, which is often the difference between "fits" and "doesn't."
    loss = lambda out: -abs(mode_overlap(out))**2          # e.g. -|S21|^2
    value, grad = pf.value_and_grad_density(sim, ec, rho, loss)  # grad is (nx, ny)
 
+To optimize only a box of a real layout, run the loop, keep the design robust
+to etch errors, or export GDS, see :doc:`optimization`.
+
 Memory notes
 ------------
 
