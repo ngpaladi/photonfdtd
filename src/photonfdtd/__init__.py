@@ -29,6 +29,11 @@ Capabilities:
   training a chip like a neural network on a dataset (:mod:`photonfdtd.train`)
 - :func:`from_gdsfactory` adapter that turns a gdsfactory Component into a
   fully-built Simulation
+- Active devices (:mod:`photonfdtd.active`): electro-optic (lithium niobate and
+  other crystals), thermo-optic (heaters) and free-carrier (silicon PN) index
+  changes, from electrostatic and thermal solves (:mod:`photonfdtd.statics`),
+  for voltage and heater sweeps in the mode solver and FDTD, and
+  time-varying (RF) drives
 
 Every time loop runs on JAX (:mod:`photonfdtd.jaxbackend`, and the ADI-FDTD
 stepper in :mod:`photonfdtd.adi`); :mod:`photonfdtd.memory` sizes a run against
@@ -38,7 +43,7 @@ adjoint, streams from disk in x-slabs (:mod:`photonfdtd.tiled`).
 from .constants import C_0, EPS_0, MU_0, ETA_0, Q_E
 from .grid import Grid
 from .materials import (
-    Medium, DispersiveMedium, Pole,
+    Medium, DispersiveMedium, Pole, AnisotropicMedium,
     silica, silicon, silicon_nitride, lithium_niobate, gold, silver,
 )
 from . import materials
@@ -85,10 +90,16 @@ from .memory import (
 )
 from . import adapters
 from .adapters import from_gdsfactory
+from . import statics, active
+from .statics import solve_potential, solve_thermal
+from .active import (
+    ActiveMedium, ActiveRegion, Electrode, Heater, PNJunction,
+    Sinusoid, Ramp, Step,
+)
 
 __all__ = [
     "C_0", "EPS_0", "MU_0", "ETA_0", "Q_E", "PLANCK_H",
-    "Grid", "Medium", "DispersiveMedium", "Pole", "materials",
+    "Grid", "Medium", "DispersiveMedium", "Pole", "AnisotropicMedium", "materials",
     "silica", "silicon", "silicon_nitride", "lithium_niobate", "gold", "silver",
     "Box", "PolySlab",
     "GaussianPulse", "PointDipole", "ModeSource", "UniModeSource",
@@ -114,6 +125,10 @@ __all__ = [
     "PhotonicModel", "train", "fit_transfer", "accuracy", "export_gds",
     "estimate_memory", "recommend_mode", "format_report", "available_memory",
     "adapters", "from_gdsfactory",
+    # active devices: electro-optic, thermo-optic and free-carrier tuning
+    "statics", "active", "solve_potential", "solve_thermal",
+    "ActiveMedium", "ActiveRegion", "Electrode", "Heater", "PNJunction",
+    "Sinusoid", "Ramp", "Step",
 ]
 
 __version__ = "0.15.0"

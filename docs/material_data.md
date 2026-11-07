@@ -98,6 +98,34 @@ e^(−iωt) (loss ⇒ Im ε > 0); flip imaginary signs for e^(+iωt).
 A. D. Rakić, A. B. Djurišić, J. M. Elazar, M. L. Majewski, *Appl. Opt.*
 **37**(22), 5271–5283 (1998). DOI: 10.1364/AO.37.005271
 
+## Electro-optic and thermal properties (photonfdtd.active)
+
+| Material | Quantity | Value | Source |
+|---|---|---|---|
+| LiNbO₃ | r13, r22, r33, r51 (clamped, > ~10 MHz) | 8.6, 3.4, 31, 28 pm/V | Weis & Gaylord, *Appl. Phys. A* **37**, 191 (1985), via the Crystal Technology datasheet and PM Optics tables |
+| LiNbO₃ | r13, r22, r33, r51 (unclamped, DC) | 10, 6.8, 32, 32 pm/V | as above (the datasheet gives r22 = 7, r33 = r51 = 33) |
+| LiNbO₃ | ε₁₁, ε₃₃ clamped / unclamped | 44, 27.9 / 85, 28.7 | Weis & Gaylord 1985 |
+| LiNbO₃ | dn_e/dT, dn_o/dT (room temp., near IR) | 3.34×10⁻⁵, ≈0 /K | arXiv:1806.04755 (others quote ≈4×10⁻⁵, e.g. arXiv:1804.03621) |
+| LiNbO₃ | thermal conductivity | 4.6 W/(m K) | typical bulk value |
+| LiTaO₃ | n_o, n_e (1.55 µm); r13, r33 | 2.119, 2.123; 8.4, 30.5 pm/V | approximate literature values, not checked against a primary source |
+| BaTiO₃ | n_o, n_e; r13, r33, r42 (bulk, clamped) | 2.286, 2.263; 8, 28, 1300 pm/V | Zgonik et al., *PRB* **50**, 5941 (1994); thin films differ |
+| Si | dn/dT (1.55 µm), k, ε_dc | 1.86×10⁻⁴ /K, 148 W/(m K), 11.7 | Komma et al., *APL* **101**, 041905 (2012) |
+| SiN (LPCVD) | dn/dT, k | 2.45×10⁻⁵ /K, ~20 W/(m K) (films 10–30) | Arbabi & Goddard, *Opt. Lett.* **38**, 3878 (2013) |
+| SiO₂ | dn/dT, k, ε_dc | 0.95×10⁻⁵ /K, 1.38 W/(m K), 3.9 | typical values |
+| Au, Al, TiN, NiCr, Ti, W | σ (S/m), k (W/(m K)) | see `metal_active` | handbook values; thin films are usually lower |
+
+Free-carrier dispersion in silicon, Soref & Bennett, *IEEE JQE* **23**, 123
+(1987), as tabulated by Reed et al., *Nat. Photon.* **4**, 518 (2010), with
+densities in cm⁻³ and absorption in cm⁻¹:
+
+- 1550 nm: Δn = −(8.8×10⁻²² ΔN + 8.5×10⁻¹⁸ ΔP^0.8), Δα = 8.5×10⁻¹⁸ ΔN + 6.0×10⁻¹⁸ ΔP
+- 1310 nm: Δn = −(6.2×10⁻²² ΔN + 6.0×10⁻¹⁸ ΔP^0.8), Δα = 6.0×10⁻¹⁸ ΔN + 4.0×10⁻¹⁸ ΔP
+
+The electro-optic values come from secondary tabulations of the cited papers
+(vendor datasheets and review tables), which disagree in the second digit for
+r22 and r51; thin-film values depend on the film. Treat the library as a
+starting point and override the media for a specific process.
+
 ## Provenance notes
 
 SiO₂ (Malitson) is canonical. Si₃N₄, LiNbO₃, and the Au/Ag Rakić tables pass

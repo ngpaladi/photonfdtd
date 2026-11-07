@@ -25,12 +25,19 @@ class Medium:
         Pass eps_r = n^2 for a refractive index n.
     name : str, optional
         Identifier, used only for logging.
+    conductivity : float, optional
+        Electric conductivity sigma in S/m (default 0). A non-zero value makes
+        the medium lossy, with E decaying as exp(-sigma t / (2 eps)) in time;
+        the FDTD E update then uses the standard lossy (ca, cb) coefficients.
     """
     permittivity: float = 1.0
     name: str = ""
+    conductivity: float = 0.0
 
     #: Marks this as a plain non-dispersive dielectric (see DispersiveMedium).
     is_dispersive: ClassVar[bool] = False
+    #: A diagonal-tensor medium (see AnisotropicMedium).
+    is_anisotropic: ClassVar[bool] = False
 
     @property
     def eps_r(self) -> float:
@@ -42,6 +49,55 @@ class Medium:
 
 
 VACUUM = Medium(permittivity=1.0, name="vacuum")
+
+
+@dataclass(frozen=True)
+class AnisotropicMedium:
+    """Non-dispersive medium with a diagonal permittivity tensor.
+
+    ``permittivity`` is ``(eps_xx, eps_yy, eps_zz)`` in the *grid* frame: the
+    value seen by the Ex, Ey and Ez field components. Only diagonal tensors are
+    supported, so a crystal must have its principal axes along the grid axes
+    (for example x-cut or z-cut lithium niobate with the light travelling along
+    a grid axis); :mod:`photonfdtd.active` builds these from crystal data and a
+    cut. Subpixel smoothing is not supported with anisotropic media.
+
+    ``eps_r`` (the scalar used where a single value is needed, such as the
+    moving-charge deposition coefficient) is the mean of the three.
+    """
+    permittivity: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    name: str = ""
+    conductivity: float = 0.0
+
+    is_dispersive: ClassVar[bool] = False
+    is_anisotropic: ClassVar[bool] = True
+
+    def __post_init__(self):
+        p = tuple(float(v) for v in self.permittivity)
+        if len(p) != 3:
+            raise ValueError("permittivity must be (eps_xx, eps_yy, eps_zz)")
+        object.__setattr__(self, "permittivity", p)
+
+    @property
+    def eps_r(self) -> float:
+        return float(sum(self.permittivity) / 3.0)
+
+    @property
+    def eps_components(self) -> Tuple[float, float, float]:
+        return self.permittivity
+
+    @classmethod
+    def from_index(cls, n, name: str = "") -> "AnisotropicMedium":
+        """From refractive indices ``(n_x, n_y, n_z)`` along the grid axes."""
+        return cls(permittivity=tuple(float(v) ** 2 for v in n), name=name)
+
+
+def eps_components_of(medium) -> Tuple[float, float, float]:
+    """``(eps_xx, eps_yy, eps_zz)`` of any medium (isotropic ones repeat eps_r)."""
+    if getattr(medium, "is_anisotropic", False):
+        return tuple(medium.eps_components)
+    e = float(medium.eps_r)
+    return (e, e, e)
 
 
 # --------------------------------------------------------------------------- #
@@ -101,6 +157,9 @@ class DispersiveMedium:
     name: str = ""
 
     is_dispersive: ClassVar[bool] = True
+    is_anisotropic: ClassVar[bool] = False
+    #: Dispersive media are lossy through their poles, not a conductivity.
+    conductivity: ClassVar[float] = 0.0
 
     @property
     def eps_r(self) -> float:
