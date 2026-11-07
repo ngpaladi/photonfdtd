@@ -386,6 +386,12 @@ def solve_thermal(mesh, conductivity, heaters: Sequence, powers=None,
     for f in sinks + tuple(convection or ()):
         if f not in _FACES:
             raise ValueError(f"unknown face {f!r}; use one of {_FACES}")
+    for f in sinks + tuple(convection or ()):
+        if mesh.shape["xyz".index(f[0])] == 1:
+            raise ValueError(
+                f"face {f!r} is on a collapsed axis of this mesh, so it can't hold "
+                "heat; for a chip-plane (x-y) layout, prepare on a cross-section "
+                "(a ModeSolver) instead, or name faces on the mesh's own axes")
     if not sinks and not convection:
         raise ValueError("with no sink or convective face the temperature has no "
                          "steady state; give sinks= or convection=")

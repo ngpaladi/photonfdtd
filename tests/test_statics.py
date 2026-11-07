@@ -127,3 +127,11 @@ def test_mesh_of_mode_solver_and_simulation():
     assert m.shape == (1, 10, 10)
     grid = pf.Grid(size=(1e-6, 1e-6), cell_size=0.1e-6)
     assert statics.mesh_of(pf.Simulation(grid)).shape == grid.shape
+
+
+def test_thermal_sink_on_a_collapsed_axis_is_refused():
+    y = (np.arange(20) - 9.5) * D
+    mesh = statics.Mesh((y, y, np.array([0.0])), (D, D, 0.0))     # a chip plane
+    heater = pf.Box((0.0, 0.0), (0.1e-6, 0.1e-6), pf.Medium())
+    with pytest.raises(ValueError, match="collapsed"):
+        statics.solve_thermal(mesh, np.ones(mesh.shape), [heater], sinks=("zmin",))

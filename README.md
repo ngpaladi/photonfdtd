@@ -171,7 +171,8 @@ print(result.n_eff)            # array of effective indices
   (`photonfdtd.statics`). Get `V_pi * L` and `P_pi` from the mode solver, sweep
   a switch's voltage in FDTD, optimize drive voltages by gradient descent, or
   step an RF drive in time. Anisotropic (diagonal-tensor) and conductive media
-  work everywhere.
+  work in FDTD runs, the mode solver and the checkpointed design gradients
+  (`value_and_grad_params`); see the guide for the paths that refuse them.
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient

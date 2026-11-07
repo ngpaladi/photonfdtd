@@ -224,10 +224,10 @@ def lithium_niobate_eo(wavelength: float, cut: str = "x", propagation: str = "x"
     """Congruent LiNbO3 (thin film or bulk), electro-optic and thermo-optic.
 
     Indices from the Zelmon (1997) Sellmeier at ``wavelength``. Pockels
-    coefficients and DC permittivity from Weis & Gaylord (1985): ``clamped``
-    (the default; above ~10 MHz, what a modulator sees) r13, r22, r33, r51 =
-    8.6, 3.4, 30.8, 28 pm/V and eps_11, eps_33 = 44, 27.9; unclamped (DC)
-    10, 6.8, 32.2, 32 pm/V and 85, 28.7. dn_e/dT = 3.34e-5 /K, dn_o/dT ~ 0 at
+    coefficients and DC permittivity from Weis & Gaylord (1985), as tabulated
+    by crystal vendors: ``clamped`` (the default; above ~10 MHz, what a
+    modulator sees) r13, r22, r33, r51 = 8.6, 3.4, 31, 28 pm/V and eps_11,
+    eps_33 = 44, 27.9; unclamped (DC) 10, 6.8, 32, 32 pm/V and 85, 28.7. dn_e/dT = 3.34e-5 /K, dn_o/dT ~ 0 at
     room temperature in the near infrared; thermal conductivity 4.6 W/(m K).
     See ``docs/material_data.md``.
 
@@ -241,10 +241,10 @@ def lithium_niobate_eo(wavelength: float, cut: str = "x", propagation: str = "x"
     n_o = float(np.sqrt(np.real(lithium_niobate("o").eps_model(f))))
     n_e = float(np.sqrt(np.real(lithium_niobate("e").eps_model(f))))
     if clamped:
-        r = _r_3m(8.6 * _PM, 3.4 * _PM, 30.8 * _PM, 28.0 * _PM)
+        r = _r_3m(8.6 * _PM, 3.4 * _PM, 31.0 * _PM, 28.0 * _PM)
         e11, e33 = 44.0, 27.9
     else:
-        r = _r_3m(10.0 * _PM, 6.8 * _PM, 32.2 * _PM, 32.0 * _PM)
+        r = _r_3m(10.0 * _PM, 6.8 * _PM, 32.0 * _PM, 32.0 * _PM)
         e11, e33 = 85.0, 28.7
     return _uniaxial(n_o, n_e, _cut_axes(cut, propagation, vertical), r,
                      (e11, e11, e33), (0.0, 0.0, 3.34e-5), 4.6,
@@ -253,12 +253,14 @@ def lithium_niobate_eo(wavelength: float, cut: str = "x", propagation: str = "x"
 
 def lithium_tantalate_eo(wavelength: float = 1.55e-6, cut: str = "x",
                          propagation: str = "x", vertical: str = "z") -> ActiveMedium:
-    """LiTaO3: n_o = 2.119, n_e = 2.123 near 1.55 um, r13 = 8.4, r33 = 30.5
-    pm/V (clamped), eps_11, eps_33 = 41, 43, thermal conductivity 4.6 W/(m K).
-    Indices are fixed values for the telecom band (``wavelength`` is recorded
-    in the name only); dn/dT is not included."""
+    """LiTaO3, approximate: n_o = 2.119, n_e = 2.123 near 1.55 um, r13 = 8.4,
+    r33 = 30.5 pm/V, eps_11, eps_33 = 41, 43, thermal conductivity 4.6 W/(m K).
+    These are typical literature values that were not checked against a
+    primary source; r22 and r51 and dn/dT are not included. The indices are
+    fixed telecom-band values (``wavelength`` only labels the medium). Override
+    for your material."""
     return _uniaxial(2.119, 2.123, _cut_axes(cut, propagation, vertical),
-                     _r_3m(8.4 * _PM, 0.0, 30.5 * _PM, 20.0 * _PM),
+                     _r_3m(8.4 * _PM, 0.0, 30.5 * _PM, 0.0),
                      (41.0, 41.0, 43.0), (0.0, 0.0, 0.0), 4.6,
                      f"LiTaO3 {cut}-cut @{wavelength * 1e9:.0f}nm")
 

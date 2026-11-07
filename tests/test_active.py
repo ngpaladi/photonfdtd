@@ -181,7 +181,7 @@ def test_pockels_uniform_field_on_z_cut():
     k = int(np.argmin(np.abs(ms.z)))
     Ez = prep.electrostatics.field([V, 0.0])[2][0, j, k]
     assert Ez == pytest.approx(-V / gap, rel=0.01)       # between the plate faces
-    r13, r33 = 8.6e-12, 30.8e-12
+    r13, r33 = 8.6e-12, 31.0e-12
     assert d[2][0, j, k] == pytest.approx(-ln.permittivity[2] ** 2 * r33 * Ez, rel=1e-9)
     assert d[0][0, j, k] == pytest.approx(-ln.permittivity[0] ** 2 * r13 * Ez, rel=1e-9)
 
@@ -419,7 +419,7 @@ def test_fdtd_phase_index_follows_the_pockels_formula():
     i = grid.shape[0] // 2
     eps_V = prep.eps_components(V={"t": V})[1][i, :, 0]
     # Every cell between the plates gets exactly the Pockels change.
-    assert np.allclose(eps_V[1:-1] - eps_e, -eps_e ** 2 * 30.8e-12 * E, rtol=1e-9)
+    assert np.allclose(eps_V[1:-1] - eps_e, -eps_e ** 2 * 31.0e-12 * E, rtol=1e-9)
     x = grid.coords[0]
     i1, i2 = (int(np.argmin(np.abs(x - p))) for p in (-4e-6, 6e-6))
     j = grid.shape[1] // 2
@@ -432,3 +432,11 @@ def test_fdtd_phase_index_follows_the_pockels_formula():
     series = lambda e: np.sqrt(1.0 / np.mean(1.0 / e))
     dn_expected = series(eps_V) - series(np.full_like(eps_V, eps_e))
     assert dn_fdtd == pytest.approx(dn_expected, rel=0.02)
+
+
+def test_disk_tiled_run_takes_anisotropic_media():
+    med = pf.AnisotropicMedium(permittivity=(4.0, 2.25, 6.25))
+    sim = _line(med, "Ey", np.array([200e12]), L=8e-6, run_time=60e-15)
+    a = np.asarray(sim.run(disk_tiled=False).dft["d"]["Ey"])
+    b = np.asarray(sim.run(disk_tiled=True, tile_cells=40).dft["d"]["Ey"])
+    assert np.allclose(a, b, rtol=1e-9, atol=1e-12 * np.abs(a).max())

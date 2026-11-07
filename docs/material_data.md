@@ -102,12 +102,12 @@ A. D. Rakić, A. B. Djurišić, J. M. Elazar, M. L. Majewski, *Appl. Opt.*
 
 | Material | Quantity | Value | Source |
 |---|---|---|---|
-| LiNbO₃ | r13, r22, r33, r51 (clamped, > ~10 MHz) | 8.6, 3.4, 30.8, 28 pm/V | Weis & Gaylord, *Appl. Phys. A* **37**, 191 (1985) |
-| LiNbO₃ | r13, r22, r33, r51 (unclamped, DC) | 10, 6.8, 32.2, 32 pm/V | Weis & Gaylord 1985 |
+| LiNbO₃ | r13, r22, r33, r51 (clamped, > ~10 MHz) | 8.6, 3.4, 31, 28 pm/V | Weis & Gaylord, *Appl. Phys. A* **37**, 191 (1985), via the Crystal Technology datasheet and PM Optics tables |
+| LiNbO₃ | r13, r22, r33, r51 (unclamped, DC) | 10, 6.8, 32, 32 pm/V | as above (the datasheet gives r22 = 7, r33 = r51 = 33) |
 | LiNbO₃ | ε₁₁, ε₃₃ clamped / unclamped | 44, 27.9 / 85, 28.7 | Weis & Gaylord 1985 |
 | LiNbO₃ | dn_e/dT, dn_o/dT (room temp., near IR) | 3.34×10⁻⁵, ≈0 /K | arXiv:1806.04755 (others quote ≈4×10⁻⁵, e.g. arXiv:1804.03621) |
 | LiNbO₃ | thermal conductivity | 4.6 W/(m K) | typical bulk value |
-| LiTaO₃ | n_o, n_e (1.55 µm); r13, r33 | 2.119, 2.123; 8.4, 30.5 pm/V | typical values; verify for your material |
+| LiTaO₃ | n_o, n_e (1.55 µm); r13, r33 | 2.119, 2.123; 8.4, 30.5 pm/V | approximate literature values, not checked against a primary source |
 | BaTiO₃ | n_o, n_e; r13, r33, r42 (bulk, clamped) | 2.286, 2.263; 8, 28, 1300 pm/V | Zgonik et al., *PRB* **50**, 5941 (1994); thin films differ |
 | Si | dn/dT (1.55 µm), k, ε_dc | 1.86×10⁻⁴ /K, 148 W/(m K), 11.7 | Komma et al., *APL* **101**, 041905 (2012) |
 | SiN (LPCVD) | dn/dT, k | 2.45×10⁻⁵ /K, ~20 W/(m K) (films 10–30) | Arbabi & Goddard, *Opt. Lett.* **38**, 3878 (2013) |

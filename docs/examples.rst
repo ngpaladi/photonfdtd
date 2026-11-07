@@ -264,7 +264,7 @@ waveguide it entered. The cross-section of example 8 gives ``d n_eff / dV``,
 :meth:`~photonfdtd.active.PreparedActive.eim` carries it to a 2-D chip-plane
 model with opposite signs on the two arms, and
 :meth:`~photonfdtd.active.EIMActive.sweep` runs 16 voltages from one compiled
-simulation. The output switches from 99.5% cross at 0 V to 99.3% bar.
+simulation. The output switches from 99.5% cross at 0 V to 99.4% bar.
 
 The FDTD coupler is 41 um long, so it switches at about 1 kV: the voltage
 scales as 1 / length, and the top axis converts to a 5 mm device (about 8 V).
