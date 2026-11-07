@@ -363,3 +363,27 @@ def test_voltage_gradient_through_the_coefficient_builder():
     assert float(val) == pytest.approx(ref, rel=1e-9)
     outs = prep.sweep([{"V": {"t": V0}}, {"V": {"t": 0.0}}])
     assert abs(outs[0]["dft"]["d"]["Ey"][0, j[0], j[1], 0]) ** 2 == pytest.approx(ref, rel=1e-9)
+
+
+def test_from_gdsfactory_returns_the_active_region():
+    gf = pytest.importorskip("gdsfactory")
+    gf.gpdk.PDK.activate()
+    c = gf.Component()
+    c.add_polygon([(-10, -0.6), (10, -0.6), (10, 0.6), (-10, 0.6)], layer=(1, 0))
+    c.add_polygon([(-8, 2.5), (8, 2.5), (8, 6), (-8, 6)], layer=(2, 0))
+    c.add_polygon([(-8, -6), (8, -6), (8, -2.5), (-8, -2.5)], layer=(2, 0))
+    lam = 1.55e-6
+    ln = A.lithium_niobate_eo(lam, cut="x")
+    sim, reg = pf.from_gdsfactory(
+        c, layers={(1, 0): (ln, (0.0, 0.6e-6))},
+        background_slabs=[(A.silica_active(lam), (-1e-6, 0.0))],
+        cell_size=0.1e-6, padding=(0.5e-6, 0.5e-6, 0.5e-6), pml_layers=(0, 0, 0),
+        electrodes={"signal": ((2, 0), (0.0, 0.5e-6), (0, 4)),
+                    "ground": ((2, 0), (0.0, 0.5e-6), (0, -4))})
+    assert [e.name for e in reg.electrodes] == ["signal", "ground"]
+    assert sim._has_anisotropy                      # the (1, 0) layer was stamped
+    d, _ = reg.prepare(sim, extrude="x").delta_eps(V={"signal": 10.0})
+    assert np.abs(d[1]).max() > 1e-4
+    with pytest.raises(ValueError, match="no polygon"):
+        pf.from_gdsfactory(c, layers={}, cell_size=0.1e-6,
+                           electrodes={"x": ((2, 0), (0.0, 0.5e-6), (0, 0))})
