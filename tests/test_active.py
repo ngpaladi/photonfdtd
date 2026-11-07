@@ -288,13 +288,16 @@ def test_eim_transfer_applies_the_index_shift():
     prep = _tfln(0.08e-6)
     slope = prep.dneff("signal")
     core = pf.Box((0.0, 0.0), (4e-6, 1.2e-6), pf.Medium(permittivity=1.9 ** 2))
-    eim = prep.eim([core], drives=["signal"])
+    arm = pf.Box((0.0, -1.0e-6), (4e-6, 0.8e-6), pf.Medium(permittivity=1.9 ** 2))
+    eim = prep.eim([core], drives=["signal"]) + prep.eim([arm], drives=["signal"], sign=-1)
     grid = pf.Grid(size=(6e-6, 4e-6), cell_size=0.05e-6, pml_layers=(10, 10, 0))
-    sim = pf.Simulation(grid, structures=[core])
-    e = eim.eps_components(sim, V={"signal": 20.0})
-    j = grid.index_at((0.0, 0.0))
-    assert np.sqrt(e[1][j]) - 1.9 == pytest.approx(20.0 * slope, rel=1e-9)
+    sim = pf.Simulation(grid, structures=[core, arm])
+    e = eim.eps_components(sim, {"signal": 20.0})
+    assert np.sqrt(e[1][grid.index_at((0.0, 0.0))]) - 1.9 == pytest.approx(20.0 * slope, rel=1e-9)
+    assert np.sqrt(e[1][grid.index_at((0.0, -1.2e-6))]) - 1.9 == pytest.approx(-20.0 * slope, rel=1e-9)
     assert e[1][grid.index_at((0.0, 1.5e-6))] == pytest.approx(1.0)
+    with pytest.raises(KeyError):
+        eim.eps_components(sim, {"heater": 1.0})
 
 
 def test_extruded_3d_preparation_matches_the_cross_section():
@@ -354,7 +357,9 @@ def test_voltage_gradient_through_the_coefficient_builder():
     fp, _ = vg({"V": jnp.array([V0 + h, 0.0])})
     fm, _ = vg({"V": jnp.array([V0 - h, 0.0])})
     assert float(g["V"][0]) == pytest.approx(float((fp - fm) / (2 * h)), rel=1e-3)
-    # The builder at V reproduces prep.run(V).
+    # The builder at V reproduces prep.run(V), and so does a compiled sweep.
     r = prep.run(V={"t": V0})
-    assert float(val) == pytest.approx(
-        abs(np.asarray(r.dft["d"]["Ey"])[0, j[0], j[1], 0]) ** 2, rel=1e-9)
+    ref = abs(np.asarray(r.dft["d"]["Ey"])[0, j[0], j[1], 0]) ** 2
+    assert float(val) == pytest.approx(ref, rel=1e-9)
+    outs = prep.sweep([{"V": {"t": V0}}, {"V": {"t": 0.0}}])
+    assert abs(outs[0]["dft"]["d"]["Ey"][0, j[0], j[1], 0]) ** 2 == pytest.approx(ref, rel=1e-9)

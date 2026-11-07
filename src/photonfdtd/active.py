@@ -945,6 +945,7 @@ class PreparedActive:
         import jax.numpy as jnp
         sim = self._sim(sim)
         dt = sim.dt
+        cdt = np.dtype(sim.dtypes["Ex"])        # coefficients in the stepping dtype
         base = [jnp.asarray(b) for b in self.base_eps]
         dV = jnp.asarray(self._expand(self.deps_V)) if self.deps_V.size else None
         dP = jnp.asarray(self._expand(self.deps_P)) if self.deps_P.size else None
@@ -968,11 +969,11 @@ class PreparedActive:
             for c, name in enumerate(("Ex", "Ey", "Ez")):
                 b = dt / (eps[c] * EPS_0)
                 if sigma is None:
-                    out[name] = b
+                    out[name] = b.astype(cdt)
                 else:
                     s = sigma * dt / (2.0 * eps[c] * EPS_0)
-                    out[name] = b / (1.0 + s)
-                    ca[name] = (1.0 - s) / (1.0 + s)
+                    out[name] = (b / (1.0 + s)).astype(cdt)
+                    ca[name] = ((1.0 - s) / (1.0 + s)).astype(cdt)
             if sigma is not None:
                 out["ca"] = ca
             return out
@@ -1021,22 +1022,52 @@ class PreparedActive:
     # -------------------------------------------------------------- #
     # Effective-index transfer to a 2-D chip-plane simulation.
     # -------------------------------------------------------------- #
-    def eim(self, footprint: Sequence, mode: int = 0, drives: Optional[Sequence[str]] = None
-            ) -> "EIMActive":
+    def eim(self, footprint: Sequence, drives: Optional[Sequence[str]] = None,
+            sign: float = 1.0, mode: int = 0) -> "EIMActive":
         """Carry the cross-section's ``d n_eff / d drive`` to a 2-D chip-plane
-        simulation: :class:`EIMActive` adds ``2 n dn_eff`` to the permittivity
-        of the cells inside ``footprint`` (geometries: the waveguide core under
-        the electrodes or heater). The in-plane mode's own lateral confinement
-        scales the shift a little below the cross-section value (by roughly its
-        in-core power fraction), so draw ``footprint`` over the whole core."""
+        simulation.
+
+        The returned :class:`EIMActive` raises the index of the cells inside
+        ``footprint`` (geometries in the chip plane: the waveguide core under
+        the electrodes or heater) by ``sign * sum(d n_eff / d drive * value)``.
+        ``sign = -1`` describes the other arm of a push-pull pair, where the
+        same electrodes give the opposite field; add the arms with ``+``. The
+        in-plane mode is not fully confined to the footprint, so the shift it
+        sees is a little below the cross-section value (by roughly its in-core
+        power fraction): draw ``footprint`` over the whole core."""
         if not self.is_mode_solver:
             raise TypeError("eim() takes the result of preparing on a ModeSolver")
         names = list(drives) if drives is not None else (
             self.region.electrode_names + self.region.heater_names)
-        slopes = {n: self.dneff(n, mode=mode) for n in names}
-        n0 = self.n_eff(mode=mode)
-        return EIMActive(list(footprint), slopes, n0, self.region.electrode_names,
-                         self.region.heater_names)
+        slopes = {n: float(sign) * self.dneff(n, mode=mode) for n in names}
+        return EIMActive([(list(footprint), slopes)])
+
+    def sweep(self, values: Sequence[dict], sim=None):
+        """Run the simulation at each drive setting in ``values`` (dicts with
+        ``V``, ``P`` keys, each a dict or array as for :meth:`eps_components`),
+        compiling once. Returns the monitor outputs, one dict per setting:
+        ``{'dft': {name: {comp: array}}, 'flux': {...}, 'fields': {...}}``."""
+        import jax.numpy as jnp
+        sim = self._sim(sim)
+        build = self.ce_builder(sim)
+        nv = len(self.region.electrode_names); nh = len(self.region.heater_names)
+
+        def params(v):
+            return {"V": jnp.asarray(self._vec(v.get("V"), self.region.electrode_names)) if nv else jnp.zeros(0),
+                    "P": jnp.asarray(self._vec(v.get("P"), self.region.heater_names)) if nh else jnp.zeros(0)}
+        return _sweep(sim, build, [params(v) for v in values])
+
+
+def _sweep(sim, build, params_list):
+    """Forward runs of ``sim`` with coefficients ``build(p)``, compiled once."""
+    import jax
+    from .jaxbackend import _run_fn
+    run = jax.jit(lambda p: _run_fn(sim)(build(p)))
+    outs = []
+    for p in params_list:
+        out = run(p)
+        outs.append(jax.tree_util.tree_map(np.asarray, out))
+    return outs
 
 
 class _OffsetMesh(statics.Mesh):
@@ -1053,65 +1084,83 @@ class _OffsetMesh(statics.Mesh):
 
 @dataclass
 class EIMActive:
-    """Drive response of a waveguide transferred to a 2-D chip-plane run (see
-    :meth:`PreparedActive.eim`)."""
-    footprint: list
-    slopes: Dict[str, float]
-    n_eff0: float
-    electrode_names: list
-    heater_names: list
+    """Drive response of waveguides transferred to a 2-D chip-plane run (see
+    :meth:`PreparedActive.eim`).
 
-    def delta_n(self, V=None, P=None) -> float:
+    ``regions`` is a list of ``(footprint geometries, {drive: d n / d drive})``;
+    ``a + b`` combines two (e.g. the two arms of a push-pull modulator).
+    Drive values are passed as one dict keyed by drive name (voltages and
+    heater powers alike, in the units of the cross-section they came from)."""
+    regions: list
+
+    def __add__(self, other: "EIMActive") -> "EIMActive":
+        return EIMActive(list(self.regions) + list(other.regions))
+
+    @property
+    def drives(self):
+        return sorted({k for _, sl in self.regions for k in sl})
+
+    def _masks(self, sim):
+        out = []
+        for geoms, _ in self.regions:
+            m = np.zeros(sim.grid.shape, bool)
+            for g in geoms:
+                m |= np.asarray(g.region_mask(sim.grid), bool)
+            if not m.any():
+                raise ValueError("a footprint covers no cells of the simulation")
+            out.append(m)
+        return out
+
+    def _dn(self, slopes, drives):
         dn = 0.0
-        for d in (V or {}), (P or {}):
-            for k, v in d.items():
-                if k not in self.slopes:
-                    raise KeyError(f"unknown drive {k!r}; have {sorted(self.slopes)}")
-                dn += self.slopes[k] * float(v)
+        for k, v in (drives or {}).items():
+            if k not in self.drives:
+                raise KeyError(f"unknown drive {k!r}; have {self.drives}")
+            dn = dn + slopes.get(k, 0.0) * v
         return dn
 
-    def _mask(self, sim):
-        m = np.zeros(sim.grid.shape, bool)
-        for g in self.footprint:
-            m |= np.asarray(g.region_mask(sim.grid), bool)
-        if not m.any():
-            raise ValueError("the footprint covers no cells of the simulation")
-        return m
-
-    def eps_components(self, sim, V=None, P=None):
-        m = self._mask(sim)
-        out = []
-        for e in sim.eps_components():
-            e = np.array(e, float)
-            n = np.sqrt(e[m])
-            e[m] = (n + self.delta_n(V, P)) ** 2
-            out.append(e)
+    def eps_components(self, sim, drives=None):
+        """``(eps_xx, eps_yy, eps_zz)`` of ``sim`` with the drives applied."""
+        out = [np.array(e, float) for e in sim.eps_components()]
+        for m, (_, slopes) in zip(self._masks(sim), self.regions):
+            dn = float(self._dn(slopes, drives))
+            for e in out:
+                e[m] = (np.sqrt(e[m]) + dn) ** 2
         return tuple(out)
 
-    def coefficients(self, sim, V=None, P=None):
+    def coefficients(self, sim, drives=None):
         from .jaxbackend import update_coefficients
-        return update_coefficients(sim, self.eps_components(sim, V, P))
+        return update_coefficients(sim, self.eps_components(sim, drives))
 
-    def run(self, sim, V=None, P=None, **kw):
-        ce, ca = self.coefficients(sim, V, P)
+    def run(self, sim, drives=None, **kw):
+        ce, ca = self.coefficients(sim, drives)
         return sim.run(ce=ce, ca=ca, **kw)
 
     def ce_builder(self, sim):
-        """``ce_of_params({'V': {...}} or {'dn': {name: ...}})``: JAX coefficients
-        with ``params`` a dict of drive values keyed by name."""
+        """``ce_of_params({drive: value, ...}) -> ce`` in JAX, for the
+        design-gradient tools (e.g. find the voltage for a target split)."""
         import jax.numpy as jnp
-        m = jnp.asarray(self._mask(sim))
+        masks = [jnp.asarray(m) for m in self._masks(sim)]
         base = [jnp.asarray(np.asarray(e, float)) for e in sim.eps_components()]
         dt = sim.dt
-        slopes = dict(self.slopes)
+        cdt = np.dtype(sim.dtypes["Ex"])
+        regions = [dict(sl) for _, sl in self.regions]
 
         def ce_of_params(params, **_):
-            dn = 0.0
-            for k, v in params.items():
-                dn = dn + slopes[k] * v
-            out = {}
-            for c, name in enumerate(("Ex", "Ey", "Ez")):
-                e = jnp.where(m, (jnp.sqrt(base[c]) + dn) ** 2, base[c])
-                out[name] = dt / (e * EPS_0)
-            return out
+            eps = list(base)
+            for m, slopes in zip(masks, regions):
+                dn = self._dn(slopes, params)
+                eps = [jnp.where(m, (jnp.sqrt(e) + dn) ** 2, e) for e in eps]
+            return {name: (dt / (eps[c] * EPS_0)).astype(cdt)
+                    for c, name in enumerate(("Ex", "Ey", "Ez"))}
         return ce_of_params
+
+    def sweep(self, sim, values: Sequence[dict]):
+        """Run ``sim`` at each drive setting (dicts keyed by drive name),
+        compiling once; returns the monitor outputs (see
+        :meth:`PreparedActive.sweep`)."""
+        import jax.numpy as jnp
+        names = self.drives
+        build = self.ce_builder(sim)
+        plist = [{k: jnp.asarray(float(v.get(k, 0.0))) for k in names} for v in values]
+        return _sweep(sim, build, plist)
