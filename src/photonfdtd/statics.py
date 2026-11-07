@@ -197,14 +197,41 @@ class _Solver:
         return x
 
 
-def _gradient(u, mesh):
-    """``grad u`` at cell centres, three arrays (zero along collapsed axes)."""
+def _electric_field(phi, mesh, fixed, ground):
+    """``E = -grad phi`` at cell centres, consistent with the finite-volume
+    fluxes: each face's field is the potential difference across it, with a
+    conductor's potential on its surface (half a cell from the neighbouring
+    centre) and, for ``ground``, 0 V on the outer boundary. A cell's field is
+    the mean of its two faces along each axis (one face at an insulating outer
+    boundary); inside conductors it is zero."""
     out = []
     for a in range(3):
-        if mesh.shape[a] > 1:
-            out.append(np.gradient(u, mesh.cell_size[a], axis=a))
-        else:
-            out.append(np.zeros_like(u))
+        n = mesh.shape[a]
+        if n == 1:
+            out.append(np.zeros_like(phi))
+            continue
+        d = mesh.cell_size[a]
+        p = np.moveaxis(phi, a, 0)
+        fx = np.moveaxis(fixed, a, 0)
+        # Faces 0..n (n+1 of them); face i sits between cells i-1 and i.
+        Ef = np.zeros((n + 1,) + p.shape[1:])
+        both = ~fx[:-1] & ~fx[1:]
+        lo_fix = fx[:-1] & ~fx[1:]
+        hi_fix = ~fx[:-1] & fx[1:]
+        diff = p[1:] - p[:-1]
+        Ef[1:-1] = np.where(both, -diff / d,
+                            np.where(lo_fix | hi_fix, -diff / (d / 2), 0.0))
+        valid = np.zeros((n + 1,) + p.shape[1:], bool)
+        valid[1:-1] = both | lo_fix | hi_fix
+        if ground:
+            Ef[0] = np.where(fx[0], 0.0, -(p[0] - 0.0) / (d / 2))
+            Ef[-1] = np.where(fx[-1], 0.0, -(0.0 - p[-1]) / (d / 2))
+            valid[0] = ~fx[0]
+            valid[-1] = ~fx[-1]
+        w = valid[:-1].astype(float) + valid[1:].astype(float)
+        E = (Ef[:-1] * valid[:-1] + Ef[1:] * valid[1:]) / np.maximum(w, 1.0)
+        E = np.where(fx, 0.0, E)
+        out.append(np.moveaxis(E, 0, a))
     return tuple(out)
 
 
@@ -290,7 +317,8 @@ def solve_potential(mesh, eps_dc, electrodes: Sequence, voltages=None,
         u[free] = solve(-(A_fx @ u[fixed]))
         phi = u.reshape(mesh.shape)
         basis_phi[i] = phi
-        basis_E[i] = -np.stack(_gradient(phi, mesh))
+        basis_E[i] = np.stack(_electric_field(phi, mesh, fixed.reshape(mesh.shape),
+                                              boundary == "ground"))
     v = np.zeros(n_el) if voltages is None else np.asarray(voltages, float)
     if voltages is None:
         v[0] = 1.0

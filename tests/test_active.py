@@ -387,3 +387,48 @@ def test_from_gdsfactory_returns_the_active_region():
     with pytest.raises(ValueError, match="no polygon"):
         pf.from_gdsfactory(c, layers={}, cell_size=0.1e-6,
                            electrodes={"x": ((2, 0), (0.0, 0.5e-6), (0, 0))})
+
+
+def test_fdtd_phase_index_follows_the_pockels_formula():
+    """Statics -> Pockels -> FDTD. Plates bias x-cut LN (optic axis along y);
+    inside, d eps_yy = -eps_e^2 r33 E_y exactly, and an Ey wave between them,
+    whose field is normal to the y-layering, travels at the series (harmonic)
+    mean of eps_yy over the gap."""
+    lam = 1.55e-6
+    f = C0 / lam
+    ln = A.lithium_niobate_eo(lam, cut="x")
+    dx = 0.04e-6
+    grid = pf.Grid(size=(24e-6, 1.2e-6), cell_size=dx, pml_layers=(25, 0, 0))
+    fill = pf.Box((0.0, 0.0), (60e-6, 2e-6), ln)
+    y = grid.coords[1]
+    top = pf.Box((0.0, y[-1]), (60e-6, dx), A.metal_active("Au"))
+    bot = pf.Box((0.0, y[0]), (60e-6, dx), A.metal_active("Au"))
+    src = [pf.PointDipole(position=(-8e-6, yy), component="Ey",
+                          waveform=pf.GaussianPulse(freq0=f, fwhm=8e-15))
+           for yy in y]
+    mon = pf.DFTMonitor(name="d", components=("Ey",), freqs=np.array([f]))
+    sim = pf.Simulation(grid, structures=[fill], sources=src, monitors=[mon],
+                        run_time=200e-15, precision="float64")
+    reg = A.ActiveRegion([fill, top, bot], electrodes=[A.Electrode(top, "t"),
+                                                       A.Electrode(bot, "b")],
+                         wavelength=lam)
+    prep = reg.prepare(sim)
+    V = 100.0
+    E = -V / (y[-1] - y[0] - dx)          # between the plate faces, pointing down
+    eps_e = ln.permittivity[1]
+    i = grid.shape[0] // 2
+    eps_V = prep.eps_components(V={"t": V})[1][i, :, 0]
+    # Every cell between the plates gets exactly the Pockels change.
+    assert np.allclose(eps_V[1:-1] - eps_e, -eps_e ** 2 * 30.8e-12 * E, rtol=1e-9)
+    x = grid.coords[0]
+    i1, i2 = (int(np.argmin(np.abs(x - p))) for p in (-4e-6, 6e-6))
+    j = grid.shape[1] // 2
+
+    def n_of(res):
+        ph = np.unwrap(np.angle(np.asarray(res.dft["d"]["Ey"])[0, :, j, 0]))
+        return abs(ph[i2] - ph[i1]) / (x[i2] - x[i1]) * C0 / (2 * np.pi * f)
+
+    dn_fdtd = n_of(prep.run(V={"t": V})) - n_of(sim.run())
+    series = lambda e: np.sqrt(1.0 / np.mean(1.0 / e))
+    dn_expected = series(eps_V) - series(np.full_like(eps_V, eps_e))
+    assert dn_fdtd == pytest.approx(dn_expected, rel=0.02)
