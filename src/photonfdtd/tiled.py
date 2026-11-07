@@ -118,7 +118,7 @@ def disk_bytes(sim, tile_cells: int, steps_per_tile: int, n_states: int = 1) -> 
     nx, ny, nz = static["shape"]
     h = steps_per_tile + 1
     px = int(math.ceil(nx / tile_cells)) * tile_cells + 2 * h
-    n_ce = 4 if sim.subpixel else 1
+    n_ce = 4 if sim.per_component else 1
     item = np.dtype(static["npdt"]).itemsize
     state = _state_bytes(sim, static, px, _n_poles_cells(sim, static))
     return n_states * state + n_ce * px * ny * nz * item
@@ -158,7 +158,7 @@ def tile_bytes(sim, tile_cells: int, steps_per_tile: int,
     L = tile_cells + 2 * (steps_per_tile + 1)
     item = np.dtype(static["npdt"]).itemsize
     n_psi = sum(len(c["terms"]) for c in static["comps"])
-    n_ce = 4 if sim.subpixel else 1
+    n_ce = 4 if sim.per_component else 1
     plane = ny * nz
     state = (6 + n_psi) * L * plane * item \
         + 2 * npole * 3 * min(n_disp, L * plane) * item
@@ -888,7 +888,8 @@ def _buf_cotangent(mons, tile, g, nx, h, bufs):
 
 
 def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
-              workdir: Optional[str] = None, budget_bytes: Optional[float] = None):
+              workdir: Optional[str] = None, budget_bytes: Optional[float] = None,
+              ce=None):
     """Run ``sim`` forward with disk-backed fields, tiled along x.
 
     Parameters
@@ -909,7 +910,11 @@ def run_tiled(sim, tile_cells: Optional[int] = None, steps_per_tile: int = 8,
         Device memory budget used to pick ``tile_cells`` (default: what
         :func:`photonfdtd.memory.available_memory` reports).
     """
-    with _Tiled(sim, tile_cells, steps_per_tile, workdir, budget_bytes) as tr:
+    if ce is None and getattr(sim, "_has_anisotropy", False):
+        from .jaxbackend import update_coefficients
+        ce = update_coefficients(sim)[0]
+    with _Tiled(sim, tile_cells, steps_per_tile, workdir, budget_bytes,
+                ce=ce) as tr:
         tr.check_disk(disk_bytes(sim, tr.T, tr.K))
         state = tr.new_state("s")
         for n0 in range(0, tr.n_steps, tr.K):
@@ -1044,6 +1049,10 @@ def value_and_grad_eps_tiled(sim, loss, tile_cells: Optional[int] = None,
     their cells ``eps_r`` is ``eps_inf``, with the poles held fixed.
     """
     import jax
+    if sim._has_anisotropy or sim._has_conductivity:
+        raise NotImplementedError(
+            "value_and_grad_eps_tiled differentiates a scalar eps_r; anisotropic "
+            "or conductive media need value_and_grad_params")
     if sim.subpixel:
         raise NotImplementedError(
             "value_and_grad_eps_tiled differentiates the scalar per-cell eps_r, "

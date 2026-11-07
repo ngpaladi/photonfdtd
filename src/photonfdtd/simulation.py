@@ -225,6 +225,21 @@ class Simulation:
                 "Subpixel smoothing combined with dispersive media is not "
                 "yet supported. Use one or the other."
             )
+        # Diagonal-tensor media (AnisotropicMedium) make the E update use one
+        # coefficient per component; conductive media add a lossy decay factor.
+        self._has_anisotropy = any(
+            getattr(getattr(s, "medium", None), "is_anisotropic", False)
+            for s in self.structures
+        )
+        if self._has_anisotropy and self.subpixel:
+            raise NotImplementedError(
+                "Subpixel smoothing combined with anisotropic media is not "
+                "yet supported. Use one or the other."
+            )
+        self._has_conductivity = any(
+            float(getattr(getattr(s, "medium", None), "conductivity", 0.0) or 0.0) != 0.0
+            for s in self.structures
+        )
         # Moving current sources (e.g. ChargedParticle) are deposited along
         # their trajectory each step rather than expanded into fixed-cell soft
         # dipoles (see jaxbackend._particle_plan).
@@ -309,8 +324,46 @@ class Simulation:
     def eps_r(self, value) -> None:
         # Allow callers to stamp a custom permittivity grid. Once set
         # explicitly it is no longer regenerated from `structures`.
+        if self._has_anisotropy:
+            raise ValueError(
+                "this simulation has anisotropic media, so a single scalar "
+                "eps_r can't describe it; build the layout from structures, or "
+                "pass per-component coefficients (Simulation.run(ce=...)).")
         self._eps_r = value
         self._eps_r_custom = True
+
+    @property
+    def per_component(self) -> bool:
+        """True when the E update needs one coefficient per field component
+        (subpixel smoothing or anisotropic media)."""
+        return bool(self.subpixel or self._has_anisotropy)
+
+    def eps_components(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The permittivity seen by Ex, Ey and Ez, as the E update uses it:
+        subpixel-smoothed when smoothing is on, stamped per component for
+        anisotropic media, and otherwise ``(eps_r, eps_r, eps_r)``."""
+        if self.subpixel:
+            return self._smoothed_eps_components()
+        if not self._has_anisotropy:
+            e = self.eps_r
+            return (e, e, e)
+        from .materials import eps_components_of
+        comps = [np.ones(self.grid.shape, dtype=self.dtypes["eps_r"]) for _ in range(3)]
+        for st in self.structures:
+            mask = st.region_mask(self.grid)
+            for c, v in zip(comps, eps_components_of(st.medium)):
+                c[mask] = v
+        return tuple(comps)
+
+    def conductivity_map(self) -> Optional[np.ndarray]:
+        """Per-cell conductivity sigma (S/m), or None if no medium is lossy."""
+        if not self._has_conductivity:
+            return None
+        sig = np.zeros(self.grid.shape, dtype=np.float64)
+        for st in self.structures:
+            sig[st.region_mask(self.grid)] = float(
+                getattr(st.medium, "conductivity", 0.0) or 0.0)
+        return sig
 
     # ------------------------------------------------------------------ #
     # Attach sources / monitors after construction. Useful when the
@@ -362,7 +415,8 @@ class Simulation:
     # ------------------------------------------------------------------ #
     def run(self, disk_tiled: Optional[bool] = None,
             tile_cells: Optional[int] = None, steps_per_tile: int = 8,
-            workdir: Optional[str] = None) -> Result:
+            workdir: Optional[str] = None, ce=None, ca=None,
+            modulation=None) -> Result:
         """Time-step the simulation on JAX/XLA and return the recorded monitor
         data (see :func:`photonfdtd.jaxbackend.run_jax`).
 
@@ -378,6 +432,11 @@ class Simulation:
             with a warning.
         tile_cells, steps_per_tile, workdir
             Passed to :func:`~photonfdtd.tiled.run_tiled` when tiling.
+        ce, ca, modulation
+            Optional E-update coefficient overrides and a time-varying
+            permittivity drive, as built by :class:`photonfdtd.active.ActiveRegion`
+            (see :func:`photonfdtd.jaxbackend.run_jax`). Disk tiling takes
+            ``ce`` only.
         """
         if disk_tiled is None:
             disk_tiled = self._needs_disk_tiling()
@@ -394,12 +453,17 @@ class Simulation:
                   f"{jax.devices()[0]}, grid {self.grid.shape}, "
                   f"{self.n_steps} steps, {mode}")
         if disk_tiled:
+            if ca is not None or modulation is not None or self._has_conductivity:
+                raise NotImplementedError(
+                    "disk-tiled runs support neither conductive media nor a "
+                    "time-varying permittivity; run in memory (disk_tiled=False)")
             from .tiled import run_tiled
             result = run_tiled(self, tile_cells=tile_cells,
-                               steps_per_tile=steps_per_tile, workdir=workdir)
+                               steps_per_tile=steps_per_tile, workdir=workdir,
+                               **({"ce": ce} if ce is not None else {}))
         else:
             from .jaxbackend import run_jax
-            result = run_jax(self)
+            result = run_jax(self, ce=ce, ca=ca, modulation=modulation)
         if self.progress_callback is not None:
             self.progress_callback(self.n_steps, self.n_steps)
         return result

@@ -187,13 +187,23 @@ class ModeSolver:
         self.polarization = polarization
 
         # Build eps_r(y, z) by stamping the boxes (row index = y, col = z).
+        # Anisotropic (diagonal-tensor) media also fill ``eps_components``,
+        # the permittivity seen by (Ex, Ey, Ez); it stays None for an
+        # isotropic layout, and then every component uses eps_r.
+        self.structures = list(structures)
+        self.background_eps = float(background_eps)
         eps_r = np.full((ny, nz), float(background_eps))
-        for s in structures:
-            self._stamp_2d(s, eps_r)
+        aniso = any(getattr(getattr(st, "medium", None), "is_anisotropic", False)
+                    for st in structures)
+        comps = ([np.full((ny, nz), float(background_eps)) for _ in range(3)]
+                 if aniso else None)
+        for st in structures:
+            self._stamp_2d(st, eps_r, comps)
         self.eps_r = eps_r
+        self.eps_components = None if comps is None else tuple(comps)
 
     # ------------------------------------------------------------------ #
-    def _stamp_2d(self, box: Box, eps_r: np.ndarray) -> None:
+    def _stamp_2d(self, box: Box, eps_r: np.ndarray, comps=None) -> None:
         c = list(box.center) + [0.0, 0.0]
         s = list(box.size) + [0.0, 0.0]
         # interpret as (y, z) if 2D centre / size; else (x, y, z) and use (y, z)
@@ -223,6 +233,13 @@ class ModeSolver:
         else:
             val = med.eps_r
         eps_r[yy, zz] = val
+        if comps is not None:
+            if getattr(med, "is_anisotropic", False):
+                vals = med.eps_components
+            else:
+                vals = (val, val, val)
+            for c, v in zip(comps, vals):
+                c[yy, zz] = v
 
     # ------------------------------------------------------------------ #
     def _difference_operators(self):
@@ -262,10 +279,13 @@ class ModeSolver:
 
         Uu, Uv, Vu, Vv = self._difference_operators()
 
-        er = self.eps_r.reshape(N).astype(float)
-        eps_u = sp.diags(er)          # permittivity seen by E_u (=Ez)
-        eps_v = sp.diags(er)          # permittivity seen by E_v (=Ey)
-        ezi = sp.diags(1.0 / er)      # inverse longitudinal permittivity 1/eps_xx
+        if self.eps_components is None:
+            exx = eyy = ezz = self.eps_r
+        else:
+            exx, eyy, ezz = self.eps_components
+        eps_u = sp.diags(np.asarray(ezz, float).reshape(N))   # seen by E_u (=Ez)
+        eps_v = sp.diags(np.asarray(eyy, float).reshape(N))   # seen by E_v (=Ey)
+        ezi = sp.diags(1.0 / np.asarray(exx, float).reshape(N))  # 1/eps_xx (longitudinal)
         I = sp.eye(N, format="csr")
 
         # Full-vectorial transverse-E operator (Zhu & Brown / philsol form).
@@ -282,7 +302,7 @@ class ModeSolver:
 
         # We want the guided modes: the eigenvalues beta**2 just below the
         # largest possible value (k0 n_max)**2.  Shift-invert near that point.
-        n_max = float(np.sqrt(self.eps_r.max()))
+        n_max = float(np.sqrt(max(np.max(c) for c in (exx, eyy, ezz))))
         sigma = (k0 * n_max) ** 2
 
         # Ask for a few extra so a polarization filter still has candidates.
@@ -362,7 +382,10 @@ class ModeSolver:
         m, ny, nz = Ey.shape
         dy, dz = self.dy, self.dz
         omega = C_0 * k0
-        eps = self.eps_r  # (ny, nz)
+        if self.eps_components is None:
+            exx = eyy = ezz = self.eps_r  # (ny, nz)
+        else:
+            exx, eyy, ezz = self.eps_components
 
         Ex = np.zeros_like(Ey)
         Hx = np.zeros_like(Ey)
@@ -373,10 +396,10 @@ class ModeSolver:
             if beta == 0:
                 continue
             # Gauss's law div(eps E)=0 with d/dx -> i beta (axis 0 = y, axis 1 = z):
-            #   i beta eps Ex = -(d(eps Ey)/dy + d(eps Ez)/dz)
-            d_epsEy_dy = np.gradient(eps * Ey[i], dy, axis=0)
-            d_epsEz_dz = np.gradient(eps * Ez[i], dz, axis=1)
-            Ex[i] = -(d_epsEy_dy + d_epsEz_dz) / (1j * beta * eps)
+            #   i beta eps_xx Ex = -(d(eps_yy Ey)/dy + d(eps_zz Ez)/dz)
+            d_epsEy_dy = np.gradient(eyy * Ey[i], dy, axis=0)
+            d_epsEz_dz = np.gradient(ezz * Ez[i], dz, axis=1)
+            Ex[i] = -(d_epsEy_dy + d_epsEz_dz) / (1j * beta * exx)
             dEx_dy = np.gradient(Ex[i], dy, axis=0)
             dEx_dz = np.gradient(Ex[i], dz, axis=1)
             # H = curl(E)/(i omega mu0), d/dx -> i beta
