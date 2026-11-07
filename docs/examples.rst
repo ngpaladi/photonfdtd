@@ -1,11 +1,12 @@
 Tutorial: worked examples
 =========================
 
-The ``examples/`` directory holds seven self-contained, runnable scripts. The
+The ``examples/`` directory holds ten self-contained, runnable scripts. The
 first five climb from a one-dimensional pulse up to a moving charge radiating a
-Cherenkov cone, and then put that charge inside a dielectric tube; the last two
+Cherenkov cone, and then put that charge inside a dielectric tube; the next two
 turn to design, optimizing a splitter by gradient descent and training a chip
-on a dataset like a neural network. Each one adds exactly
+on a dataset like a neural network; the last three switch light with voltages
+and heaters. Each one adds exactly
 one new piece of the API or physics, so you can read them in order and never be
 more than a step ahead of yourself. Every script saves the figure shown below;
 run one with, e.g.::
@@ -223,5 +224,80 @@ which is an interferometer.
    port-1 power fraction against the input relative phase, coloured by class.
 
 .. literalinclude:: ../examples/07_train_photonic_classifier.py
+   :language: python
+   :linenos:
+
+
+8. A lithium niobate phase modulator
+------------------------------------
+
+The first active device (:doc:`active_devices`). An x-cut thin-film lithium
+niobate rib sits between two gold electrodes 5 um apart. The optic axis runs
+across the waveguide, so the TE mode and the electrodes' lateral field both use
+the large r33 coefficient. :class:`~photonfdtd.ActiveRegion` solves the
+potential on the mode solver's cross-section (one solve per electrode), turns
+the field into the Pockels index change, and re-solves the mode at each
+voltage. The script prints ``V_pi * L`` of 4.2 V cm for one arm; a push-pull
+Mach-Zehnder halves it, matching the ~2.2 V cm reported for such devices.
+
+.. figure:: ../examples/08_ln_phase_modulator.png
+   :width: 100%
+   :alt: Potential map, index change and n_eff against voltage for a thin-film LN modulator
+
+   Left: the potential with the signal electrode at 1 V, and the mode's
+   ``|Ey|``. Middle: the index change of the ``yy`` component at 10 V. Right:
+   ``n_eff`` against voltage, linear as the Pockels effect is.
+
+.. literalinclude:: ../examples/08_ln_phase_modulator.py
+   :language: python
+   :linenos:
+
+
+9. Switching light with a voltage
+---------------------------------
+
+A delta-beta coupler switch in FDTD. Two lithium niobate waveguides couple
+over their length, so light launched in the lower one crosses to the upper.
+Push-pull electrodes raise one waveguide's index and lower the other's; the
+detuning breaks the phase matching, and the light comes back out of the
+waveguide it entered. The cross-section of example 8 gives ``d n_eff / dV``,
+:meth:`~photonfdtd.active.PreparedActive.eim` carries it to a 2-D chip-plane
+model with opposite signs on the two arms, and
+:meth:`~photonfdtd.active.EIMActive.sweep` runs 16 voltages from one compiled
+simulation. The output switches from 99.5% cross at 0 V to 99.3% bar.
+
+The FDTD coupler is 41 um long, so it switches at about 1 kV: the voltage
+scales as 1 / length, and the top axis converts to a 5 mm device (about 8 V).
+
+.. figure:: ../examples/09_eo_coupler_switch.png
+   :width: 100%
+   :alt: Field maps of a coupler switch at 0 V and 1000 V, and the switching curve
+
+   Left and middle: ``|Ey|`` at 0 V (the light crosses over) and 1000 V (it
+   stays). The cyan line marks the read-out plane. Right: the cross and bar
+   fractions against voltage.
+
+.. literalinclude:: ../examples/09_eo_coupler_switch.py
+   :language: python
+   :linenos:
+
+
+10. A heater phase shifter
+--------------------------
+
+A TiN heater 1 um above a silicon strip. The steady-state temperature is solved
+on the cross-section with the substrate as the heat sink, silicon's large
+thermo-optic coefficient turns it into an index change, and the mode solver
+finds the power for a pi phase shift: about 17 mW, independent of the heater's
+length (a longer heater spreads the same power thinner).
+
+.. figure:: ../examples/10_thermo_optic_heater.png
+   :width: 100%
+   :alt: Temperature map around a heated silicon waveguide and n_eff against heater power
+
+   Left: the temperature rise at ``P_pi`` for a 100 um heater. Right: the
+   change of ``n_eff`` against heater power, with the pi-phase level dashed.
+
+.. literalinclude:: ../examples/10_thermo_optic_heater.py
    :language: python
    :linenos:

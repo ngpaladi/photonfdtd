@@ -804,7 +804,7 @@ class PreparedActive:
         return deps, sigma
 
     def delta_eps(self, V=None, P=None, bias=None):
-        """Permittivity change (3, *static mesh) for voltages ``V``, powers
+        """Permittivity change ``(3, *mesh.shape)`` for voltages ``V``, powers
         ``P`` and junction biases ``bias``, plus the free-carrier conductivity
         (or None)."""
         v = self._vec(V, self.region.electrode_names)

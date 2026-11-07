@@ -22,6 +22,7 @@ don't. See :doc:`api` for the full reference.
    accuracy
    optimization
    training_tutorial
+   active_devices
    layout_scale
    examples
    api
@@ -73,6 +74,12 @@ Capabilities
   layout, parametric shapes, Adam / optax loops with beta continuation, robust
   (eroded / dilated) objectives, GDS export, and training a chip on a dataset
   like a neural network (:func:`~photonfdtd.train`). See :doc:`optimization`.
+- **Active devices**: electro-optic (lithium niobate and other crystals),
+  thermo-optic (heaters) and free-carrier (silicon PN) index changes from
+  electrostatic and thermal solves, for ``V_pi * L`` and ``P_pi`` in the mode
+  solver, voltage sweeps of switches in FDTD, drive optimization by gradient
+  descent, and RF drives. Anisotropic (diagonal-tensor) and conductive media.
+  See :doc:`active_devices`.
 - **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
   :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
   before it starts, and disk-tiled forward runs and adjoints for grids that

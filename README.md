@@ -164,6 +164,14 @@ print(result.n_eff)            # array of effective indices
   grids too big for the device a **disk-tiled adjoint**
   (`jax_value_and_grad_eps_tiled`). Dispersive media are differentiable on
   every path (the reversible ones need lossless poles, e.g. Sellmeier glass).
+- **Active devices.** Switch light with voltages and heaters
+  (`photonfdtd.active`): electro-optic crystals (x/z-cut lithium niobate,
+  LiTaO3, BaTiO3, EO polymers), thermo-optic heaters and silicon free-carrier
+  dispersion, from built-in electrostatic and thermal solvers
+  (`photonfdtd.statics`). Get `V_pi * L` and `P_pi` from the mode solver, sweep
+  a switch's voltage in FDTD, optimize drive voltages by gradient descent, or
+  step an RF drive in time. Anisotropic (diagonal-tensor) and conductive media
+  work everywhere.
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient
