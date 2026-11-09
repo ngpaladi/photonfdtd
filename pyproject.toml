@@ -34,6 +34,8 @@ docs = ["sphinx>=7", "sphinx-rtd-theme>=3"]
 # GDS export of optimized designs; optax optimizers for the design loops.
 gds = ["gdstk"]
 optim = ["optax"]
+# LNOI switch cells for gdsfactory (photonfdtd.lnoi).
+gdsfactory = ["gdsfactory>=9"]
 
 [project.urls]
 Homepage = "https://github.com/ngpaladi/photonfdtd"
