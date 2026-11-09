@@ -65,9 +65,10 @@ __all__ = ["Layers", "LAYERS", "Stack", "rib", "phase_shifter", "mzi_switch",
 @dataclass(frozen=True)
 class Layers:
     """GDS layers the cells draw on: the unetched LN ridge and the electrode
-    metal."""
-    rib: Tuple[int, int] = (2, 0)
-    metal: Tuple[int, int] = (21, 0)
+    metal. The defaults are gdsfactory's generic ``WG`` and ``MTOP`` layers,
+    so the generic pads and metal routing connect to the electrodes."""
+    rib: Tuple[int, int] = (1, 0)
+    metal: Tuple[int, int] = (49, 0)
 
 
 LAYERS = Layers()
