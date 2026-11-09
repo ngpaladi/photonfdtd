@@ -155,6 +155,8 @@ See :doc:`chip_simulation` for the guide.
 
 .. automodule:: photonfdtd.circuit.sax
 
+.. automodule:: photonfdtd.circuit.library
+
 .. automodule:: photonfdtd.circuit.cells
 
 Layout-scale methods

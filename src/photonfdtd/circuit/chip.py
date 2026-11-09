@@ -510,6 +510,9 @@ def _model_for(name, inst, cell, models, wg, lnoi_kwargs) -> Model:
         return user if isinstance(user, Model) else user(cell, settings, info)
     optical = [p.name for p in cell.ports if p.port_type == "optical"]
     elec = [p.name for p in cell.ports if p.port_type != "optical"]
+    if "pcomp" in info:
+        from .library import model_for_cell
+        return model_for_cell(info)
     if "lnoi" in info:
         from .. import lnoi
         kw = dict(lnoi_kwargs)

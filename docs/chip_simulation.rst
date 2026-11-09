@@ -78,6 +78,43 @@ voltage, the current each drive supplies and every heater's power.
 :func:`~photonfdtd.circuit.to_sax` the same circuit for ``sax.circuit`` (the
 two agree to round-off).
 
+Component files
+---------------
+
+A component file (``*.pcomp.json``, plain-text JSON) is a part you can share
+and import, like a KiCad library part: one file with
+
+- the **layout**: fixed polygons per GDS layer;
+- the **ports** (optical and electrical) and the **pins**: which electrical
+  ports are one piece of metal;
+- the **model**, in up to three forms: ``physics`` (solved parameters: an LN
+  switch's ``d n_eff / dV`` and coupling, a detector's responsivity, a
+  heater's ``P_pi``, a waveguide's indices, or a whole sub-circuit of such
+  parts), ``sparams`` (S-matrices sampled over wavelength and drive voltages,
+  from FDTD, a measurement or the physics), and ``recipe`` (what the physics
+  was solved from, to re-solve at another wavelength or mesh);
+- optionally a **generator** to rebuild the part with other parameters: a
+  function in photonfdtd or gdsfactory, or Python source carried in the file,
+  which runs only when loaded with ``trust=True``.
+
+.. code-block:: python
+
+   from photonfdtd.circuit import export_component, load_component, sample_sparams
+
+   export_component(lnoi.mzi_switch(arm_length=5000), "mzi_5mm", description="5 mm MZI switch")
+   part = load_component("mzi_5mm.pcomp.json")
+   cell = part.cell()                 # place it in any gdsfactory layout
+   part.model()                       # its circuit model (no re-solve)
+   part.resolve(wavelength=1.31)      # re-solve from the recipe
+   part.regenerate(arm_length=8000)   # rebuild through the generator
+
+A component holding several instances (a sub-layout) exports as a
+``circuit``: its parts' physics, the connections between them, and the ports
+and pads it exposes as its own pins. Circuits built from a layout that uses a
+loaded part's cell find its model by themselves. A sub-circuit drives its
+internal electrodes through its pins; currents drawn inside it (heaters,
+detectors) are not passed back to the outer circuit.
+
 Time domain
 -----------
 

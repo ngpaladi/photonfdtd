@@ -183,6 +183,9 @@ print(result.n_eff)            # array of effective indices
   routes, electrodes, heaters, photodetectors and load resistors, with DC
   sweeps, wavelength sweeps and time-domain drives (square waves, PRBS) through
   each modulator's and detector's bandwidth. Exports the circuit to sax.
+  Parts travel as component files (`*.pcomp.json`): layout, ports, pins and
+  model (solved physics, S-parameter tables, the recipe) in one JSON file,
+  importable like a KiCad library part.
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient
