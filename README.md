@@ -178,6 +178,11 @@ print(result.n_eff)            # array of effective indices
   switches as gdsfactory cells, each with a voltage model computed from its own
   cross-section (bar and cross against voltage for millimetre devices in about
   a minute). `pip install photonfdtd[gdsfactory]`.
+- **Chip simulation.** `photonfdtd.circuit` simulates a whole gdsfactory
+  layout as a circuit of physics-based models: optics, bond pads, metal
+  routes, electrodes, heaters, photodetectors and load resistors, with DC
+  sweeps, wavelength sweeps and time-domain drives (square waves, PRBS) through
+  each modulator's and detector's bandwidth. Exports the circuit to sax.
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient

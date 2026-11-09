@@ -140,6 +140,23 @@ LNOI switch cells (gdsfactory)
 
 .. automodule:: photonfdtd.lnoi
 
+Chip simulation
+---------------
+
+See :doc:`chip_simulation` for the guide.
+
+.. automodule:: photonfdtd.circuit
+
+.. automodule:: photonfdtd.circuit.models
+
+.. automodule:: photonfdtd.circuit.electrical
+
+.. automodule:: photonfdtd.circuit.solver
+
+.. automodule:: photonfdtd.circuit.sax
+
+.. automodule:: photonfdtd.circuit.cells
+
 Layout-scale methods
 --------------------
 

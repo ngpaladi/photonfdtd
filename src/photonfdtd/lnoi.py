@@ -38,7 +38,11 @@ the electrodes' RF behaviour (velocity matching, microwave loss).
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -53,6 +57,7 @@ from .geometry import Box
 from .mode import ModeSolver
 
 UM = 1e-6
+_CACHE_VERSION = 1
 
 __all__ = ["Layers", "LAYERS", "Stack", "rib", "phase_shifter", "mzi_switch",
            "dbeta_coupler_switch", "model", "SwitchModel", "PhaseShifterModel",
@@ -413,10 +418,16 @@ def _drives(V, names, signals):
 @dataclass
 class PhaseShifterModel:
     """Voltage response of a :func:`phase_shifter`. ``dneff_dV`` is per volt
-    on the signal electrode; ``vpi`` is for the drawn length."""
+    on the signal electrode; ``vpi`` is for the drawn length.
+
+    ``wavelength`` arguments (m) evaluate the phase at another wavelength,
+    keeping ``dneff_dV`` from the design wavelength (phase scales as 1/λ).
+    """
     length: float
     wavelength: float
     dneff_dV: float
+    n_eff: Optional[float] = None
+    electrode_names: list = field(default_factory=lambda: ["sig", "gnd"])
 
     @property
     def vpi_l(self) -> float:
@@ -427,12 +438,16 @@ class PhaseShifterModel:
     def vpi(self) -> float:
         return self.vpi_l / self.length
 
-    def phase(self, V) -> np.ndarray:
-        """Optical phase shift (rad) at signal voltage ``V``."""
-        return 2 * np.pi / self.wavelength * self.dneff_dV * np.asarray(V, float) * self.length
+    def phase(self, V, wavelength: Optional[float] = None) -> np.ndarray:
+        """Optical phase shift (rad) at signal voltage ``V`` (a number, or a
+        dict of electrode voltages: the signal relative to the ground)."""
+        if isinstance(V, dict):
+            V = float(V.get("sig", 0.0)) - float(V.get("gnd", 0.0))
+        lam = self.wavelength if wavelength is None else np.asarray(wavelength, float)
+        return 2 * np.pi / lam * self.dneff_dV * np.asarray(V, float) * self.length
 
-    def transfer(self, V) -> complex:
-        return np.exp(-1j * self.phase(V))
+    def transfer(self, V, wavelength: Optional[float] = None) -> complex:
+        return np.exp(-1j * self.phase(V, wavelength))
 
 
 @dataclass
@@ -460,9 +475,12 @@ class SwitchModel:
             d += self.slopes[:, strip] * V[name]
         return d
 
-    def transfer(self, V=0.0) -> np.ndarray:
+    def transfer(self, V=0.0, wavelength: Optional[float] = None) -> np.ndarray:
+        """``wavelength`` (m, default the design wavelength) rescales the
+        phases as 1/λ, with the coupling and ``d n_eff / dV`` kept from the
+        design wavelength."""
         V = _drives(V, self.electrode_names, self.signals)
-        k0 = 2 * np.pi / self.wavelength
+        k0 = 2 * np.pi / (self.wavelength if wavelength is None else float(wavelength))
         rec = self.rec
         if self.kind == "mzi_switch":
             dc = _coupled(self.kappa, 0.0, rec["coupler"]["length"] * UM)
@@ -512,7 +530,7 @@ class SwitchModel:
 
 
 def model(component, stack: Optional[Stack] = None, cell_size: float = 0.05,
-          wavelength: Optional[float] = None):
+          wavelength: Optional[float] = None, cache: Union[bool, str] = True):
     """The voltage response of an LNOI cell (from its ``info["lnoi"]``).
 
     ``stack`` defaults to :data:`X_CUT` for the phase shifter and the MZI
@@ -522,6 +540,11 @@ def model(component, stack: Optional[Stack] = None, cell_size: float = 0.05,
     waveguides depends exponentially on the gap, so keep the gap and the ridge
     edges on whole cells: a staircased gap at 0.08 um moves the coupling
     length by tens of per cent.
+
+    ``cache`` keeps the result on disk (``True``: in
+    ``~/.cache/photonfdtd/lnoi``, or a directory), keyed by the cell's
+    cross-section record, the stack, the mesh and the wavelength, so building
+    a circuit of many cells solves each design once.
     """
     rec = dict(component.info["lnoi"])
     kind = rec["kind"]
@@ -533,13 +556,57 @@ def model(component, stack: Optional[Stack] = None, cell_size: float = 0.05,
     if kind == "dbeta_coupler_switch" and stack.cut != "z":
         raise ValueError("electrodes on top of the waveguides detune them only on "
                          "z-cut LN (an x-cut film sees the same lateral field in both)")
+    path = _cache_path(cache, rec, stack, cell_size)
+    if path is not None and path.exists():
+        return _from_json(json.loads(path.read_text()))
+    m = _solve_model(rec, stack, cell_size)
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_to_json(m)))
+    return m
+
+
+def _cache_path(cache, rec, stack, cell_size):
+    if not cache:
+        return None
+    root = Path(cache) if isinstance(cache, (str, Path)) else \
+        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "photonfdtd" / "lnoi"
+    key = json.dumps(dict(v=_CACHE_VERSION, rec=rec, stack=stack.__dict__,
+                          cell=cell_size), sort_keys=True, default=float)
+    return root / (hashlib.sha256(key.encode()).hexdigest()[:24] + ".json")
+
+
+def _to_json(m):
+    if isinstance(m, PhaseShifterModel):
+        return dict(type="phase_shifter", length=m.length, wavelength=m.wavelength,
+                    dneff_dV=m.dneff_dV, n_eff=m.n_eff)
+    return dict(type="switch", kind=m.kind, wavelength=m.wavelength, kappa=m.kappa,
+                slopes=m.slopes.tolist(), rec=m.rec, electrode_names=m.electrode_names,
+                signals=m.signals, info={k: float(v) for k, v in m.info.items()})
+
+
+def _from_json(d):
+    if d["type"] == "phase_shifter":
+        return PhaseShifterModel(length=d["length"], wavelength=d["wavelength"],
+                                 dneff_dV=d["dneff_dV"], n_eff=d.get("n_eff"))
+    return SwitchModel(kind=d["kind"], wavelength=d["wavelength"], kappa=d["kappa"],
+                       slopes=np.array(d["slopes"]), rec=d["rec"],
+                       electrode_names=d["electrode_names"], signals=d["signals"],
+                       info=d["info"])
+
+
+def _solve_model(rec, stack, cell_size):
+    kind = rec["kind"]
+    lam = stack.wavelength * UM
     S = _slopes(rec, stack, cell_size)
     names = [n for seg in rec["segments"] for n in seg["electrodes"]]
     signals = [n for n in names if n.startswith("sig")]
     if kind == "phase_shifter":
         seg = rec["segments"][0]
+        optics, _, kw = _cross_section(rec, stack, rec["ribs"], cell_size, with_strips=False)
+        n0 = float(np.real(_modesolver(optics, kw).solve().n_eff[0]))
         return PhaseShifterModel(length=(seg["x1"] - seg["x0"]) * UM, wavelength=lam,
-                                 dneff_dV=float(S[0, seg["electrodes"]["sig"]]))
+                                 dneff_dV=float(S[0, seg["electrodes"]["sig"]]), n_eff=n0)
     cp = rec["coupler"]
     n_even, n_odd = _supermodes(cp["gap"], rec["width"], stack, cell_size)
     kappa = np.pi * (n_even - n_odd) / lam

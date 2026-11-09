@@ -1,13 +1,13 @@
 Tutorial: worked examples
 =========================
 
-The ``examples/`` directory holds eleven self-contained, runnable scripts. The
+The ``examples/`` directory holds twelve self-contained, runnable scripts. The
 first five climb from a one-dimensional pulse up to a moving charge radiating a
 Cherenkov cone, and then put that charge inside a dielectric tube; the next two
 turn to design, optimizing a splitter by gradient descent and training a chip
 on a dataset like a neural network; the next three switch light with voltages
-and heaters, and the last draws lithium niobate switches as gdsfactory
-cells. Each one adds exactly
+and heaters, and the last two draw lithium niobate switches as gdsfactory
+cells and simulate a whole chip built from them. Each one adds exactly
 one new piece of the API or physics, so you can read them in order and never be
 more than a step ahead of yourself. Every script saves the figure shown below;
 run one with, e.g.::
@@ -323,5 +323,30 @@ Needs gdsfactory (``pip install photonfdtd[gdsfactory]``).
    dotted line marks the switching voltage.
 
 .. literalinclude:: ../examples/11_lnoi_switch_cells.py
+   :language: python
+   :linenos:
+
+
+12. A whole optoelectronic chip
+-------------------------------
+
+A lithium niobate chip laid out in gdsfactory: a laser input, the MZI switch
+of example 11 with its signal electrode routed to a bond pad, and a
+photodetector on each output, biased from its own pads.
+:class:`photonfdtd.circuit.Chip` reads the layout's netlist, models every
+instance, traces the metal from the pads to the electrodes, and solves the
+chip: photocurrents against the pad voltage, the light at each detector
+against wavelength, and a 10 Gb/s PRBS on the pad through the modulator's 30
+GHz and the detectors' 20 GHz bandwidths. See :doc:`chip_simulation`.
+
+.. figure:: ../examples/12_optoelectronic_chip.png
+   :width: 100%
+   :alt: Photocurrent against pad voltage, power at each detector against wavelength, and photocurrents under a PRBS drive
+
+   Left: the two photocurrents against the pad voltage (V_pi dotted).
+   Middle: light at each detector at 0 V and at V_pi. Right: photocurrents
+   under the PRBS drive.
+
+.. literalinclude:: ../examples/12_optoelectronic_chip.py
    :language: python
    :linenos:
