@@ -131,7 +131,7 @@ def _physics(cell, info, stack, cell_size, waveguide) -> tuple:
             responsivity=d.get("responsivity", 1.0), dark_current=d.get("dark_current", 0.0),
             bandwidth=d.get("bandwidth"), port=optical[0],
             anode=list(d.get("anode", ["anode"])), cathode=list(d.get("cathode", ["cathode"])))), None
-    wg = dict(neff=1.9, ng=2.3, wl0=1.55, loss_db_cm=0.0, **(waveguide or {}))
+    wg = {**dict(neff=1.9, ng=2.3, wl0=1.55, loss_db_cm=0.0), **(waveguide or {})}
     if fname.startswith("straight_heater_metal"):
         R = float(info.get("resistance") or 0) or 1000.0
         return dict(kind="heater", data=dict(
@@ -140,7 +140,8 @@ def _physics(cell, info, stack, cell_size, waveguide) -> tuple:
                                           "b": [p for p in elec if p.startswith("r_")]})), None
     if fname in ("mmi1x2", "mmi2x2"):
         return dict(kind=fname, data={}), None
-    if len(optical) == 2 and not elec:
+    from .chip import _WAVEGUIDES
+    if len(optical) == 2 and not elec and (fname in _WAVEGUIDES or "length" in info):
         L = info.get("length")
         if L is None:
             a, b = (cell.ports[n].center for n in optical)
@@ -153,6 +154,27 @@ def _physics(cell, info, stack, cell_size, waveguide) -> tuple:
 
 def _conductors_of(model: cm.Model) -> dict:
     return {k: list(v) for k, v in model.conductors.items()}
+
+
+def _is_leaf(cell, info) -> bool:
+    """Cells photonfdtd models as one part, even when they hold instances."""
+    fname = getattr(cell, "function_name", "") or ""
+    return bool(info.get("lnoi") or info.get("photodetector")) \
+        or fname.startswith("straight_heater_metal") or fname in ("mmi1x2", "mmi2x2")
+
+
+def _pins_from_drives(component, drives) -> dict:
+    """Conductors of an sparams-only part: each drive name with the
+    electrical ports named after it (``sig`` -> ``sig``, ``sig_w``, ...)."""
+    elec = [p.name for p in component.ports if p.port_type != "optical"]
+    out = {}
+    for d in drives:
+        ports = [n for n in elec if n == d or n.startswith(d + "_")]
+        if not ports:
+            raise ValueError(f"sparams drive {d!r} matches no electrical port of the component "
+                             f"({elec}); pass conductors={{{d!r}: [ports...]}}")
+        out[d] = ports
+    return out
 
 
 def sample_sparams(model: cm.Model, wavelengths, drives: Optional[Mapping[str, Sequence[float]]] = None,
@@ -183,7 +205,8 @@ def export_component(component, path=None, *, name: Optional[str] = None,
                      model: Any = "auto", sparams: Optional[dict] = None,
                      generator: Any = "auto", generator_source: Optional[str] = None,
                      stack=None, cell_size: float = 0.05,
-                     waveguide: Optional[Mapping[str, float]] = None) -> dict:
+                     waveguide: Optional[Mapping[str, float]] = None,
+                     conductors: Optional[Mapping[str, Sequence[str]]] = None) -> dict:
     """Write ``component`` as a component file (to ``path``, if given) and
     return its dict.
 
@@ -197,6 +220,10 @@ def export_component(component, path=None, *, name: Optional[str] = None,
     installed module; ``generator_source`` instead carries Python source
     defining ``generator["function"]`` (run only with ``trust=True`` on
     load). ``stack``, ``cell_size`` and ``waveguide`` go to the physics.
+    ``conductors`` (``{pin: [electrical ports]}``) sets the pins; by default
+    they come from the physics, or for an sparams-only part from its drive
+    names matched to port names. A component loaded from a file
+    (``info["pcomp"]``) keeps that file's model and generator.
     """
     from .. import __version__
     info = dict(component.info) if component.info else {}
@@ -207,19 +234,37 @@ def export_component(component, path=None, *, name: Optional[str] = None,
         photonfdtd_version=__version__, layout=dict(unit="um", polygons=_layout(component)),
         ports=_ports(component))
     physics = recipe = None
-    conductors: dict = {}
-    if model == "auto":
-        if len(list(component.insts)) and not info.get("lnoi") and not info.get("photodetector") \
-                and not getattr(component, "function_name", None):
-            physics, conductors = _circuit_physics(component, stack, cell_size, waveguide)
-        else:
+    pins: dict = {}
+    source = _registry_get(info["pcomp"]).data if "pcomp" in info else None
+    if source is not None and model == "auto":
+        # Re-exporting a loaded part: its file's model, pins and generator.
+        m = source.get("model", {})
+        physics, recipe = m.get("physics"), m.get("recipe")
+        sparams = sparams if sparams is not None else m.get("sparams")
+        pins = {k: list(v) for k, v in source.get("conductors", {}).items()}
+        if generator == "auto" and not generator_source and source.get("generator"):
+            g = dict(source["generator"])
+            generator_source = g.pop("source", None)
+            generator = g
+    elif model == "auto":
+        if _is_leaf(component, info) or not len(list(component.insts)):
             physics, recipe = _physics(component, info, stack, cell_size, waveguide)
+            if physics is None and not sparams:
+                raise ValueError(
+                    f"no physics for {name!r}: photonfdtd has no model for this kind of cell; "
+                    "pass model=None with an sparams table, or a physics dict")
             if physics is not None:
-                conductors = _conductors_of(_model_from_physics(physics))
+                pins = _conductors_of(_model_from_physics(physics))
+        else:
+            physics, pins = _circuit_physics(component, stack, cell_size, waveguide)
     elif isinstance(model, dict):
         physics = model
-        conductors = _conductors_of(_model_from_physics(physics))
-    data["conductors"] = conductors
+        pins = _conductors_of(_model_from_physics(physics))
+    if conductors is not None:
+        pins = {k: list(v) for k, v in conductors.items()}
+    elif physics is None and sparams and sparams.get("drives") and not pins:
+        pins = _pins_from_drives(component, sparams["drives"])
+    data["conductors"] = pins
     data["model"] = {k: v for k, v in dict(physics=physics, sparams=sparams, recipe=recipe).items()
                      if v is not None}
     if generator == "auto":

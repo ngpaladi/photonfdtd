@@ -135,6 +135,41 @@ def test_sub_layout_exports_as_a_circuit(tmp_path, fast_lnoi):
         assert st.power[f"{inst},{port}"][0] > 0.99
 
 
+def test_waveguide_overrides_and_hierarchical_cells():
+    d = lib.export_component(gf.components.straight(length=10), waveguide={"neff": 2.0, "loss_db_cm": 3.0})
+    assert d["model"]["physics"]["data"]["neff"] == 2.0
+    # A gdsfactory MZI is a circuit of its parts, so it interferes.
+    d = lib.export_component(gf.components.mzi(delta_length=10))
+    assert d["model"]["physics"]["kind"] == "circuit"
+    s = lib.load_component(d).model().sdict(np.linspace(1.5, 1.6, 41))[("o1", "o2")]
+    assert np.ptp(abs(s) ** 2) > 0.9
+
+
+def test_sparams_only_part_keeps_its_pins(tmp_path, fast_lnoi):
+    c = lnoi.mzi_switch(arm_length=500)
+    m = cm.from_lnoi(lnoi.model(c), length=500.0)
+    table = lib.sample_sparams(m, [1.55], drives={"sig": [0.0, V_PI]})
+    d = lib.export_component(c, None, model=None, sparams=table)
+    assert d["conductors"] == {"sig": ["sig_w", "sig_e"]}
+    tm = lib.load_component(d).model()
+    on = tm.sdict(np.array([1.55]), V={"sig": V_PI})
+    ref = m.sdict(np.array([1.55]), V={"sig": V_PI})
+    assert np.allclose(on[("o1", "o4")], ref[("o1", "o4")])
+    with pytest.raises(ValueError, match="matches no electrical port"):
+        lib.export_component(c, None, model=None, sparams=lib.sample_sparams(
+            m, [1.55], drives={"bias": [0.0, 1.0]}))
+
+
+def test_reexporting_a_loaded_part_keeps_its_file(tmp_path, fast_lnoi):
+    first = lib.export_component(lnoi.mzi_switch(arm_length=500), tmp_path / "sw",
+                                 sparams=None)
+    cf = lib.load_component(tmp_path / ("sw" + lib.SUFFIX))
+    again = lib.export_component(cf.cell(), name="copy")
+    assert again["model"] == first["model"]
+    assert again["conductors"] == first["conductors"]
+    assert again["generator"] == first["generator"]
+
+
 def test_generator_source_needs_trust(tmp_path):
     src = ("import gdsfactory as gf\n"
            "def block(size=2.0):\n"
