@@ -73,6 +73,15 @@ def test_detector_into_load_resistor():
     assert st.voltage[anode][0] == pytest.approx(1e-4 * 1e4, rel=1e-6)
 
 
+def test_unconnected_detector_is_an_open_circuit():
+    # No drive and no load between the contacts: no current, no runaway voltage.
+    chip = cc.Chip(dict(pd=cm.photodetector(1.0, 0.0)), (), (), external={"in": ("pd", "o1")})
+    with pytest.warns(UserWarning, match="no circuit between"):
+        st = chip.solve(1.55, inputs={"in": 1e-3})
+    assert st.detector_current["pd"][0] == 0.0
+    assert max(abs(v[0]) for v in st.voltage.values()) < 1e-6
+
+
 def test_heater_switches_mzi_through_its_resistance():
     h = cm.heater(P_pi=0.02, resistance=500.0, length=100.0)
     models, nets, ext = _mzi(h)

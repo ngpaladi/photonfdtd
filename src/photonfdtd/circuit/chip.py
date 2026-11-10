@@ -244,6 +244,7 @@ class Chip:
         """Warn later, per solve, only about nets that matter; record which
         nets carry electrodes or heaters."""
         self._active_nets = set()
+        self._open_detectors = set()
         for inst, m in self.models.items():
             if isinstance(m, (Modulator, Heater)):
                 for c in m.conductors:
@@ -288,7 +289,8 @@ class Chip:
             if isinstance(m, Photodetector):
                 p = float(abs(waves.a[w, waves.index(inst, m.port)]) ** 2)
                 P[inst] = p
-                I[inst] = m.responsivity * p + m.dark_current
+                # No return path between its contacts: open circuit, no current.
+                I[inst] = 0.0 if inst in self._open_detectors else m.responsivity * p + m.dark_current
         return P, I
 
     def _fixed(self, drives, t=None):
@@ -301,7 +303,33 @@ class Chip:
                                  f"{self.net_names[k]} to different voltages")
             fixed[k] = v
         floating = self._active_nets - set(fixed)
+        self._open_detectors = self._unreturned(fixed)
         return fixed, floating
+
+    def _unreturned(self, fixed) -> set:
+        """Photodetectors whose contacts have no DC path between them
+        (through resistors, or both held by sources)."""
+        parent = list(range(self.n_nets))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        fx = list(fixed)
+        for k in fx[1:]:
+            parent[find(k)] = find(fx[0])
+        for inst, m in self.models.items():
+            if isinstance(m, (Heater, Resistor)):
+                a, b = (self._conductor_net[(inst, t)] for t in m.terminals)
+                parent[find(a)] = find(b)
+        out = set()
+        for inst, m in self.models.items():
+            if isinstance(m, Photodetector):
+                a, c = (self._conductor_net[(inst, t)] for t in m.terminals)
+                if find(a) != find(c):
+                    out.add(inst)
+        return out
 
     def _warn_floating(self, floating, fixed, res_nets):
         # A net is held only through resistors to a driven net; otherwise it
@@ -310,6 +338,10 @@ class Chip:
         if loose:
             warnings.warn(f"nets {loose} carry electrodes or heaters but no drive; "
                           "they float and are taken as 0 V", stacklevel=3)
+        if self._open_detectors:
+            warnings.warn(f"photodetectors {sorted(self._open_detectors)} have no circuit between "
+                          "their contacts (drive or load them); their current is taken as 0",
+                          stacklevel=3)
 
     def _resistive_nets(self, fixed):
         """Nets connected to a driven net through resistors."""
