@@ -33,7 +33,9 @@ Capabilities
 - 1D / 2D / 3D Yee-grid FDTD with the Courant-stable time step selected
   automatically.
 - **CPML** absorbing boundaries (Roden & Gedney 2000, kappa = 1) on any
-  number of axes.
+  number of axes, and **periodic** boundaries per axis
+  (``Grid(periodic=...)``) for unit cells of gratings, photonic crystals and
+  metasurfaces.
 - Isotropic dielectric media, non-dispersive or **dispersive** (Lorentz /
   Drude / Sellmeier poles via the ADE method) with a cited material library
   (SiO2, Si, Si3N4, LiNbO3, Au, Ag). See :doc:`accuracy`.
@@ -43,7 +45,9 @@ Capabilities
   arbitrary-polygon :class:`~photonfdtd.PolySlab`.
 - Sources: soft point dipole (:class:`~photonfdtd.PointDipole`), distributed
   mode injection (:class:`~photonfdtd.ModeSource`, and the one-way
-  :class:`~photonfdtd.UniModeSource`), an energy-normalised
+  :class:`~photonfdtd.UniModeSource`), one-way normal-incidence
+  :class:`~photonfdtd.PlaneWave` and :class:`~photonfdtd.GaussianBeam`
+  sources from a Huygens current sheet, an energy-normalised
   :class:`~photonfdtd.SinglePhotonSource`, and a moving-charge
   :class:`~photonfdtd.ChargedParticle` that emits Cherenkov radiation.
 - Monitors: time-domain snapshots (:class:`~photonfdtd.FieldMonitor`, with
@@ -51,6 +55,9 @@ Capabilities
   (:class:`~photonfdtd.FluxMonitor`), and a running frequency-domain
   :class:`~photonfdtd.DFTMonitor` whose storage scales with the number of
   frequencies rather than timesteps.
+- **Near-to-far-field projection** (:func:`~photonfdtd.project_far_field`)
+  from plane DFT monitors on a closed box or an open plane, in 2-D and 3-D:
+  radiation patterns, radiant intensity, and Cherenkov angular spectra.
 - **Mode-decomposition S-parameters** (:func:`~photonfdtd.s_parameters`) from a
   memory-light port plane. See :doc:`accuracy`.
 - **Photon-count estimates**: photon spectra and band counts through a DFT

@@ -154,8 +154,8 @@ class Simulation:
         Geometry, stamped in order (later structures overwrite earlier ones).
     sources : sequence
         Point / soft sources (``PointDipole``, ``ModeSource``,
-        ``UniModeSource``, ``SinglePhotonSource``) and moving charges
-        (``ChargedParticle``).
+        ``UniModeSource``, ``SinglePhotonSource``, ``PlaneWave``,
+        ``GaussianBeam``) and moving charges (``ChargedParticle``).
     monitors : sequence
         ``FieldMonitor``, ``FluxMonitor`` and/or ``DFTMonitor`` instances.
     run_time : float
@@ -240,6 +240,15 @@ class Simulation:
             float(getattr(getattr(s, "medium", None), "conductivity", 0.0) or 0.0) != 0.0
             for s in self.structures
         )
+        self.run_time = float(run_time)
+        self.courant = float(courant)
+        # Time step from the Courant condition.
+        inv_dl2 = 0.0
+        for d in grid.cell_size:
+            if d > 0:
+                inv_dl2 += 1.0 / d ** 2
+        self.dt = self.courant / (C_0 * math.sqrt(inv_dl2))
+        self.n_steps = int(math.ceil(self.run_time / self.dt))
         # Moving current sources (e.g. ChargedParticle) are deposited along
         # their trajectory each step rather than expanded into fixed-cell soft
         # dipoles (see jaxbackend._particle_plan).
@@ -251,17 +260,16 @@ class Simulation:
             elif isinstance(s, ChargedParticle):
                 self._register_particle(s)
             elif hasattr(s, "expand"):
-                expanded.extend(s.expand(grid))
+                expanded.extend(self._expand(s))
             else:
                 raise TypeError(
                     f"Unsupported source type: {type(s).__name__}. "
-                    "Pass a PointDipole, ModeSource, SinglePhotonSource, "
-                    "or ChargedParticle."
+                    "Pass a PointDipole, ModeSource, UniModeSource, "
+                    "SinglePhotonSource, PlaneWave, GaussianBeam or "
+                    "ChargedParticle."
                 )
         self.sources = expanded
         self.monitors = list(monitors)
-        self.run_time = float(run_time)
-        self.courant = float(courant)
         self.cpml_params = cpml_params
         self.verbose = verbose
         # Optional progress hook, called as progress_callback(n_steps, n_steps)
@@ -279,13 +287,6 @@ class Simulation:
         self._eps_r_custom = False
         self._materialize_eps_r()
 
-        # Time step from the Courant condition.
-        inv_dl2 = 0.0
-        for d in grid.cell_size:
-            if d > 0:
-                inv_dl2 += 1.0 / d ** 2
-        self.dt = self.courant / (C_0 * math.sqrt(inv_dl2))
-        self.n_steps = int(math.ceil(self.run_time / self.dt))
 
         self._build_cpml()
 
@@ -376,11 +377,18 @@ class Simulation:
         elif isinstance(source, ChargedParticle):
             self._register_particle(source)
         elif hasattr(source, "expand"):
-            self.sources.extend(source.expand(self.grid))
+            self.sources.extend(self._expand(source))
         else:
             raise TypeError(
                 f"Unsupported source type: {type(source).__name__}"
             )
+
+    def _expand(self, source):
+        """Expand a distributed source into point dipoles; sources calibrated
+        against the time step (``needs_dt``, e.g. :class:`PlaneWave`) get it."""
+        if getattr(source, "needs_dt", False):
+            return source.expand(self.grid, dt=self.dt)
+        return source.expand(self.grid)
 
     def _register_particle(self, p: ChargedParticle) -> None:
         """Validate and store a moving charged-particle current source."""

@@ -19,6 +19,11 @@ class Grid:
     size: Tuple[float, ...]          # physical extent of the simulation domain, m
     cell_size: Tuple[float, ...]     # uniform spacing per axis, m
     pml_layers: Tuple[int, ...] = (0, 0, 0)  # PML thickness per axis, in cells
+    #: Periodic boundary per axis: the fields wrap around (cell n-1 neighbours
+    #: cell 0), as for one unit cell of a grating, photonic crystal or
+    #: metasurface at normal incidence. A periodic axis takes no PML. The
+    #: default, non-periodic edge with no PML is a perfect electric conductor.
+    periodic: Tuple[bool, ...] = (False, False, False)
 
     # Filled in __post_init__
     shape: Tuple[int, ...] = field(init=False)
@@ -30,6 +35,7 @@ class Grid:
         size = _to3(self.size)
         cs = _to3(self.cell_size)
         pml = _to3(self.pml_layers, default=0)
+        per = _to3(self.periodic, default=False)
 
         ndim = sum(1 for s in size if s is not None and s > 0)
         if ndim == 0:
@@ -39,11 +45,13 @@ class Grid:
         shape = []
         coords = []
         pml_active = []
+        per_active = []
         for i, (s, d, p) in enumerate(zip(size, cs, pml)):
             if s is None or s == 0:
                 shape.append(1)
                 coords.append(np.array([0.0]))
                 pml_active.append(0)
+                per_active.append(False)
                 continue
             if d is None or d <= 0:
                 raise ValueError(f"axis {i}: cell_size must be > 0")
@@ -54,11 +62,16 @@ class Grid:
             # Coordinates of E-field samples at integer cell indices.
             coords.append((np.arange(n) - (n - 1) / 2) * d)
             pml_active.append(int(p))
+            per_active.append(bool(per[i]))
+            if per_active[-1] and int(p) > 0:
+                raise ValueError(
+                    f"axis {i}: a periodic axis cannot also have PML layers")
             active.append(i)
 
         self.size = tuple(0.0 if s is None else float(s) for s in size)
         self.cell_size = tuple(0.0 if d is None else float(d) for d in cs)
         self.pml_layers = tuple(pml_active)
+        self.periodic = tuple(per_active)
         self.shape = tuple(shape)
         self.coords = tuple(coords)
         self.ndim = ndim

@@ -18,7 +18,10 @@ Accuracy features: anisotropic subpixel smoothing (``subpixel=True``, via a
 per-component coefficient) and dispersive media (Lorentz/Drude/Sellmeier poles
 advanced by the ADE recursion inside the ``lax.scan`` carry).
 
-The per-cell update uses the ``cy - cz`` curl form with dense CPML psi.
+The per-cell update uses the ``cy - cz`` curl form with dense CPML psi. On an
+axis marked periodic (``Grid(periodic=...)``) the differences wrap around
+(:func:`_term_diff`); otherwise a grid edge without PML is a perfect electric
+conductor.
 
 Sources: soft point/dipole sources (so expanded ModeSource / SinglePhoton
 sources work too) and moving ``ChargedParticle`` charges (Cherenkov). The
@@ -52,11 +55,71 @@ _AXNAME = {0: "x", 1: "y", 2: "z"}
 _FLUX_AXIS = {"x": 0, "y": 1, "z": 2}
 
 
-def _crop(n, is_E):
-    """Region slice on a derivative axis: [1:] for E, [:-1] for H, all if flat."""
-    if n <= 1:
+class SourceTable:
+    """Per-step soft-source values of one component group, stored separably.
+
+    ``W`` (n_steps, n_wave) holds each distinct waveform sampled at the
+    component's update times; source ``s`` uses column ``widx[s]`` scaled by
+    ``amp[s]``. ``table[n]`` gives the (n_src,) increments added at step ``n``
+    and works with a traced ``n`` once :meth:`device` has moved the arrays to
+    JAX. ``table.dense()`` rebuilds the (n_steps, n_src) table for host code.
+    """
+
+    def __init__(self, W, widx, amp):
+        self.W, self.widx, self.amp = W, widx, amp
+
+    def __getitem__(self, n):
+        return self.W[n][..., self.widx] * self.amp
+
+    def __neg__(self):
+        return SourceTable(self.W, self.widx, -self.amp)
+
+    @property
+    def n_src(self):
+        return int(np.shape(self.amp)[0])
+
+    def device(self):
+        import jax.numpy as jnp
+        return SourceTable(jnp.asarray(self.W), jnp.asarray(self.widx),
+                           jnp.asarray(self.amp))
+
+    def dense(self):
+        return np.asarray(self.W)[:, np.asarray(self.widx)] * np.asarray(self.amp)
+
+    @property
+    def nbytes(self):
+        return sum(int(np.asarray(a).nbytes) for a in (self.W, self.widx, self.amp))
+
+
+def _crop(n, is_E, periodic=False):
+    """Region slice on a derivative axis: [1:] for E, [:-1] for H, all if flat
+    or periodic (a periodic axis wraps, so every cell has both neighbours)."""
+    if n <= 1 or periodic:
         return slice(None)
     return slice(1, None) if is_E else slice(0, -1)
+
+
+def _term_diff(src, t, jnp):
+    """Forward/backward difference of ``src`` along a curl term's axis, cropped
+    to the component's update region.
+
+    E sits at integer cells and uses ``H[i] - H[i-1]``; H at half cells uses
+    ``E[i+1] - E[i]``. On a non-periodic axis that is ``src[1:] - src[:-1]``
+    for both (the E region starts at cell 1, the H region stops at n-2); on a
+    periodic axis the neighbour wraps around, via a roll whose direction
+    depends on the pass.
+    """
+    ax = t["ax"]
+    if t.get("periodic", False):
+        if t["is_E"]:
+            d = src - jnp.roll(src, 1, axis=ax)
+        else:
+            d = jnp.roll(src, -1, axis=ax) - src
+    else:
+        hi = [slice(None)] * 3; hi[ax] = slice(1, None)
+        lo = [slice(None)] * 3; lo[ax] = slice(0, -1)
+        d = src[tuple(hi)] - src[tuple(lo)]
+    return (d / t["dl"])[t["osl"]]
 
 
 def _region_shape(region, shape):
@@ -85,11 +148,12 @@ def _build_static(sim):
     bh = [np.asarray(sim._b_h[a]) for a in range(3)]
     ch = [np.asarray(sim._c_h[a]) for a in range(3)]
 
+    per = tuple(bool(p) for p in getattr(grid, "periodic", (False,) * 3))
     comps = []
     for Fkey, aligned, (axA, srcA), (axB, srcB), is_E in _TABLE:
         region = [slice(None), slice(None), slice(None)]
-        region[axA] = _crop(shape[axA], is_E)
-        region[axB] = _crop(shape[axB], is_E)
+        region[axA] = _crop(shape[axA], is_E, per[axA])
+        region[axB] = _crop(shape[axB], is_E, per[axB])
         region = tuple(region)
         b_src = be if is_E else bh
         c_src = ce if is_E else ch
@@ -100,13 +164,14 @@ def _build_static(sim):
             if shape[ax] <= 1:
                 continue
             osl = [slice(None), slice(None), slice(None)]
-            osl[other_ax] = _crop(shape[other_ax], is_E)
+            osl[other_ax] = _crop(shape[other_ax], is_E, per[other_ax])
             ridx = region[ax]
             b1 = b_src[ax][ridx].astype(npdt).reshape(
                 [-1 if i == ax else 1 for i in range(3)])
             c1 = c_src[ax][ridx].astype(npdt).reshape(
                 [-1 if i == ax else 1 for i in range(3)])
             terms.append(dict(ax=ax, src=src, sign=sign, osl=tuple(osl),
+                              periodic=per[ax], is_E=is_E,
                               b1=b1, c1=c1, key=f"{Fkey}_{_AXNAME[ax]}",
                               dl=cell[ax], pshape=rshape))
         comps.append(dict(Fkey=Fkey, region=region, is_E=is_E, terms=terms))
@@ -116,24 +181,42 @@ def _build_static(sim):
     # with one scatter, ``F.at[I, J, K].add(V[n])``. One op per source instead
     # (a mode source expands to thousands of dipoles) makes XLA's compile time
     # explode: 7000 dipoles took ~40 s to compile on jax 0.6 and >10 min on 0.12.
+    #
+    # The per-step values are stored separably, as a :class:`SourceTable`: each
+    # distinct waveform is sampled once, ``W`` of shape (n_steps, n_wave), and
+    # each source carries an index into it and a scalar amplitude, so step ``n``
+    # adds ``W[n, widx] * amp``. A dense (n_steps, n_src) table would cost
+    # gigabytes for a 3-D plane-wave sheet (40k cells x 5k steps per component).
     steps = np.arange(n_steps)
     groups: Dict[str, list] = {}
     for src in sim.sources:
         i, j, k = grid.index_at(src.position)
-        t = (steps + (0.5 if src.component[0] == "H" else 1.0)) * dt
-        vals = np.asarray(src.amplitude * src.waveform(t), dtype=npdt)
-        groups.setdefault(src.component, []).append((i, j, k, vals))
+        groups.setdefault(src.component, []).append(
+            (i, j, k, src.waveform, float(src.amplitude)))
     src_H, src_E = [], []
     for comp in sorted(groups):
         g = groups[comp]
+        t = (steps + (0.5 if comp[0] == "H" else 1.0)) * dt
+        wave_cols, wave_id, widx = [], {}, []
+        for e in g:
+            key = id(e[3])
+            if key not in wave_id:
+                wave_id[key] = len(wave_cols)
+                wave_cols.append(np.asarray(e[3](t), dtype=np.float64))
+            widx.append(wave_id[key])
+        table = SourceTable(
+            W=np.stack(wave_cols, axis=1).astype(npdt),
+            widx=np.asarray(widx, dtype=np.int32),
+            amp=np.asarray([e[4] for e in g], dtype=npdt))
         entry = (comp,
                  np.array([e[0] for e in g], dtype=np.int32),
                  np.array([e[1] for e in g], dtype=np.int32),
                  np.array([e[2] for e in g], dtype=np.int32),
-                 np.stack([e[3] for e in g], axis=1).astype(npdt))
+                 table)
         (src_H if comp[0] == "H" else src_E).append(entry)
 
     return dict(shape=shape, cell=cell, dt=dt, n_steps=n_steps, npdt=npdt,
+                periodic=per,
                 comps=comps, ch_field=float(dt / MU_0), src_H=src_H, src_E=src_E)
 
 
@@ -471,12 +554,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 continue
             curl = None
             for t in comp["terms"]:
-                ax = t["ax"]
-                src = fields[t["src"]]
-                hi = [slice(None)] * 3; hi[ax] = slice(1, None)
-                lo = [slice(None)] * 3; lo[ax] = slice(0, -1)
-                d = (src[tuple(hi)] - src[tuple(lo)]) / t["dl"]
-                d = d[t["osl"]]
+                d = _term_diff(fields[t["src"]], t, jnp)
                 p = jnp.asarray(t["b1"]) * psis[t["key"]] + jnp.asarray(t["c1"]) * d
                 psis[t["key"]] = p
                 cterm = d + p
@@ -495,8 +573,8 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         return fields, psis
 
     # Source waveform tables on device so a traced step index can gather them.
-    src_H = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_H"]]
-    src_E = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_E"]]
+    src_H = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_H"]]
+    src_E = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_E"]]
 
     # Moving-charge deposition tables (per particle), on device.
     E_names = ("Ex", "Ey", "Ez")

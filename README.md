@@ -89,7 +89,10 @@ print(result.n_eff)            # array of effective indices
 - **Yee-grid FDTD** in 1D / 2D / 3D, with the Courant-stable time step
   selected automatically.
 - **CPML** absorbing boundaries (Roden & Gedney 2000, kappa = 1) on any
-  number of axes.
+  number of axes, and **periodic** boundaries per axis
+  (`Grid(periodic=(False, True, True))`) for one unit cell of a grating,
+  photonic crystal or metasurface. A grid edge with neither is a perfect
+  electric conductor.
 - **Isotropic dielectric media, non-dispersive or dispersive.** Non-dispersive
   media stamp a single `eps_r` per cell; dispersive media (`DispersiveMedium`,
   with `.lorentz` / `.drude` / `.sellmeier` constructors) carry Lorentz, Drude
@@ -107,7 +110,12 @@ print(result.n_eff)            # array of effective indices
   `PolySlab` (a polygon in xy extruded between two z bounds).
 - **Sources**: soft point-dipole (`PointDipole`), distributed line/area
   mode injection (`ModeSource`, and the one-way `UniModeSource` built from
-  equivalence-principle current sheets), an energy-normalised
+  equivalence-principle current sheets), one-way **plane waves**
+  (`PlaneWave`) and **Gaussian beams** (`GaussianBeam`) from a Huygens
+  current sheet along any axis, calibrated to the requested peak field
+  (second-order accurate, backward leakage ~2e-4 at 20 cells per
+  wavelength; on a transversely periodic cell the wave stays exactly uniform
+  and a half-space reproduces the Fresnel transmission to <1%), an energy-normalised
   `SinglePhotonSource` whose amplitude is set so the launched wavepacket
   carries exactly $h\,\nu$ of total electromagnetic energy, and a moving-charge
   `ChargedParticle` current source that emits **Cherenkov radiation** when
@@ -121,6 +129,13 @@ print(result.n_eff)            # array of effective indices
   number of frequencies rather than the number of timesteps (routinely
   50-1000x smaller than an equivalent time-domain monitor, exact at those
   frequencies).
+- **Near-to-far-field projection** (`project_far_field`): turn plane
+  `DFTMonitor`s on a closed box (or one open plane) into the far field and
+  radiant intensity at any directions, in 2-D or 3-D, from Love's
+  equivalence currents with each sample at its exact Yee position. A 3-D
+  dipole gives `sin²θ` to <1% at 20 cells per wavelength; the far-field power
+  matches the near-field Poynting flux to 0.2%. The same projection gives the
+  angular spectrum of Cherenkov light leaving a radiator.
 - **Mode-decomposition S-parameters** (`s_parameters`, `mode_amplitudes`):
   project the frequency-domain fields on a memory-light port plane (any axis via
   `DFTMonitor(plane_axis=..., plane_position=...)`) onto a solved mode to get
@@ -231,8 +246,15 @@ demand rather than grabbing most of the card up front.
 - The reversible adjoint with CPML is exact but only saves memory when the PML
   shell is a small fraction (under ~5%) of the volume; for ordinary PML runs
   use checkpointing.
-- Media are isotropic (the subpixel tensor is the only anisotropy); there is
-  no TFSF plane-wave injection.
+- Anisotropic media are diagonal tensors in the grid frame (no rotated
+  crystal axes), and neither they nor dispersive media combine with subpixel
+  smoothing.
+- Plane waves are normal-incidence only: oblique incidence on a periodic cell
+  needs Bloch-periodic (complex) fields, which the engine does not step, and
+  there is no total-field/scattered-field box. Periodic boundaries run in
+  memory (not disk-tiled).
+- One device per run: no multi-GPU domain decomposition. Grids are uniform
+  per axis, and there are no symmetry planes.
 
 ## Releasing (maintainers)
 

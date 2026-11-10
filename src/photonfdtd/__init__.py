@@ -50,9 +50,12 @@ from . import materials
 from .geometry import Box, PolySlab
 from .sources import (
     GaussianPulse, PointDipole, ModeSource, UniModeSource, SinglePhotonSource,
+    PlaneWave, GaussianBeam,
     ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
 from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+from .farfield import (FarField, project_far_field, spherical_directions,
+                       polar_directions)
 from .simulation import Simulation
 # Differentiable JAX entry points.
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
@@ -103,6 +106,8 @@ __all__ = [
     "silica", "silicon", "silicon_nitride", "lithium_niobate", "gold", "silver",
     "Box", "PolySlab",
     "GaussianPulse", "PointDipole", "ModeSource", "UniModeSource",
+    "PlaneWave", "GaussianBeam",
+    "FarField", "project_far_field", "spherical_directions", "polar_directions",
     "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
     "FieldMonitor", "FluxMonitor", "DFTMonitor",
