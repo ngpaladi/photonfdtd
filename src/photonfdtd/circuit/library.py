@@ -89,10 +89,24 @@ def _ports(component) -> list:
     return out
 
 
+def _plain(v) -> bool:
+    """A number, string, or (nested) sequence of them."""
+    if isinstance(v, (list, tuple)):
+        return all(_plain(x) for x in v)
+    return isinstance(v, (bool, int, float, str))
+
+
+def _tuples(v):
+    """JSON lists back to the tuples gdsfactory settings use."""
+    return tuple(_tuples(x) for x in v) if isinstance(v, (list, tuple)) else v
+
+
 def _scalar_settings(cell) -> dict:
+    """The settings a generator can be called with again: numbers, strings
+    and sequences of them (a pad's ``size``, a ``layer``)."""
     out = {}
     for k, v in dict(cell.settings).items():
-        if isinstance(v, (bool, int, float, str)) and not (isinstance(v, str) and k == "layers"):
+        if _plain(v) and not (isinstance(v, str) and k == "layers"):
             out[k] = v
     return out
 
@@ -429,6 +443,11 @@ class TableModel:
         self.drives = {k: np.asarray(v, float) for k, v in table.get("drives", {}).items()}
         self.ports = tuple(table["ports"])
         names = list(self.drives)
+        # The interpolation and the clamp to the table's range need ascending
+        # axes; a table may list them in any order (e.g. sorted by frequency).
+        order = [np.argsort(self.drives[n]) for n in names] + [np.argsort(self.wl)]
+        self.drives = {n: self.drives[n][o] for n, o in zip(names, order)}
+        self.wl = self.wl[order[-1]]
         self._live = [n for n in names if len(self.drives[n]) > 1]
         self._wl_live = len(self.wl) > 1
         axes = [self.drives[n] for n in self._live] + ([self.wl] if self._wl_live else [])
@@ -436,7 +455,10 @@ class TableModel:
             ((slice(None),) if self._wl_live else (0,))
         self._interp = {}
         for key, v in table["S"].items():
-            vals = (np.asarray(v["re"], float) + 1j * np.asarray(v["im"], float))[take]
+            vals = np.asarray(v["re"], float) + 1j * np.asarray(v["im"], float)
+            for axis, o in enumerate(order):
+                vals = np.take(vals, o, axis=axis)
+            vals = vals[take]
             a, b = key.split(",", 1)
             self._interp[(a, b)] = RegularGridInterpolator(
                 axes, vals, bounds_error=False, fill_value=None) if axes else complex(vals)
@@ -557,7 +579,7 @@ class ComponentFile:
         g = self.data.get("generator")
         if not g:
             raise ValueError(f"component {self.name!r} has no generator")
-        kw = {**g.get("kwargs", {}), **kwargs}
+        kw = {k: _tuples(v) for k, v in {**g.get("kwargs", {}), **kwargs}.items()}
         tag = json.dumps(kw, sort_keys=True, default=str)
         if tag in self._regenerated:
             return self._regenerated[tag]
@@ -613,17 +635,28 @@ def generator_allowed(g: Mapping) -> bool:
         return fn in _CELL_FUNCTIONS[mod]
     if not (mod == "gdsfactory" or mod.startswith("gdsfactory.")):
         return False
+    import sys
+
     import gdsfactory as gf
     try:
-        obj = getattr(importlib.import_module(mod), fn)
-    except (ImportError, AttributeError):
-        return False
-    return obj is gf.get_active_pdk().cells.get(fn) or obj is getattr(gf.components, fn, None)
+        cell = gf.get_active_pdk().cells.get(fn)
+    except ValueError:  # no active PDK
+        cell = None
+    if cell is None:
+        cell = getattr(gf.components, fn, None)
+        if not getattr(cell, "is_gf_cell", False):
+            return False
+    # The file must name the module that cell really lives in. Nothing is
+    # imported to find out: an untrusted file does not choose what to import.
+    return getattr(cell, "__module__", None) == mod or \
+        getattr(sys.modules.get(mod), fn, None) is cell
 
 
 def load_component(source, trust: bool = False) -> ComponentFile:
     """Read a component file (a path, a JSON string or a dict) and register
-    it, so circuits built from its cell find its model."""
+    it, so circuits built from its cell find its model. Trust belongs to
+    the content for the rest of the session: loading the same content again
+    returns the same part, trusted if it ever was."""
     path = None
     if isinstance(source, dict):
         data = source
@@ -653,6 +686,9 @@ def _registry_get(rec: Mapping) -> ComponentFile:
     cf = _REGISTRY.get(rec.get("key"))
     if cf is None and rec.get("path"):
         cf = load_component(rec["path"])
+        if rec.get("key") and cf.key != rec["key"]:
+            raise KeyError(f"component file {rec.get('name')!r} at {rec['path']} has changed "
+                           "since this cell was built; load it and place the part again")
     if cf is None:
         raise KeyError(f"component file {rec.get('name')!r} is not loaded")
     return cf

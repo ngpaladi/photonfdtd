@@ -270,3 +270,46 @@ def test_loaded_ln_part_is_resolved_at_the_circuit_wavelength(tmp_path, fast_lno
 def test_rejects_other_files():
     with pytest.raises(ValueError):
         lib.load_component({"format": "something-else"})
+
+
+def test_table_axes_may_be_in_any_order():
+    wl = np.linspace(1.5, 1.6, 41)
+    up = lib.TableModel(lib.sample_sparams(cm.waveguide(2.0), wl), {})
+    down = lib.TableModel(lib.sample_sparams(cm.waveguide(2.0), wl[::-1]), {})
+    q = np.array([1.52, 1.55, 1.58])
+    a, b = up.model.sdict(q), down.model.sdict(q)
+    key = next(iter(a))
+    assert np.allclose(a[key], b[key]) and abs(a[key][0] - a[key][2]) > 0.1
+
+
+def test_sequence_settings_survive_regeneration(tmp_path):
+    gf = pytest.importorskip("gdsfactory")
+    data = lib.export_component(gf.components.pad(size=(60, 40)), tmp_path / "pad", name="wide pad")
+    assert list(data["generator"]["kwargs"]["size"]) == [60, 40]
+    c = lib.load_component(tmp_path / ("pad" + lib.SUFFIX)).regenerate()
+    assert (c.dbbox().width(), c.dbbox().height()) == (60, 40)
+
+
+def test_a_file_edited_on_disk_is_not_served_for_an_old_cell(tmp_path):
+    gf = pytest.importorskip("gdsfactory")
+    import json
+    path = tmp_path / ("wg" + lib.SUFFIX)
+    lib.export_component(gf.components.straight(length=20), path, name="wg")
+    info = dict(lib.load_component(path).cell().info)
+    lib._REGISTRY.clear()
+    data = json.loads(path.read_text())
+    data["model"]["physics"]["length"] = 9999.0
+    path.write_text(json.dumps(data))
+    with pytest.raises(KeyError, match="has changed"):
+        lib.model_for_cell(info)
+
+
+def test_only_cells_pass_the_generator_allowlist():
+    pytest.importorskip("gdsfactory")
+    ok = dict(module="gdsfactory.components.pads.pad", function="pad")
+    assert lib.generator_allowed(ok)
+    for g in (dict(module="gdsfactory.components", function="__doc__"),
+              dict(module="gdsfactory.samples.demo.pcell", function="pad"),
+              dict(module="os", function="system"),
+              {**ok, "source": "x = 1"}):
+        assert not lib.generator_allowed(g)
