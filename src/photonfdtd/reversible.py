@@ -53,6 +53,8 @@ def reversible_available(sim):
                        "stably")
     if getattr(sim, "particle_sources", None):
         return False, "reversible adjoint does not support moving-charge sources"
+    if getattr(sim, "_has_conductivity", False):
+        return False, "reversible adjoint does not support conductive media"
     for m in sim.monitors:
         if isinstance(m, FieldMonitor):
             return False, "reversible adjoint supports DFT/Flux monitors only"
@@ -336,6 +338,10 @@ def value_and_grad_eps_reversible(sim, loss):
     """
     import jax
     import jax.numpy as jnp
+    if getattr(sim, "_has_anisotropy", False):
+        raise NotImplementedError("value_and_grad_eps_reversible differentiates "
+                                  "a scalar eps_r; anisotropic media need "
+                                  "value_and_grad_params")
     run = reversible_run(sim)
     npdt = np.dtype(sim.dtypes["Ex"])
 

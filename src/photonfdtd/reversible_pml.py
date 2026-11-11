@@ -320,6 +320,10 @@ def value_and_grad_eps_reversible_pml(sim, loss):
     zero off-PML); gathering it to the PML cells only (O(surface*n_steps)) is a
     mechanical memory optimization on top of the validated reconstruction.
     """
+    if getattr(sim, "_has_anisotropy", False) or getattr(sim, "_has_conductivity", False):
+        raise NotImplementedError("value_and_grad_eps_reversible_pml differentiates "
+                                  "a scalar eps_r; anisotropic or conductive media "
+                                  "need value_and_grad_params")
     import jax
     import jax.numpy as jnp
     run = reversible_pml_run(sim)

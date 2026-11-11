@@ -355,7 +355,8 @@ def _dft_snap(field, comp, m, plane):
 
 
 def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
-                     ade=None, ce_particle=None, remat="none", checkpoint_levels=2):
+                     ade=None, ce_particle=None, remat="none", checkpoint_levels=2,
+                     ca_e=None, modulation=None):
     """Pure device-side time loop. Returns the raw monitor accumulators (field
     buffers, DFT accumulators, flux scalars) as JAX arrays.
 
@@ -366,6 +367,18 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
     :func:`_build_ade_jax` (or None). The result is differentiable in ``ce_e``,
     in ``ce_particle``, and in the ADE coefficient arrays (``ade['C']`` etc.),
     so gradients flow to permittivity, the smoothed tensor, and pole strengths.
+
+    ``ca_e`` (optional, same layout as ``ce_e``) is the lossy-medium decay
+    factor: the E update becomes ``E <- ca*E + ce*curl H``. ``None`` (no
+    conductivity anywhere) keeps the plain ``E <- E + ce*curl H``.
+
+    ``modulation`` (optional) makes the permittivity inside a box follow
+    applied voltages in time: a dict with ``box`` (tuple of index slices),
+    ``eps_b`` ({comp: base eps in the box}), ``deps`` ({comp: (n_drive, *box)}
+    permittivity change per unit drive) and ``v`` ((n_steps, n_drive) drive
+    values per step). Each step the coefficient in the box is rebuilt as
+    ``dt / (EPS_0 * (eps_b + v[n] . deps))`` (an instantaneous-permittivity
+    model, valid when the drive varies slowly next to the optical period).
     """
     import jax.numpy as jnp
     from jax import lax
@@ -433,7 +446,24 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         elif p["kind"] == "flux":
             state_flux[m.name] = jnp.asarray(0.0, dtype=jdt)
 
-    def apply_pass(fields, psis, is_E_pass):
+    if ca_e is not None:
+        ca_e = {c: jnp.asarray(v, dtype=jdt) for c, v in ca_e.items()}
+    if modulation is not None:
+        mod_box = tuple(modulation["box"])
+        mod_eps = {c: jnp.asarray(modulation["eps_b"][c], dtype=jdt) for c in ("Ex", "Ey", "Ez")}
+        mod_deps = {c: jnp.asarray(modulation["deps"][c], dtype=jdt) for c in ("Ex", "Ey", "Ez")}
+        mod_v = jnp.asarray(modulation["v"], dtype=jdt)
+
+    def coefficients_at(step_idx):
+        if modulation is None:
+            return ce_e
+        v = mod_v[step_idx]
+        return {c: ce_e[c].at[mod_box].set(
+                    dt / (EPS_0 * (mod_eps[c] + jnp.tensordot(v, mod_deps[c], 1))))
+                for c in ("Ex", "Ey", "Ez")}
+
+    def apply_pass(fields, psis, is_E_pass, ce_now=None):
+        ce_now = ce_e if ce_now is None else ce_now
         fields = dict(fields)
         psis = dict(psis)
         for comp in static["comps"]:
@@ -455,8 +485,13 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
             if curl is None:
                 continue
             reg = comp["region"]
-            k = ce_e[comp["Fkey"]][reg] if comp["is_E"] else neg_ch
-            fields[comp["Fkey"]] = fields[comp["Fkey"]].at[reg].add(k * curl)
+            key = comp["Fkey"]
+            k = ce_now[key][reg] if comp["is_E"] else neg_ch
+            if comp["is_E"] and ca_e is not None:
+                F = fields[key]
+                fields[key] = F.at[reg].set(ca_e[key][reg] * F[reg] + k * curl)
+            else:
+                fields[key] = fields[key].at[reg].add(k * curl)
         return fields, psis
 
     # Source waveform tables on device so a traced step index can gather them.
@@ -501,7 +536,8 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         # discrete energy flux E^n x (H^{n-1/2} + H^{n+1/2}) / 2.
         flux_pre = {p["m"].name: _flux(fields, p["m"], sim.grid, jnp)
                     for p in plans if p["kind"] == "flux"}
-        fields, psis = apply_pass(fields, psis, is_E_pass=True)
+        fields, psis = apply_pass(fields, psis, is_E_pass=True,
+                                  ce_now=coefficients_at(step_idx))
         if ade is not None:
             # P^{n+1} = a P^n + b P^{n-1} + c E^n; scatter the increment into E.
             Pcur, Pprev = ade_state
@@ -653,8 +689,43 @@ def _validate(sim):
             "the stepping arrays (fields, eps_r) must share one precision.")
 
 
-def run_jax(sim, jit: bool = True):
-    """Run ``sim`` on JAX and return a Result (see module docstring)."""
+def update_coefficients(sim, eps_components=None, sigma=None, dtype=None):
+    """E-update coefficients ``(ce, ca)`` for ``sim``.
+
+    ``ce`` is ``{'Ex','Ey','Ez'}`` of ``dt / (eps EPS_0)``, from
+    ``eps_components`` (default: :meth:`Simulation.eps_components`). With a
+    conductivity map ``sigma`` (default: :meth:`Simulation.conductivity_map`)
+    the lossy-medium form is used, ``ce = (dt/eps EPS_0) / (1 + s)`` and
+    ``ca = (1 - s) / (1 + s)`` with ``s = sigma dt / (2 eps EPS_0)``; ``ca`` is
+    None when nothing is conductive. Arrays are NumPy, in the stepping dtype.
+    """
+    npdt = np.dtype(dtype or sim.dtypes["Ex"])
+    dt = sim.dt
+    comps = sim.eps_components() if eps_components is None else eps_components
+    if sigma is None:
+        sigma = sim.conductivity_map()
+    ce, ca = {}, ({} if sigma is not None else None)
+    for c, e in zip(("Ex", "Ey", "Ez"), comps):
+        e = np.asarray(e, dtype=np.float64)
+        base = dt / (e * EPS_0)
+        if sigma is None:
+            ce[c] = base.astype(npdt)
+        else:
+            sh = sigma * dt / (2.0 * e * EPS_0)
+            ce[c] = (base / (1.0 + sh)).astype(npdt)
+            ca[c] = ((1.0 - sh) / (1.0 + sh)).astype(npdt)
+    return ce, ca
+
+
+def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None):
+    """Run ``sim`` on JAX and return a Result (see module docstring).
+
+    ``ce`` (optional) replaces the E-update coefficients ``{'Ex','Ey','Ez'}``
+    (for example from :meth:`photonfdtd.active.ActiveRegion.coefficients`), and
+    ``ca`` the lossy decay factors. ``modulation`` drives the permittivity in a
+    box in time (see :func:`_device_simulate`); build it with
+    :meth:`photonfdtd.active.ActiveRegion.modulation`.
+    """
     import jax
     import jax.numpy as jnp
     from .simulation import Result
@@ -670,23 +741,36 @@ def run_jax(sim, jit: bool = True):
     dt = static["dt"]
     n_steps = static["n_steps"]
 
-    # Scalar coefficient from eps_r (== eps_inf in dispersive cells); used for
-    # moving-charge deposition and as the E-update coefficient when smoothing is
-    # off.
+    # Per-component coefficients (equal unless smoothing or anisotropy). In
+    # dispersive cells eps is eps_inf. The scalar one (from eps_r) is used for
+    # moving-charge deposition.
     ce_scalar = (dt / (np.asarray(sim.eps_r, dtype=npdt) * EPS_0)).astype(npdt)
-    if sim.subpixel:
-        exx, eyy, ezz = sim._smoothed_eps_components()
-        ce_e_np = {c: (dt / (np.asarray(e, dtype=npdt) * EPS_0)).astype(npdt)
-                   for c, e in zip(("Ex", "Ey", "Ez"), (exx, eyy, ezz))}
+    if sim.per_component or sim._has_conductivity:
+        ce_e_np, ca_np = update_coefficients(sim)
     else:
-        ce_e_np = {c: ce_scalar for c in ("Ex", "Ey", "Ez")}
+        ce_e_np, ca_np = {c: ce_scalar for c in ("Ex", "Ey", "Ez")}, None
+    if ce is not None:
+        ce_e_np = ce
+    if ca is not None:
+        ca_np = ca
+    if modulation is not None and modulation["v"].shape[0] != n_steps:
+        raise ValueError(f"modulation drive has {modulation['v'].shape[0]} steps; "
+                         f"the simulation runs {n_steps}")
 
-    def fn(ce_e, ce_particle):
-        return _device_simulate(sim, static, plans, ce_e, pplans,
-                                ade=ade, ce_particle=ce_particle)
+    # The modulation box is a static index window (closed over); its arrays
+    # are traced inputs.
+    box = None if modulation is None else tuple(modulation["box"])
+    mod = None if modulation is None else {
+        k: modulation[k] for k in ("eps_b", "deps", "v")}
+
+    def fn(ce_e, ce_particle, ca_e, mod):
+        return _device_simulate(
+            sim, static, plans, ce_e, pplans, ade=ade, ce_particle=ce_particle,
+            ca_e=ca_e, modulation=None if mod is None else dict(mod, box=box))
     fn = jax.jit(fn) if jit else fn
     ce_e = {c: jnp.asarray(v) for c, v in ce_e_np.items()}
-    sf, sd, sfx = fn(ce_e, jnp.asarray(ce_scalar))
+    ca_e = None if ca_np is None else {c: jnp.asarray(v) for c, v in ca_np.items()}
+    sf, sd, sfx = fn(ce_e, jnp.asarray(ce_scalar), ca_e, mod)
 
     result = Result(times=np.arange(n_steps) * dt)
     for p in plans:
@@ -739,6 +823,11 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
     import jax.numpy as jnp
 
     _validate(sim)
+    if sim._has_anisotropy or sim._has_conductivity:
+        raise NotImplementedError(
+            "value_and_grad_eps differentiates one scalar eps_r per cell; with "
+            "anisotropic or conductive media use value_and_grad_params with a "
+            "per-component coefficient builder.")
     if sim.subpixel:
         raise NotImplementedError(
             "value_and_grad_eps differentiates the scalar per-cell eps_r, which "
@@ -786,12 +875,17 @@ def _prepare(sim):
 
 
 def _simulate_out(sim, prep, ce_e, remat="nested", checkpoint_levels=2):
-    """Run ``sim`` with E coefficients ``ce_e``; return the loss-facing dict."""
+    """Run ``sim`` with E coefficients ``ce_e``; return the loss-facing dict.
+
+    ``ce_e`` may also carry ``'ca'``: a ``{'Ex','Ey','Ez'}`` dict of lossy decay
+    factors, for conductive cells (see :func:`update_coefficients`)."""
     static, plans, pplans, ade = prep
+    ca = ce_e.get("ca") if isinstance(ce_e, dict) else None
+    ce_e = {c: ce_e[c] for c in ("Ex", "Ey", "Ez")}
     sf, sd, sfx = _device_simulate(
         sim, static, plans, ce_e, pplans, ade=ade,
         ce_particle=ce_e["Ex"], remat=remat,
-        checkpoint_levels=checkpoint_levels)
+        checkpoint_levels=checkpoint_levels, ca_e=ca)
     return _out_dict(sf, sd, sfx, plans)
 
 
@@ -811,6 +905,10 @@ def _run_fn(sim, method="checkpoint", remat="nested", checkpoint_levels=2):
         prep = _prepare(sim)
         return lambda ce_e: _simulate_out(sim, prep, ce_e, remat,
                                           checkpoint_levels)
+    if sim._has_conductivity:
+        raise NotImplementedError(
+            f"the {method!r} adjoint does not support conductive media; use "
+            "method='checkpoint'")
     if method == "reversible":
         from .reversible import reversible_run
         return reversible_run(sim)
@@ -902,6 +1000,9 @@ def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
     import jax
 
     _check_method(method)
+    if method == "tiled" and sim._has_conductivity:
+        raise NotImplementedError("the tiled adjoint does not support conductive "
+                                  "media; use method='checkpoint'")
     if method == "tiled":
         tvg = _tiled_value_and_grad([sim], ce_of_params,
                                     lambda outs: loss(outs[0]), tiled_options)

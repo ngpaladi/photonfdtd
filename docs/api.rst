@@ -123,6 +123,18 @@ GDS export
 
 .. automodule:: photonfdtd.gds
 
+Active devices
+--------------
+
+See :doc:`active_devices` for the guide.
+
+.. automodule:: photonfdtd.active
+
+Static solvers
+~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.statics
+
 Layout-scale methods
 --------------------
 

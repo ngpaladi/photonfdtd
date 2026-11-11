@@ -204,10 +204,7 @@ def _axis_range(coords, lo, hi):
 
 def _base_eps(sim):
     """The simulation's own per-component permittivity, as it would run."""
-    if sim.subpixel:
-        return tuple(np.asarray(e, float) for e in sim._smoothed_eps_components())
-    e = np.asarray(sim.eps_r, float)
-    return (e, e, e)
+    return tuple(np.asarray(e, float) for e in sim.eps_components())
 
 
 @dataclass

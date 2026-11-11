@@ -43,6 +43,15 @@ def _component_polygons_um(component) -> Dict[int, list]:
     return out
 
 
+def _layer_key(component, spec):
+    """A ``layers`` / ``electrodes`` key as the kdb layer index that
+    ``component.get_polygons()`` uses: an int is taken as that index already;
+    a ``(gds_layer, gds_datatype)`` pair is looked up."""
+    if isinstance(spec, tuple) and len(spec) == 2:
+        return int(component.kcl.layout.layer(int(spec[0]), int(spec[1])))
+    return spec
+
+
 def from_gdsfactory(
     component,
     *,
@@ -57,7 +66,13 @@ def from_gdsfactory(
     courant: float = 0.99,
     precision="float64",
     xy_bounds: Optional[Tuple[float, float, float, float]] = None,
-) -> Simulation:
+    electrodes: Optional[Dict[str, tuple]] = None,
+    heaters: Optional[Dict[str, tuple]] = None,
+    electrode_medium=None,
+    heater_medium=None,
+    wavelength: float = 1.55e-6,
+    **active_kwargs,
+):
     """Build a 3D photonfdtd Simulation from a gdsfactory Component.
 
     Parameters
@@ -66,7 +81,9 @@ def from_gdsfactory(
         Layout source. Polygons are read via ``component.get_polygons()`` and
         scaled from database units to microns via ``component.kcl.dbu``.
     layers : dict
-        ``{layer_index: (Medium, (z_min_m, z_max_m))}``. Each gdsfactory
+        ``{layer: (Medium, (z_min_m, z_max_m))}``, with ``layer`` either the
+        kdb layer index of ``component.get_polygons()`` or a
+        ``(gds_layer, gds_datatype)`` pair. Each gdsfactory
         layer is rasterised as a :class:`PolySlab` filled with ``Medium``
         between ``z_min`` and ``z_max`` (both in metres). Layers not in this
         dict are ignored.
@@ -93,14 +110,35 @@ def from_gdsfactory(
         (highest priority).
     courant : float
         Courant safety factor on the FDTD timestep.
+    electrodes : dict, optional
+        ``{name: (layer, (z_min_m, z_max_m), (x_um, y_um))}``: the polygon on
+        ``layer`` containing the point ``(x_um, y_um)`` (layout coordinates, in
+        microns) becomes an :class:`~photonfdtd.active.Electrode` called
+        ``name``. Several electrodes may share a layer (signal and ground pads).
+    heaters : dict, optional
+        ``{name: (layer, (z_min_m, z_max_m), (x_um, y_um), power_W)}``, the
+        same for :class:`~photonfdtd.active.Heater`.
+    electrode_medium, heater_medium
+        The metals, for the static solves (default gold and TiN from
+        :func:`photonfdtd.active.metal_active`). The metal is not added to the
+        optical layout; list its layer in ``layers`` too if the light should
+        see it.
+    wavelength, **active_kwargs
+        Passed to :class:`~photonfdtd.active.ActiveRegion` (e.g. ``sinks``,
+        ``boundary``, ``background``).
 
     Returns
     -------
-    Simulation
+    Simulation, or (Simulation, ActiveRegion)
         Built but not yet run. Add sources and monitors before calling
-        ``sim.run()``.
+        ``sim.run()``. With ``electrodes`` or ``heaters`` the
+        :class:`~photonfdtd.active.ActiveRegion` describing them is returned
+        too; prepare it on the simulation (``region.prepare(sim,
+        extrude="x")`` for straight electrodes along x) or on a ModeSolver of
+        the cross-section.
     """
     polys_by_layer = _component_polygons_um(component)
+    layers = {_layer_key(component, k): v for k, v in layers.items()}
 
     # XY domain in microns -> centre and extent in metres. Normally the whole
     # component bounding box (the kfactory-era DBox exposes .left/.right/
@@ -175,7 +213,7 @@ def from_gdsfactory(
     for s in extra_structures:
         structures.append(s)
 
-    return Simulation(
+    sim = Simulation(
         grid=grid,
         structures=structures,
         sources=[],
@@ -184,3 +222,32 @@ def from_gdsfactory(
         courant=courant,
         precision=precision,
     )
+    if not electrodes and not heaters:
+        return sim
+
+    from . import active as _active
+
+    def pick(name, layer, zb, point, med):
+        polys = polys_by_layer.get(_layer_key(component, layer), [])
+        from matplotlib.path import Path
+        hits = [p for p in polys if Path(p).contains_point(point)]
+        if not hits:
+            raise ValueError(f"{name!r}: no polygon on layer {layer} contains "
+                             f"the point {point} (um)")
+        verts = [(float(x * 1e-6 - x_center), float(y * 1e-6 - y_center)) for x, y in hits[0]]
+        return PolySlab(vertices=tuple(verts),
+                        z_bounds=(float(zb[0]) - z_center, float(zb[1]) - z_center),
+                        medium=med)
+
+    e_med = electrode_medium or _active.metal_active("Au")
+    h_med = heater_medium or _active.metal_active("TiN")
+    els, hts, metal = [], [], []
+    for name, (layer, zb, point) in (electrodes or {}).items():
+        g = pick(name, layer, zb, point, e_med)
+        els.append(_active.Electrode(g, name)); metal.append(g)
+    for name, (layer, zb, point, power) in (heaters or {}).items():
+        g = pick(name, layer, zb, point, h_med)
+        hts.append(_active.Heater(g, float(power), name)); metal.append(g)
+    region = _active.ActiveRegion(list(structures) + metal, electrodes=els,
+                                  heaters=hts, wavelength=wavelength, **active_kwargs)
+    return sim, region
