@@ -134,6 +134,46 @@ scales as 1 / length. Example 9's coupler switches at about 1 kV over 41 um;
 the same design 5 mm long would switch at about 8 V. The shape of the
 switching curve and the extinction carry over unchanged.
 
+Lithium niobate switch cells for gdsfactory
+-------------------------------------------
+
+:mod:`photonfdtd.lnoi` packages thin-film LN switches as gdsfactory cells
+(they place, route and export like any other cell) and gives each one a model
+computed from its own geometry:
+
+.. code-block:: python
+
+   import gdsfactory as gf
+   from photonfdtd import lnoi
+
+   c = lnoi.mzi_switch(arm_length=5000)       # um; ports o1..o4, sig_*, gnd_*
+   m = lnoi.model(c)                          # about a minute
+   m.info["vpi"], m.cross(0.0), m.bar(4.4)
+   m.transfer({"sig": 2.0})                   # 2 x 2 amplitude matrix
+
+.. list-table::
+   :widths: 35 65
+
+   * - :func:`~photonfdtd.lnoi.phase_shifter`
+     - x-cut ridge between signal and ground; ``model`` gives ``vpi_l``,
+       ``vpi`` and ``phase(V)``
+   * - :func:`~photonfdtd.lnoi.mzi_switch`
+     - x-cut 2 x 2 MZI, directional couplers and push-pull GSG electrodes
+   * - :func:`~photonfdtd.lnoi.dbeta_coupler_switch`
+     - z-cut delta-beta coupler with electrodes on top of both waveguides,
+       optionally in reversed sections
+
+:func:`~photonfdtd.lnoi.model` solves the electroded cross-section (one
+waveguide at a time, for its ``d n_eff / dV`` per electrode) and the coupled
+pair (the supermode splitting gives the coupling), then multiplies coupled-mode
+transfer matrices along the device. :func:`~photonfdtd.lnoi.coupler_length`
+sizes a coupler for a given split, :class:`~photonfdtd.lnoi.Stack` sets the
+film, etch, cladding and cut, and :func:`~photonfdtd.lnoi.to_simulation`
+builds the full 3-D FDTD model of a short cell. A delta-beta coupler needs
+z-cut: on x-cut both waveguides see the same lateral field, so electrodes on
+top don't detune them. The models leave out the electrodes' optical absorption,
+coupling in the fan-out bends, and RF behaviour.
+
 The physics, and what it leaves out
 -----------------------------------
 

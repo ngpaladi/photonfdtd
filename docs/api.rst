@@ -135,6 +135,11 @@ Static solvers
 
 .. automodule:: photonfdtd.statics
 
+LNOI switch cells (gdsfactory)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: photonfdtd.lnoi
+
 Layout-scale methods
 --------------------
 

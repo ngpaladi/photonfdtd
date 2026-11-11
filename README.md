@@ -173,6 +173,11 @@ print(result.n_eff)            # array of effective indices
   step an RF drive in time. Anisotropic (diagonal-tensor) and conductive media
   work in FDTD runs, the mode solver and the checkpointed design gradients
   (`value_and_grad_params`); see the guide for the paths that refuse them.
+- **LNOI switch cells for gdsfactory.** `photonfdtd.lnoi` draws thin-film
+  lithium niobate phase shifters, Mach-Zehnder switches and delta-beta coupler
+  switches as gdsfactory cells, each with a voltage model computed from its own
+  cross-section (bar and cross against voltage for millimetre devices in about
+  a minute). `pip install photonfdtd[gdsfactory]`.
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient

@@ -1,12 +1,13 @@
 Tutorial: worked examples
 =========================
 
-The ``examples/`` directory holds ten self-contained, runnable scripts. The
+The ``examples/`` directory holds eleven self-contained, runnable scripts. The
 first five climb from a one-dimensional pulse up to a moving charge radiating a
 Cherenkov cone, and then put that charge inside a dielectric tube; the next two
 turn to design, optimizing a splitter by gradient descent and training a chip
-on a dataset like a neural network; the last three switch light with voltages
-and heaters. Each one adds exactly
+on a dataset like a neural network; the next three switch light with voltages
+and heaters, and the last draws lithium niobate switches as gdsfactory
+cells. Each one adds exactly
 one new piece of the API or physics, so you can read them in order and never be
 more than a step ahead of yourself. Every script saves the figure shown below;
 run one with, e.g.::
@@ -299,5 +300,28 @@ length (a longer heater spreads the same power thinner).
    change of ``n_eff`` against heater power, with the pi-phase level dashed.
 
 .. literalinclude:: ../examples/10_thermo_optic_heater.py
+   :language: python
+   :linenos:
+
+
+11. Lithium niobate switch cells for gdsfactory
+-----------------------------------------------
+
+:mod:`photonfdtd.lnoi` draws thin-film LN switches as gdsfactory cells and
+models each one from its own cross-section: the electrostatics and mode
+solves give each waveguide's ``d n_eff / dV`` and the coupling between them,
+and coupled-mode theory carries that along the millimetre-long device. The
+x-cut Mach-Zehnder switch goes from cross to bar at about 4.4 V; the z-cut
+delta-beta coupler, with electrodes on top of the waveguides, at about 40 V.
+Needs gdsfactory (``pip install photonfdtd[gdsfactory]``).
+
+.. figure:: ../examples/11_lnoi_switch_cells.png
+   :width: 100%
+   :alt: Bar and cross output against voltage for an LN MZI switch and a delta-beta coupler switch
+
+   Bar and cross fractions from input ``o1`` against the signal voltage; the
+   dotted line marks the switching voltage.
+
+.. literalinclude:: ../examples/11_lnoi_switch_cells.py
    :language: python
    :linenos:
