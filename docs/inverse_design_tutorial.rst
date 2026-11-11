@@ -138,8 +138,8 @@ parameters with a very sharp projection gives exactly that pattern, so
 as the optimized value, because the continuation ran until the design was
 binary.
 
-Stopping early does not get you there. The same script with 40 iterations and
-``beta_max=16`` reports 0.54 with a binarization of 0.71, and that design reads
+Stopping early does not get you there. The same script with 40 iterations,
+``every=10`` and ``beta_max=16`` reports 0.54 with a binarization of 0.71, and that design reads
 **0.42** as a binary etch: a fifth of the performance was in grey material that
 cannot be made. If the binary number is much below the optimized one, run the
 continuation further.
@@ -209,8 +209,9 @@ Adapting it to your own device
   dimensions to tune, optimize those with :class:`~photonfdtd.ShapeDesign`
   instead of a density (see :doc:`optimization`).
 * **Other sources.** Any source works, including a
-  :class:`~photonfdtd.ChargedParticle`; a moving charge needs the default
-  ``"checkpoint"`` adjoint.
+  :class:`~photonfdtd.ChargedParticle`; a moving charge cannot use the
+  reversible adjoints, so keep the default ``"checkpoint"`` or use
+  ``"tiled"``.
 * **Long runs.** Pass ``checkpoint="run.npz"`` to
   :func:`~photonfdtd.minimize`. An interrupted run resumes from the file and
   gives the same result as an uninterrupted one.
