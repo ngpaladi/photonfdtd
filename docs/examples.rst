@@ -177,9 +177,11 @@ improves if it splits evenly. :func:`~photonfdtd.make_value_and_grad_params`
 compiles the forward and adjoint run once, and :func:`~photonfdtd.minimize`
 steps the density with Adam while
 :func:`~photonfdtd.beta_continuation` doubles the projection sharpness every
-10 iterations. The jumps in the convergence curve at those points are the
-design being pushed toward binary. At the end the design is written to GDS if
-``gdstk`` is installed. In 2-D the port readout is a Gaussian projection, a
+12 iterations, up to 64. The jumps in the convergence curve at those points
+are the design being pushed toward binary. At the end the design is
+re-evaluated as a hard binary etch and written to GDS if ``gdstk`` is
+installed. :doc:`inverse_design_tutorial` goes through the script step by
+step. In 2-D the port readout is a Gaussian projection, a
 cheap stand-in for modal power. A 3-D device would use
 :class:`~photonfdtd.ModeTransmission`. See :doc:`optimization` for the whole
 toolkit.
@@ -188,7 +190,7 @@ toolkit.
    :width: 100%
    :alt: Convergence, optimized permittivity, and field of a 1x2 splitter
 
-   Left: the weaker arm's overlap over 40 iterations. Middle: the optimized
+   Left: the weaker arm's overlap over 80 iterations. Middle: the optimized
    permittivity between the fixed waveguide stubs. Right: ``Ez`` as the pulse
    passes through the splitter.
 

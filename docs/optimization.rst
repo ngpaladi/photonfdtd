@@ -178,6 +178,8 @@ Training memory scales with the number of input ports, because the ``N``
 adjoints are taken together inside one ``jax.value_and_grad``. With
 ``method="tiled"`` the port simulations are disk-backed instead (see below).
 
+.. _choosing-an-adjoint:
+
 Choosing an adjoint
 -------------------
 
@@ -245,3 +247,5 @@ Limitations
 
 The worked examples 6 (a 1x2 splitter) and 7 (a phase classifier trained on a
 dataset) in :doc:`examples` run all of this end to end.
+:doc:`inverse_design_tutorial` and :doc:`training_tutorial` go through them
+step by step.

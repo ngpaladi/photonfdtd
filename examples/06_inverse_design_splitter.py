@@ -7,8 +7,10 @@ evenly), normalized by what a straight waveguide delivers. In 2-D the port
 "mode" here is a Gaussian projection - a cheap proxy for modal power; a 3-D
 device would use ``pf.ModeTransmission`` with a solved mode instead. The density is filtered
 to a minimum feature size, projected toward binary with a sharpness ``beta``
-that doubles every 10 iterations, and stepped with Adam; every gradient is
-one forward + one adjoint FDTD run, compiled once for the whole loop.
+that doubles every 12 iterations up to 64, and stepped with Adam; every
+gradient is one forward + one adjoint FDTD run, compiled once for the whole
+loop. The last lines re-evaluate the design as a hard binary etch, the pattern
+``export_gds`` writes. ``docs/inverse_design_tutorial.rst`` walks through it.
 """
 import matplotlib
 matplotlib.use("Agg")
@@ -62,12 +64,18 @@ region = pf.DesignRegion(center=(0, 0), size=(box, box), core_z=(-1, 1),
                          filter_radius=120e-9)
 vg = pf.make_value_and_grad_params(sim, region.ce_builder(sim), loss)
 rho0 = jnp.full(region.shape(sim.grid), 0.5)
-res = pf.minimize(vg, rho0, pf.Adam(0.05), n_iter=40,
-                  schedule=pf.beta_continuation(2.0, 2.0, every=10, beta_max=16.0),
+n_iter, every, beta_max = 80, 12, 64.0
+res = pf.minimize(vg, rho0, pf.Adam(0.05), n_iter=n_iter,
+                  schedule=pf.beta_continuation(2.0, 2.0, every=every, beta_max=beta_max),
                   verbose=True)
-rho_phys = np.asarray(region.rho_phys(sim, res.x, beta=16.0))
-print(f"weaker arm: {-res.history[-1]['value']:.3f} x the straight-guide overlap; "
-      f"binarization {pf.binarization(rho_phys):.2f}")
+rho_phys = np.asarray(region.rho_phys(sim, res.x, beta=beta_max))
+print(f"weaker arm: {-float(vg(res.x, beta=beta_max)[0]):.3f} x the straight-guide "
+      f"overlap; binarization {pf.binarization(rho_phys):.2f}")
+
+# What gets fabricated is the hard-binary pattern (density > 0.5). A very
+# sharp projection of the same density is that pattern, so evaluate it.
+binary = -float(vg(res.x, beta=1e3)[0])
+print(f"as a binary etch: {binary:.3f}")
 
 try:
     pf.export_gds("06_splitter.gds", region=region, rho=rho_phys, grid=sim.grid)
@@ -77,7 +85,7 @@ except ImportError:
 
 # Final design in context + its field. For the picture the run uses the
 # isotropic (Ez) permittivity, without the in-plane sidewall anisotropy.
-final = region.ce_builder(sim)(res.x, beta=16.0)
+final = region.ce_builder(sim)(res.x, beta=beta_max)
 eps = sim.dt / (np.asarray(final["Ez"])[..., 0] * pf.EPS_0)
 snap = pf.FieldMonitor(name="f", components=("Ez",), times=[70e-15])
 sim_f = chip()
@@ -91,7 +99,7 @@ it = [h["it"] for h in res.history]
 ax[0].plot(it, [-h["value"] for h in res.history], "k-")
 ax[0].set_xlabel("iteration")
 ax[0].set_ylabel("weaker-arm overlap / straight guide")
-for b in range(10, 40, 10):
+for b in range(every, 5 * every + 1, every):   # 2 -> 4 -> ... -> 64
     ax[0].axvline(b, color="0.8", lw=0.8)
 ax[0].set_title("convergence (grey: beta doubles)")
 ax[1].pcolormesh(x_um, y_um, eps.T, cmap="Greys", shading="auto")

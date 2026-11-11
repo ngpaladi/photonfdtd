@@ -21,6 +21,7 @@ don't. See :doc:`api` for the full reference.
    backends
    accuracy
    optimization
+   inverse_design_tutorial
    training_tutorial
    active_devices
    chip_simulation

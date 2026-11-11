@@ -211,7 +211,8 @@ print(result.n_eff)            # array of effective indices
   transfer matrix and a training step costs N forward + N adjoint runs however
   big the batch. Every design gradient can use the checkpointed, reversible,
   PML-reversible or disk-tiled adjoint (`method=`), and dispersive layouts
-  around the design region are supported. See `docs/optimization.rst`.
+  around the design region are supported. See `docs/optimization.rst`, and
+  `docs/inverse_design_tutorial.rst` for a step-by-step run.
 - **Memory planning**: per-array `float32`/`float64` precision (the stepping
   arrays share one dtype; monitor storage may differ) and a memory planner
   (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)
