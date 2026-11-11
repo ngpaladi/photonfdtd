@@ -245,6 +245,7 @@ class Chip:
         nets carry electrodes or heaters."""
         self._active_nets = set()
         self._open_detectors = set()
+        self._open_cache = {}
         for inst, m in self.models.items():
             if isinstance(m, (Modulator, Heater)):
                 for c in m.conductors:
@@ -303,7 +304,10 @@ class Chip:
                                  f"{self.net_names[k]} to different voltages")
             fixed[k] = v
         floating = self._active_nets - set(fixed)
-        self._open_detectors = self._unreturned(fixed)
+        key = frozenset(fixed)
+        if key not in self._open_cache:  # depends only on which nets are driven
+            self._open_cache[key] = self._unreturned(fixed)
+        self._open_detectors = self._open_cache[key]
         return fixed, floating
 
     def _unreturned(self, fixed) -> set:

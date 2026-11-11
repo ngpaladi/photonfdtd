@@ -9,6 +9,7 @@ electrode or heater sits on one.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -88,14 +89,10 @@ class PRBS:
     seed: int = 1
 
     def bits(self, n: int) -> np.ndarray:
-        taps = {7: (7, 6), 9: (9, 5), 15: (15, 14), 23: (23, 18), 31: (31, 28)}[self.order]
-        state = (self.seed or 1) & ((1 << self.order) - 1)
-        out = np.empty(n, int)
-        for i in range(n):
-            bit = ((state >> (taps[0] - 1)) ^ (state >> (taps[1] - 1))) & 1
-            state = ((state << 1) | bit) & ((1 << self.order) - 1)
-            out[i] = bit
-        return out
+        # Generated in power-of-two blocks and cached: a transient asks for
+        # the sequence up to each time step.
+        size = 1 << max(int(n) - 1, 0).bit_length()
+        return _lfsr(self.order, self.seed, size)[:n]
 
     def __call__(self, t):
         t = np.asarray(t, float)
@@ -103,6 +100,19 @@ class PRBS:
         n = int(idx.max()) + 1 if idx.size else 1
         b = self.bits(max(n, 1))
         return np.where(b[np.clip(idx, 0, n - 1)] == 1, self.high, self.low)
+
+
+@lru_cache(maxsize=16)
+def _lfsr(order: int, seed: int, n: int) -> np.ndarray:
+    taps = {7: (7, 6), 9: (9, 5), 15: (15, 14), 23: (23, 18), 31: (31, 28)}[order]
+    state = (seed or 1) & ((1 << order) - 1)
+    out = np.empty(n, int)
+    for i in range(n):
+        bit = ((state >> (taps[0] - 1)) ^ (state >> (taps[1] - 1))) & 1
+        state = ((state << 1) | bit) & ((1 << order) - 1)
+        out[i] = bit
+    out.flags.writeable = False
+    return out
 
 
 @dataclass(frozen=True)
