@@ -150,3 +150,40 @@ def test_projection_validation():
     with pytest.raises(ValueError, match="below"):
         pf.project_far_field(sim, res, {"xm": "+x", "xp": "-x"},
                              pf.polar_directions([0.0]))
+
+
+@pytest.mark.parametrize("index", [1.0, 1.5])
+def test_far_field_power_equals_near_field_flux(index):
+    """Absolute normalisation: the far-field intensity integrated over all
+    directions is the Poynting flux through the monitor box."""
+    lam = 1e-6
+    f0 = pf.C_0 / lam
+    h = 1.5e-6
+    grid = pf.Grid(size=(5e-6, 5e-6), cell_size=lam / 30, pml_layers=(15, 15, 0))
+    mons = [pf.DFTMonitor(name=a + t, components=("Ez", "Hx", "Hy"), freqs=[f0],
+                          plane_axis=a, plane_position=s * h)
+            for a in "xy" for s, t in ((-1, "m"), (1, "p"))]
+    structures = [pf.Box(center=(0, 0, 0), size=(1, 1, 1), medium=pf.Medium.from_index(index))] \
+        if index != 1.0 else []
+    sim = pf.Simulation(grid, structures=structures, monitors=mons, run_time=120e-15,
+                        sources=[pf.PointDipole(position=(0, 0), component="Ez",
+                                                waveform=pf.GaussianPulse(freq0=f0, fwhm=6e-15))])
+    res = sim.run()
+
+    flux = 0.0
+    for ax, a in enumerate("xy"):
+        t = np.asarray(grid.coords[1 - ax])
+        inside = np.abs(t) <= h + 1e-12
+        w = inside * grid.cell_size[1 - ax]
+        w = np.where(np.isclose(np.abs(t), np.abs(t)[inside].max()), 0.5 * w, w)   # box corners
+        for s, tag in ((-1, "m"), (1, "p")):
+            d = {c: np.asarray(v)[0].ravel() for c, v in res.dft[a + tag].items()}
+            # S_x = -Ez Hy*, S_y = Ez Hx*
+            sn = 0.5 * np.real(-d["Ez"] * np.conj(d["Hy"]) if a == "x" else d["Ez"] * np.conj(d["Hx"]))
+            flux += s * np.sum(sn * w)
+
+    phi = np.linspace(0, 2 * np.pi, 361)[:-1]
+    ff = pf.project_far_field(sim, res, {"xm": "-x", "xp": "+x", "ym": "-y", "yp": "+y"},
+                              pf.polar_directions(phi), index=index)
+    power = ff.intensity[0].sum() * (phi[1] - phi[0])
+    assert power == pytest.approx(flux, rel=0.03)
