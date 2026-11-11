@@ -23,6 +23,7 @@ don't. See :doc:`api` for the full reference.
    optimization
    training_tutorial
    active_devices
+   chip_simulation
    layout_scale
    examples
    api
@@ -80,6 +81,11 @@ Capabilities
   solver, voltage sweeps of switches in FDTD, drive optimization by gradient
   descent, and RF drives. Anisotropic (diagonal-tensor) and conductive media.
   See :doc:`active_devices`.
+- **Chip simulation**: a whole gdsfactory layout as a circuit of
+  physics-based models (the lithium niobate switch cells of
+  :mod:`photonfdtd.lnoi` solved from their cross-sections), with pads,
+  electrodes, heaters and photodetectors, DC and time-domain drives (square
+  waves, PRBS), and export to sax. See :doc:`chip_simulation`.
 - **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
   :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
   before it starts, and disk-tiled forward runs and adjoints for grids that
