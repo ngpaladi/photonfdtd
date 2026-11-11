@@ -41,6 +41,12 @@ from photonfdtd.circuit.cells import photodetector  # noqa: E402
 V_PI = 5.0
 
 
+@pytest.fixture(autouse=True)
+def _private_cache(tmp_path, monkeypatch):
+    # Faked solves must never land in the user's LN cache.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+
 @pytest.fixture
 def fast_lnoi(monkeypatch):
     def fake_model(cell, **_):
@@ -166,6 +172,9 @@ def test_reexporting_a_loaded_part_keeps_its_file(tmp_path, fast_lnoi):
     cf = lib.load_component(tmp_path / ("sw" + lib.SUFFIX))
     again = lib.export_component(cf.cell(), name="copy")
     assert again["model"] == first["model"]
+    # Without a name it keeps the file's name and metadata.
+    same = lib.export_component(cf.cell())
+    assert same["name"] == first["name"] and same["description"] == first["description"]
     assert again["conductors"] == first["conductors"]
     assert again["generator"] == first["generator"]
 
@@ -202,6 +211,60 @@ def test_recipe_resolves_at_another_wavelength(tmp_path, fast_lnoi, monkeypatch)
     new = lib.load_component(data).resolve(wavelength=1.31, cell_size=0.03)
     assert seen == {"wavelength": 1.31, "cell": 0.03}
     assert new["data"]["dneff_dV"] == 2e-5
+
+
+def test_untrusted_generators_are_limited_to_cell_functions(tmp_path):
+    assert lib.generator_allowed({"module": "photonfdtd.lnoi", "function": "mzi_switch"})
+    assert lib.generator_allowed({"module": "gdsfactory.components", "function": "straight"})
+    assert not lib.generator_allowed({"module": "photonfdtd.lnoi", "function": "_cache_path"})
+    assert not lib.generator_allowed({"module": "gdsfactory", "function": "import_gds"})
+    assert not lib.generator_allowed({"module": "os", "function": "remove"})
+    d = lib.export_component(gf.components.straight(length=5))
+    d["generator"] = {"module": "gdsfactory", "function": "import_gds", "kwargs": {}}
+    with pytest.raises(PermissionError, match="not a known cell function"):
+        lib.load_component(d).regenerate(gdspath="x.gds")
+
+
+def test_regenerated_part_keeps_the_files_model(tmp_path):
+    table = lib.sample_sparams(cm.directional_coupler(0.3), [1.55])
+    c = gf.components.coupler(gap=0.3)
+    d = lib.export_component(c, model=None, sparams=table)
+    assert "physics" not in d["model"] and d["model"]["sparams"]
+    cf = lib.load_component(d)
+    with pytest.warns(UserWarning, match="file's model"):
+        c2 = cf.regenerate(gap=0.25)
+    assert "pcomp" in c2.info and cf.regenerate(gap=0.25) is c2
+    top = gf.Component("uses_regenerated")
+    top << c2
+    chip = cc.Chip.from_gdsfactory(top)
+    m = next(iter(chip.models.values()))
+    ref = table["S"]["o1,o4"]
+    s = m.sdict(np.array([1.55]))[("o1", "o4")][0]
+    assert s == pytest.approx(complex(ref["re"][0], ref["im"][0]))
+
+
+def test_loaded_ln_part_is_resolved_at_the_circuit_wavelength(tmp_path, fast_lnoi, monkeypatch):
+    c = lnoi.phase_shifter(length=1000)
+    monkeypatch.setattr(lnoi, "model", lambda cell, **kw: lnoi.PhaseShifterModel(
+        length=1e-3, wavelength=1.55e-6, dneff_dV=1e-5, n_eff=1.9))
+    d = lib.export_component(c)
+    calls = []
+
+    def fake_solve(rec, stack, cell_size):
+        calls.append(stack.wavelength)
+        return lnoi.PhaseShifterModel(length=1e-3, wavelength=stack.wavelength * 1e-6,
+                                      dneff_dV=3e-5, n_eff=1.8)
+    monkeypatch.setattr(lnoi, "_solve_model", fake_solve)
+    cf = lib.load_component(d)
+    top = gf.Component("uses_ln_file")
+    top << cf.cell()
+    chip = cc.Chip.from_gdsfactory(top, wavelength=1.31)
+    assert calls == [1.31]
+    cc.Chip.from_gdsfactory(top, wavelength=1.31)        # cached in the file object
+    lib._REGISTRY.clear()
+    lib.load_component(d).model(wavelength=1.31)         # and on disk
+    assert calls == [1.31]
+    assert chip.models[next(iter(chip.models))].ports
 
 
 def test_rejects_other_files():

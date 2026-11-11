@@ -512,7 +512,7 @@ def _model_for(name, inst, cell, models, wg, lnoi_kwargs) -> Model:
     elec = [p.name for p in cell.ports if p.port_type != "optical"]
     if "pcomp" in info:
         from .library import model_for_cell
-        return model_for_cell(info)
+        return model_for_cell(info, wavelength=lnoi_kwargs.get("wavelength"))
     if "lnoi" in info:
         from .. import lnoi
         kw = dict(lnoi_kwargs)

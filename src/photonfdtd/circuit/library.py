@@ -22,9 +22,10 @@ A component file (``*.pcomp.json``) holds:
     - ``recipe``: what the physics was solved from (stack, cross-section,
       mesh), so it can be re-solved at another wavelength or mesh.
 ``generator``
-    Optionally, how to rebuild the part with other parameters: a function in
-    an installed module (photonfdtd, gdsfactory), or Python source carried in
-    the file, which only runs when the loader is told to trust it.
+    Optionally, how to rebuild the part with other parameters: a cell
+    function of photonfdtd or gdsfactory (see :func:`generator_allowed`), or
+    other code (another module, or Python source carried in the file), which
+    only runs when the loader is told to trust it.
 
 :func:`export_component` writes one from a gdsfactory component (a single
 cell, or a sub-layout of several, which becomes a ``circuit`` model);
@@ -39,6 +40,7 @@ import datetime as _dt
 import hashlib
 import importlib
 import json
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
@@ -48,12 +50,14 @@ import numpy as np
 from . import models as cm
 
 __all__ = ["FORMAT", "VERSION", "SUFFIX", "export_component", "load_component",
-           "ComponentFile", "sample_sparams", "TableModel", "TRUSTED_MODULES"]
+           "ComponentFile", "sample_sparams", "TableModel", "TRUSTED_MODULES",
+           "generator_allowed"]
 
 FORMAT = "photonfdtd-component"
 VERSION = 1
 SUFFIX = ".pcomp.json"
-#: Modules whose functions a generator may name without ``trust=True``.
+#: Module prefixes a generator may come from without ``trust=True``; within
+#: them only cell functions run (see :func:`generator_allowed`).
 TRUSTED_MODULES = ("photonfdtd.", "gdsfactory.")
 
 _REGISTRY: Dict[str, "ComponentFile"] = {}
@@ -227,6 +231,13 @@ def export_component(component, path=None, *, name: Optional[str] = None,
     """
     from .. import __version__
     info = dict(component.info) if component.info else {}
+    source = _registry_get(info["pcomp"]).data if "pcomp" in info else None
+    if source is not None:
+        # A loaded part: its file's name and metadata unless given.
+        name = name or source.get("name")
+        description = description or source.get("description", "")
+        author = author or source.get("author", "")
+        library = library or source.get("library", "")
     name = name or getattr(component, "function_name", None) or component.name
     data: Dict[str, Any] = dict(
         format=FORMAT, version=VERSION, name=name, description=description, author=author,
@@ -235,7 +246,6 @@ def export_component(component, path=None, *, name: Optional[str] = None,
         ports=_ports(component))
     physics = recipe = None
     pins: dict = {}
-    source = _registry_get(info["pcomp"]).data if "pcomp" in info else None
     if source is not None and model == "auto":
         # Re-exporting a loaded part: its file's model, pins and generator.
         m = source.get("model", {})
@@ -256,7 +266,12 @@ def export_component(component, path=None, *, name: Optional[str] = None,
             if physics is not None:
                 pins = _conductors_of(_model_from_physics(physics))
         else:
-            physics, pins = _circuit_physics(component, stack, cell_size, waveguide)
+            try:
+                physics, pins = _circuit_physics(component, stack, cell_size, waveguide)
+            except ValueError:
+                if not sparams:
+                    raise
+                physics, pins = None, {}  # the sparams table is the model
     elif isinstance(model, dict):
         physics = model
         pins = _conductors_of(_model_from_physics(physics))
@@ -450,6 +465,8 @@ class ComponentFile:
     path: Optional[Path] = None
     trust: bool = False
     _cell: Any = field(default=None, repr=False)
+    _resolved: dict = field(default_factory=dict, repr=False)
+    _regenerated: dict = field(default_factory=dict, repr=False)
 
     @property
     def name(self) -> str:
@@ -483,13 +500,22 @@ class ComponentFile:
         self._cell = c
         return c
 
-    def model(self, prefer: str = "physics") -> cm.Model:
+    def model(self, prefer: str = "physics", wavelength: Optional[float] = None) -> cm.Model:
         """The circuit model: from the ``physics`` section, else the
-        ``sparams`` table (``prefer="sparams"`` reverses that)."""
+        ``sparams`` table (``prefer="sparams"`` reverses that). With
+        ``wavelength`` (um), physics with an LN recipe solved elsewhere is
+        re-solved there first (once; the solve is cached on disk)."""
         m = self.data.get("model", {})
         order = ("physics", "sparams") if prefer == "physics" else ("sparams", "physics")
         for kind in order:
             if kind == "physics" and m.get("physics"):
+                r = m.get("recipe") or {}
+                if wavelength is not None and r.get("kind") == "lnoi" \
+                        and abs(float(r["stack"]["wavelength"]) - float(wavelength)) > 1e-9:
+                    key = round(float(wavelength), 9)
+                    if key not in self._resolved:
+                        self._resolved[key] = self.resolve(wavelength=wavelength)
+                    return _model_from_physics(self._resolved[key])
                 return _model_from_physics(m["physics"])
             if kind == "sparams" and m.get("sparams"):
                 return TableModel(m["sparams"], self.data.get("conductors", {})).model
@@ -507,20 +533,34 @@ class ComponentFile:
         st = dict(r["stack"])
         if wavelength is not None:
             st["wavelength"] = float(wavelength)
-        m = lnoi._solve_model(r["rec"], lnoi.Stack(**st), cell_size or r["cell_size"])
+        stack, cell = lnoi.Stack(**st), cell_size or r["cell_size"]
+        path = lnoi._cache_path(True, dict(r["rec"]), stack, cell)
+        if path.exists():
+            m = lnoi._from_json(json.loads(path.read_text()))
+        else:
+            m = lnoi._solve_model(r["rec"], stack, cell)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(lnoi._to_json(m)))
         old = self.data["model"].get("physics", {})
         return dict(kind="lnoi", data=lnoi._to_json(m), length=old.get("length", 0.0),
                     loss_db_cm=old.get("loss_db_cm", 0.0))
 
     def regenerate(self, **kwargs):
-        """Rebuild the part from its generator with ``kwargs`` changed. A
-        generator in an installed photonfdtd/gdsfactory module runs as is;
-        source carried in the file runs only when loaded with
-        ``trust=True``."""
+        """Rebuild the part from its generator with ``kwargs`` changed. An
+        untrusted file may only name a cell function of photonfdtd or of
+        gdsfactory (a registered PDK cell); other generators, and source
+        carried in the file, run only when loaded with ``trust=True``.
+
+        When photonfdtd cannot model the rebuilt cell from its geometry, it
+        keeps this file's model (solved for the file's own parameters), with
+        a warning."""
         g = self.data.get("generator")
         if not g:
             raise ValueError(f"component {self.name!r} has no generator")
         kw = {**g.get("kwargs", {}), **kwargs}
+        tag = json.dumps(kw, sort_keys=True, default=str)
+        if tag in self._regenerated:
+            return self._regenerated[tag]
         if "source" in g:
             if not self.trust:
                 raise PermissionError(
@@ -528,11 +568,57 @@ class ComponentFile:
                     "to run it")
             ns: Dict[str, Any] = {}
             exec(compile(g["source"], f"<{self.name} generator>", "exec"), ns)
-            return ns[g["function"]](**kw)
-        mod = g["module"]
-        if not (mod + ".").startswith(TRUSTED_MODULES) and not self.trust:
-            raise PermissionError(f"generator module {mod!r} is not trusted; load with trust=True")
-        return getattr(importlib.import_module(mod), g["function"])(**kw)
+            c = ns[g["function"]](**kw)
+        else:
+            if not self.trust and not generator_allowed(g):
+                raise PermissionError(
+                    f"generator {g.get('module')}.{g.get('function')} is not a known cell "
+                    "function; load with trust=True to run it")
+            c = getattr(importlib.import_module(g["module"]), g["function"])(**kw)
+        c = self._keep_model(c)
+        self._regenerated[tag] = c
+        return c
+
+    def _keep_model(self, c):
+        info = dict(c.info) if c.info else {}
+        phys = self.data.get("model", {}).get("physics") or {}
+        if "lnoi" in info or "photodetector" in info or phys.get("kind") in _GEOMETRY_KINDS \
+                or not self.data.get("model"):
+            return c            # photonfdtd models the new geometry itself
+        import gdsfactory as gf
+        warnings.warn(f"component {self.name!r}: the rebuilt part uses the file's model, "
+                      "solved for the file's own parameters", stacklevel=3)
+        w = gf.Component(f"{c.name}_pcomp_{self.key[:8]}")
+        ref = w << c
+        w.add_ports(ref.ports)
+        w.info["pcomp"] = dict(name=self.name, key=self.key,
+                               path=str(self.path) if self.path else None)
+        return w
+
+
+#: Physics kinds photonfdtd derives from a cell's geometry and settings.
+_GEOMETRY_KINDS = ("waveguide", "heater", "mmi1x2", "mmi2x2", "conductor")
+_CELL_FUNCTIONS = {"photonfdtd.lnoi": ("phase_shifter", "mzi_switch", "dbeta_coupler_switch"),
+                   "photonfdtd.circuit.cells": ("photodetector",)}
+
+
+def generator_allowed(g: Mapping) -> bool:
+    """Whether a generator may run without trust: a photonfdtd cell, or a
+    gdsfactory function registered as a cell of the active PDK (or in
+    ``gdsfactory.components``). Never source carried in the file."""
+    if not g or "source" in g:
+        return False
+    mod, fn = str(g.get("module", "")), str(g.get("function", ""))
+    if mod in _CELL_FUNCTIONS:
+        return fn in _CELL_FUNCTIONS[mod]
+    if not (mod == "gdsfactory" or mod.startswith("gdsfactory.")):
+        return False
+    import gdsfactory as gf
+    try:
+        obj = getattr(importlib.import_module(mod), fn)
+    except (ImportError, AttributeError):
+        return False
+    return obj is gf.get_active_pdk().cells.get(fn) or obj is getattr(gf.components, fn, None)
 
 
 def load_component(source, trust: bool = False) -> ComponentFile:
@@ -572,6 +658,7 @@ def _registry_get(rec: Mapping) -> ComponentFile:
     return cf
 
 
-def model_for_cell(info: Mapping) -> cm.Model:
-    """The model of a cell built by :meth:`ComponentFile.cell`."""
-    return _registry_get(info["pcomp"]).model()
+def model_for_cell(info: Mapping, wavelength: Optional[float] = None) -> cm.Model:
+    """The model of a cell built by :meth:`ComponentFile.cell` (re-solved at
+    ``wavelength`` in um when its file carries an LN recipe)."""
+    return _registry_get(info["pcomp"]).model(wavelength=wavelength)

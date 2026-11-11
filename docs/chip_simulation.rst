@@ -94,8 +94,11 @@ and import, like a KiCad library part: one file with
   from FDTD, a measurement or the physics), and ``recipe`` (what the physics
   was solved from, to re-solve at another wavelength or mesh);
 - optionally a **generator** to rebuild the part with other parameters: a
-  function in photonfdtd or gdsfactory, or Python source carried in the file,
-  which runs only when loaded with ``trust=True``.
+  cell function of photonfdtd or gdsfactory (a registered PDK cell), or other
+  code (another module, or Python source carried in the file), which runs
+  only when loaded with ``trust=True``. A rebuilt part that photonfdtd cannot
+  model from its geometry keeps the file's model, solved for the file's own
+  parameters.
 
 .. code-block:: python
 
@@ -106,14 +109,21 @@ and import, like a KiCad library part: one file with
    cell = part.cell()                 # place it in any gdsfactory layout
    part.model()                       # its circuit model (no re-solve)
    part.resolve(wavelength=1.31)      # re-solve from the recipe
+   part.model(wavelength=1.31)        # the same, cached, as a circuit model
    part.regenerate(arm_length=8000)   # rebuild through the generator
 
 A component holding several instances (a sub-layout) exports as a
 ``circuit``: its parts' physics, the connections between them, and the ports
 and pads it exposes as its own pins. Circuits built from a layout that uses a
-loaded part's cell find its model by themselves. A sub-circuit drives its
-internal electrodes through its pins; currents drawn inside it (heaters,
-detectors) are not passed back to the outer circuit.
+loaded part's cell find its model by themselves. Built with
+``Chip.from_gdsfactory(..., wavelength=1.31)``, an LN part whose file carries
+a recipe is re-solved at that wavelength, like the LN cells placed directly.
+
+A sub-circuit is one optical part with electrical pins in the outer circuit:
+it drives its internal electrodes through its pins, but its heaters,
+resistors and detectors are not part of the outer electrical network. Their
+currents are not drawn from the outer drives, and a path through one of its
+resistors does not count as a return path for an outer photodetector.
 
 Time domain
 -----------
