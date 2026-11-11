@@ -233,6 +233,10 @@ class _Tiled:
         if T < 1:
             raise ValueError("tile_cells must be >= 1")
 
+        if any(getattr(sim.grid, "periodic", ())):
+            raise NotImplementedError(
+                "disk-tiled stepping does not support periodic boundaries; "
+                "run in memory (disk_tiled=False)")
         self.sim = sim
         self.static = static = _build_static(sim)
         plans = _monitor_plan(sim)
@@ -333,10 +337,9 @@ class _Tiled:
                         np.asarray(c_src[ax], dtype=npdt).reshape(shp))
 
         # Sources, already grouped per component (see _build_static), with x
-        # moved to padded indices and the table as (n_src, n_steps).
+        # moved to padded indices; V is the separable SourceTable.
         def src_table(entries):
-            return {comp: (I + h, J, Kk, np.ascontiguousarray(V.T))
-                    for comp, I, J, Kk, V in entries}
+            return {comp: (I + h, J, Kk, V) for comp, I, J, Kk, V in entries}
         srcH, srcE = src_table(static["src_H"]), src_table(static["src_E"])
 
         # ------------------------------------------------------------------ #
@@ -389,8 +392,10 @@ class _Tiled:
         d_xmask = {k: jnp.asarray(v) for k, v in xmask.items()}
         d_yz = {k: jnp.asarray(v) for k, v in yzmask.items()}
         d_coef = {k: (jnp.asarray(b), jnp.asarray(c)) for k, (b, c) in tcoef.items()}
-        d_srcH = {k: tuple(jnp.asarray(a) for a in v) for k, v in srcH.items()}
-        d_srcE = {k: tuple(jnp.asarray(a) for a in v) for k, v in srcE.items()}
+        d_srcH = {k: tuple(jnp.asarray(a) for a in v[:3]) + (v[3].device(),)
+                  for k, v in srcH.items()}
+        d_srcE = {k: tuple(jnp.asarray(a) for a in v[:3]) + (v[3].device(),)
+                  for k, v in srcE.items()}
         d_part = [dict(R=pp["R"], axes=pp["axes"], coef3=[float(c) for c in pp["coef3"]],
                        starts=jnp.asarray(pp["starts"]),
                        wblocks=jnp.asarray(pp["wblocks"])) for pp in pplans]
@@ -439,7 +444,7 @@ class _Tiled:
             for comp, (I, J, Kk, V) in table.items():
                 li = I - b0
                 li = jnp.where((li >= 0) & (li < L), li, L)
-                f[comp] = f[comp].at[li, J, Kk].add(V[:, n], mode="drop")
+                f[comp] = f[comp].at[li, J, Kk].add(V[n], mode="drop")
             return f
 
         def deposit(f, ce_p, n, b0):

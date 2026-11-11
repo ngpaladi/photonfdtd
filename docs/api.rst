@@ -46,6 +46,11 @@ Monitors
 
 .. automodule:: photonfdtd.monitors
 
+Far-field projection
+--------------------
+
+.. automodule:: photonfdtd.farfield
+
 Boundaries
 ----------
 

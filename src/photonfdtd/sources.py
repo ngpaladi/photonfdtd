@@ -1,6 +1,6 @@
 """Sources.
 
-Three primitive source types:
+Primitive source types:
 
 - :class:`PointDipole`     - soft additive source on a single E or H cell.
 - :class:`ModeSource`      - distributed soft source on an injection plane,
@@ -8,6 +8,10 @@ Three primitive source types:
 - :class:`ChargedParticle` - a point charge moving in a straight line,
   injected as a moving current source; radiates Cherenkov light when it
   outruns the local phase velocity.
+
+- :class:`PlaneWave`       - one-way plane wave at normal incidence from a
+  Huygens (electric + magnetic) current sheet; :class:`GaussianBeam` is the
+  same sheet with a Gaussian transverse profile.
 
 And one factory built on top:
 
@@ -542,3 +546,187 @@ class SinglePhotonSource:
 
     def expand(self, grid: "Grid") -> List[PointDipole]:
         return self.as_mode_source().expand(grid)
+
+
+class _TimeShifted:
+    """``waveform(t + shift)``: one shared instance per source sheet, so the
+    stepper samples it once (sources are grouped by waveform identity)."""
+
+    def __init__(self, waveform, shift: float):
+        self.waveform = waveform
+        self.shift = float(shift)
+
+    def __call__(self, t):
+        return self.waveform(np.asarray(t) + self.shift)
+
+
+_AXIS = {"x": 0, "y": 1, "z": 2}
+
+
+def _parse_direction(direction: str) -> Tuple[int, float]:
+    d = str(direction).strip().lower()
+    if len(d) != 2 or d[0] not in "+-" or d[1] not in _AXIS:
+        raise ValueError(f"direction must be one of '+x', '-x', '+y', '-y', "
+                         f"'+z', '-z'; got {direction!r}")
+    return _AXIS[d[1]], (1.0 if d[0] == "+" else -1.0)
+
+
+@dataclass(frozen=True)
+class PlaneWave:
+    r"""One-way plane wave at normal incidence, from a Huygens current sheet.
+
+    A plane of soft electric sources on the polarization component and a
+    co-located plane of magnetic sources on the matching H component (half a
+    Yee cell downstream) radiate in phase forwards and cancel backwards, the
+    same equivalence-principle construction as :class:`UniModeSource` with a
+    uniform profile. The launched wave has peak field ``amplitude`` (V/m)
+    times the waveform, propagating along ``direction``:
+
+    .. math::
+
+        \Delta E = \frac{S}{n} E_0 w(t), \qquad
+        \Delta H = \frac{S}{Z_0} E_0 w(t + n\,\Delta/2c),
+
+    added per step, with :math:`S = c\,\Delta t/\Delta` the 1-D Courant number
+    along the propagation axis (cell size :math:`\Delta`) and :math:`n` the
+    background index at the sheet. The H waveform is advanced by the
+    half-cell travel time so the backward cancellation is exact up to grid
+    dispersion.
+
+    Make the transverse axes periodic (``Grid(periodic=...)``) for an
+    infinite plane wave, e.g. one unit cell of a grating or metasurface; with
+    PML on a transverse axis the sheet is truncated and diffracts from its
+    edges. Only normal incidence is supported: oblique incidence on a periodic
+    cell needs Bloch-periodic (complex) fields, which this engine does not
+    step.
+
+    Parameters
+    ----------
+    center : 3-tuple (m)
+        A point on the injection plane; only its coordinate along the
+        propagation axis matters when ``size`` spans the grid.
+    direction : str
+        ``'+x'``, ``'-x'``, ``'+y'``, ``'-y'``, ``'+z'`` or ``'-z'``.
+    polarization : str
+        E-field component, transverse to ``direction``: ``'Ex'``, ``'Ey'`` or
+        ``'Ez'``.
+    waveform : GaussianPulse
+        Temporal pulse.
+    amplitude : float
+        Peak field of the launched wave, V/m.
+    index : float
+        Refractive index of the (non-dispersive) medium at the sheet.
+    size : 3-tuple or None
+        Extent of the sheet on the transverse axes (m); ``None`` (default) or
+        ``inf`` entries span the whole grid.
+    """
+    center: Tuple[float, ...]
+    direction: str
+    polarization: str
+    waveform: GaussianPulse
+    amplitude: float = 1.0
+    index: float = 1.0
+    size: Tuple[float, ...] = None
+
+    def _profile(self, coords_t1, coords_t2, t_axes, center):
+        return np.ones((coords_t1.size, coords_t2.size))
+
+    #: Simulation passes its time step to ``expand`` (the sheet strengths
+    #: are calibrated against the Courant number).
+    needs_dt = True
+
+    def expand(self, grid: "Grid", dt: float = None) -> List[PointDipole]:
+        if dt is None:
+            raise ValueError("PlaneWave.expand needs the simulation time step "
+                             "dt; pass the source to Simulation(sources=...)")
+        p, s = _parse_direction(self.direction)
+        pol = str(self.polarization)
+        if len(pol) != 2 or pol[0] != "E" or pol[1] not in _AXIS:
+            raise ValueError(f"polarization must be 'Ex', 'Ey' or 'Ez'; got {pol!r}")
+        e_ax = _AXIS[pol[1]]
+        if e_ax == p:
+            raise ValueError("polarization must be transverse to the direction")
+        if grid.shape[p] <= 1:
+            raise ValueError(f"the propagation axis {'xyz'[p]} is collapsed")
+        # H along k x e: for k = s*p_hat and e = e_hat, h_ax is the third axis
+        # with sign s * eps_{p, e, h}.
+        h_ax = 3 - p - e_ax
+        levi = 1.0 if (p, e_ax, h_ax) in ((0, 1, 2), (1, 2, 0), (2, 0, 1)) else -1.0
+        h_sign = s * levi
+
+        center = _to3vec(self.center)
+        size = (None, None, None) if self.size is None else tuple(
+            list(self.size) + [None] * (3 - len(self.size)))
+        dl = grid.cell_size[p]
+        S = C_0 * float(dt) / dl
+        n = float(self.index)
+        dE = S / n * float(self.amplitude)
+        dH = h_sign * S / math.sqrt(MU_0 / EPS_0) * float(self.amplitude)
+
+        # Sheet cells on the propagation axis: E at cell i_p; H (half a cell
+        # +p of its integer index) downstream: same index for +p, i_p-1 for -p.
+        cp = grid.coords[p]
+        i_e = int(np.argmin(np.abs(cp - center[p])))
+        i_h = i_e if s > 0 else i_e - 1
+        if not (0 <= i_h < grid.shape[p]):
+            raise ValueError("the plane-wave sheet lies on the grid edge")
+
+        t_axes = [a for a in range(3) if a != p]
+        idx, crd = [], []
+        for a in t_axes:
+            c = grid.coords[a]
+            lim = size[a]
+            if c.size == 1 or lim is None or not math.isfinite(lim):
+                m = np.ones(c.size, bool)
+            else:
+                m = np.abs(c - center[a]) <= lim / 2.0 + 1e-12 * max(abs(lim), 1e-30)
+            if not m.any():
+                raise ValueError(f"the plane-wave sheet misses axis {'xyz'[a]}")
+            idx.append(np.flatnonzero(m))
+            crd.append(c[m])
+        prof = self._profile(crd[0], crd[1], t_axes, center)
+
+        # Shared waveforms: the E sheet samples w(t), the H sheet w(t + tau).
+        w_e = self.waveform
+        w_h = _TimeShifted(self.waveform, n * dl / (2.0 * C_0))
+        comp_e = pol
+        comp_h = "H" + "xyz"[h_ax]
+        dipoles: List[PointDipole] = []
+        for a1, i1 in enumerate(idx[0]):
+            for a2, i2 in enumerate(idx[1]):
+                w = float(prof[a1, a2])
+                if w == 0.0:
+                    continue
+                for comp, ip, amp, wave in ((comp_e, i_e, dE, w_e),
+                                            (comp_h, i_h, dH, w_h)):
+                    ijk = [0, 0, 0]
+                    ijk[p] = ip
+                    ijk[t_axes[0]] = int(i1)
+                    ijk[t_axes[1]] = int(i2)
+                    pos = tuple(float(grid.coords[a][ijk[a]]) for a in range(3))
+                    dipoles.append(PointDipole(position=pos, component=comp,
+                                               waveform=wave, amplitude=amp * w))
+        return dipoles
+
+
+@dataclass(frozen=True)
+class GaussianBeam(PlaneWave):
+    r"""One-way Gaussian beam with its waist on the injection plane.
+
+    A :class:`PlaneWave` sheet weighted by the transverse profile
+    :math:`\exp(-r^2/w_0^2)` about ``center``, with ``r`` the distance from
+    ``center`` within the plane. The beam is launched at its waist (flat
+    phase front) and then diffracts with Rayleigh range
+    :math:`\pi w_0^2 n / \lambda`. ``waist_radius`` is :math:`w_0` (m), the
+    1/e field radius. The sheet spans the grid unless ``size`` limits it;
+    leave a few waists of margin before the PML.
+    """
+    waist_radius: float = 1e-6
+
+    def _profile(self, coords_t1, coords_t2, t_axes, center):
+        # A collapsed axis (one cell) has no transverse extent: no offset.
+        u1 = coords_t1 - center[t_axes[0]] if coords_t1.size > 1 else 0.0 * coords_t1
+        u2 = coords_t2 - center[t_axes[1]] if coords_t2.size > 1 else 0.0 * coords_t2
+        r2 = u1[:, None] ** 2 + u2[None, :] ** 2
+        return np.exp(-r2 / float(self.waist_radius) ** 2)
+

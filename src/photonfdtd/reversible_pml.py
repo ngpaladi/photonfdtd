@@ -39,7 +39,7 @@ import numpy as np
 
 from .constants import EPS_0
 from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
-from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS,
+from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS, _term_diff,
                          _build_ade_jax)
 from .reversible import _pass_increment, _flux, _ADE, lossless_poles
 
@@ -75,14 +75,7 @@ def _pass_with_psi(fields, psi, is_E_pass, ce_e, static, neg_ch):
             continue
         curl = None
         for t in comp["terms"]:
-            ax = t["ax"]
-            src = fields[t["src"]]
-            hi = [slice(None)] * 3
-            lo = [slice(None)] * 3
-            hi[ax] = slice(1, None)
-            lo[ax] = slice(0, -1)
-            d = (src[tuple(hi)] - src[tuple(lo)]) / t["dl"]
-            d = d[t["osl"]]
+            d = _term_diff(fields[t["src"]], t, jnp)
             p = jnp.asarray(t["b1"]) * psi[t["key"]] + jnp.asarray(t["c1"]) * d
             psi[t["key"]] = p
             cterm = d + p
@@ -117,8 +110,8 @@ def make_pml_reversible(sim, static, plans, ce_e, ade=None):
     pole = _ADE(ade, ce_e, dt)
     mask = jnp.asarray(pml_mask(sim.grid))
 
-    src_H = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_H"]]
-    src_E = [(c, i, j, k, jnp.asarray(v)) for c, i, j, k, v in static["src_E"]]
+    src_H = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_H"]]
+    src_E = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_E"]]
     dft_plans = [p for p in plans if p["kind"] == "dft"]
     flux_plans = [p for p in plans if p["kind"] == "flux"]
     psi_keys = [t["key"] for comp in static["comps"] for t in comp["terms"]]
