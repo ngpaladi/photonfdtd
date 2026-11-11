@@ -17,6 +17,9 @@ resistors) is a nodal network on the same netlist
   modulator's bandwidth, each heater's time constant and each detector's
   bandwidth.
 - :func:`~photonfdtd.circuit.sax.to_sax`: the same circuit in sax.
+- :mod:`~photonfdtd.circuit.library`: component files, one JSON file per
+  part with its layout, ports, pins and model, to share and import like a
+  KiCad library part.
 """
 from .chip import Chip, ChipState, Transient
 from .electrical import DC, PRBS, PWL, Pulse, Sine, Square
@@ -25,8 +28,10 @@ from .models import (Heater, Model, Modulator, Photodetector, Resistor, conducto
                      photodetector, reciprocal, resistor, terminator, waveguide)
 from .solver import Network, Waves
 from .sax import to_sax
+from .library import ComponentFile, export_component, load_component, sample_sparams
 
 __all__ = ["Chip", "ChipState", "Transient", "DC", "Square", "Sine", "Pulse", "PRBS", "PWL",
            "Model", "Modulator", "Heater", "Photodetector", "Resistor", "conductor",
            "waveguide", "directional_coupler", "mmi1x2", "mmi2x2", "terminator", "heater",
-           "photodetector", "resistor", "from_lnoi", "reciprocal", "Network", "Waves", "to_sax"]
+           "photodetector", "resistor", "from_lnoi", "reciprocal", "Network", "Waves", "to_sax",
+           "ComponentFile", "export_component", "load_component", "sample_sparams"]
