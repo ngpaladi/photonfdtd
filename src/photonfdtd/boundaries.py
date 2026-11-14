@@ -34,6 +34,7 @@ def cpml_coeffs_1axis(
     n_pml: int,
     dt: float,
     params: CPMLParams = CPMLParams(),
+    low: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """CPML update coefficients along one axis.
 
@@ -42,7 +43,8 @@ def cpml_coeffs_1axis(
     central-difference FDTD there.
 
     b_e / c_e apply on the *E-field* (integer-index) grid; b_h / c_h apply on
-    the half-staggered H-field grid offset by +1/2 cell.
+    the half-staggered H-field grid offset by +1/2 cell. ``low=False`` leaves
+    the low side without PML (a symmetry plane closes it).
     """
     m = params.poly_order
     if n_pml == 0:
@@ -78,13 +80,14 @@ def cpml_coeffs_1axis(
     b_h = np.zeros(n_cells)
     c_h = np.zeros(n_cells)
 
-    # Lower
-    u_e_lo = (n_pml - 1 - i_e[:n_pml]) / max(n_pml - 1, 1)
-    u_h_lo = (n_pml - 1 - i_h[:n_pml]) / max(n_pml - 1, 1)
-    u_e_lo = np.clip(u_e_lo, 0.0, 1.0)
-    u_h_lo = np.clip(u_h_lo, 0.0, 1.0)
-    s, a = _profile(u_e_lo); b_e[:n_pml], c_e[:n_pml] = _bc(s, a)
-    s, a = _profile(u_h_lo); b_h[:n_pml], c_h[:n_pml] = _bc(s, a)
+    # Lower (skipped on a symmetry plane, which closes the low side instead)
+    if low:
+        u_e_lo = (n_pml - 1 - i_e[:n_pml]) / max(n_pml - 1, 1)
+        u_h_lo = (n_pml - 1 - i_h[:n_pml]) / max(n_pml - 1, 1)
+        u_e_lo = np.clip(u_e_lo, 0.0, 1.0)
+        u_h_lo = np.clip(u_h_lo, 0.0, 1.0)
+        s, a = _profile(u_e_lo); b_e[:n_pml], c_e[:n_pml] = _bc(s, a)
+        s, a = _profile(u_h_lo); b_h[:n_pml], c_h[:n_pml] = _bc(s, a)
 
     # Upper
     u_e_hi = (i_e[-n_pml:] - (n_cells - n_pml)) / max(n_pml - 1, 1)

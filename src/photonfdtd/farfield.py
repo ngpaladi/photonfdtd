@@ -190,6 +190,10 @@ def project_far_field(sim, result, surfaces: Dict[str, str], directions,
         surfaces must share them).
     """
     grid = sim.grid
+    if getattr(grid, "has_symmetry", False):
+        raise NotImplementedError(
+            "far-field projection on a grid with symmetry planes is not "
+            "supported yet; run the full domain for the projection")
     collapsed = [a for a in range(3) if grid.shape[a] == 1]
     if len(collapsed) > 1:
         raise ValueError("far-field projection needs a 2-D or 3-D grid")
