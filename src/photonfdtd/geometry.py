@@ -9,6 +9,10 @@ Currently shipped:
 - :class:`Box`      - axis-aligned box.
 - :class:`PolySlab` - polygon in the xy-plane, extruded between two z bounds.
   Used by the gdsfactory adapter to rasterise arbitrary planar layouts.
+- :class:`Sphere`   - sphere or axis-aligned ellipsoid.
+- :class:`Cylinder` - circular (or elliptical) cylinder along a grid axis, such
+  as a fibre, a pillar or a hollow tube (a :class:`Cylinder` of the cladding
+  with a smaller one of the bore stamped after it).
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -141,6 +145,69 @@ class PolySlab:
         # Apply the medium to every selected (i, j) at every k_idx.
         for k in k_idx:
             eps_r[ii, jj, k] = self.medium.eps_r
+
+
+def _mesh(grid):
+    """Open meshgrid of the cell centres (collapsed axes sit at 0)."""
+    return np.meshgrid(*(np.asarray(grid.coords[a], float) for a in range(3)),
+                       indexing="ij", sparse=True)
+
+
+@dataclass(frozen=True)
+class Sphere:
+    """A sphere, or an axis-aligned ellipsoid if ``radius`` is a 3-tuple of
+    semi-axes. On a 2-D grid it is the disk where the plane z = 0 cuts it."""
+    center: Tuple[float, ...]
+    radius: float
+    medium: Medium
+
+    def region_mask(self, grid: Grid) -> np.ndarray:
+        c = _to3(self.center)
+        r = self.radius
+        r = (float(r),) * 3 if np.isscalar(r) else _to3(r)
+        if min(r) <= 0:
+            raise ValueError("Sphere radius must be positive")
+        X = _mesh(grid)
+        q = sum(((X[a] - c[a]) / r[a]) ** 2 for a in range(3))
+        return np.broadcast_to(q <= 1.0, grid.shape).copy()
+
+    def stamp(self, grid: Grid, eps_r: np.ndarray) -> None:
+        eps_r[self.region_mask(grid)] = self.medium.eps_r
+
+
+@dataclass(frozen=True)
+class Cylinder:
+    """A cylinder along grid axis ``axis`` (``'x'``, ``'y'`` or ``'z'``).
+
+    ``radius`` is a scalar, or a 2-tuple of semi-axes (in axis order of the
+    two transverse axes) for an elliptical section; ``length`` is the extent
+    along ``axis`` (``inf`` spans the grid). On a 2-D grid collapsed on z a
+    z-cylinder is a disk and an x- or y-cylinder a strip.
+    """
+    center: Tuple[float, ...]
+    radius: float
+    length: float
+    medium: Medium
+    axis: str = "z"
+
+    def region_mask(self, grid: Grid) -> np.ndarray:
+        if self.axis not in ("x", "y", "z"):
+            raise ValueError("Cylinder axis must be 'x', 'y' or 'z'")
+        ax = "xyz".index(self.axis)
+        t = [a for a in range(3) if a != ax]
+        c = _to3(self.center)
+        r = self.radius
+        r = (float(r),) * 2 if np.isscalar(r) else tuple(float(v) for v in r)
+        if len(r) != 2 or min(r) <= 0:
+            raise ValueError("Cylinder radius must be positive (scalar or 2-tuple)")
+        X = _mesh(grid)
+        q = ((X[t[0]] - c[t[0]]) / r[0]) ** 2 + ((X[t[1]] - c[t[1]]) / r[1]) ** 2
+        half = float(self.length) / 2.0
+        along = np.abs(X[ax] - c[ax]) <= half
+        return np.broadcast_to((q <= 1.0) & along, grid.shape).copy()
+
+    def stamp(self, grid: Grid, eps_r: np.ndarray) -> None:
+        eps_r[self.region_mask(grid)] = self.medium.eps_r
 
 
 def _to3(x: Sequence[float]) -> Tuple[float, float, float]:

@@ -39,7 +39,7 @@ from typing import Dict, List
 import numpy as np
 
 from .constants import EPS_0, MU_0
-from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+from .monitors import FieldMonitor, FluxMonitor, DFTMonitor, EnergyMonitor
 
 # Component update table, identical in structure to Simulation.run's _table:
 # (F, aligned_axis, (axA, srcA), (axB, srcB), is_E). curl = termA - termB.
@@ -91,10 +91,14 @@ class SourceTable:
         return sum(int(np.asarray(a).nbytes) for a in (self.W, self.widx, self.amp))
 
 
-def _crop(n, is_E, periodic=False):
+def _crop(n, is_E, periodic=False, pmc_low=False):
     """Region slice on a derivative axis: [1:] for E, [:-1] for H, all if flat
-    or periodic (a periodic axis wraps, so every cell has both neighbours)."""
-    if n <= 1 or periodic:
+    or periodic (a periodic axis wraps, so every cell has both neighbours).
+
+    ``pmc_low``: the low edge is a PMC symmetry plane half a cell below cell 0,
+    where tangential H vanishes; E is then updated from cell 0 on, against a
+    zero ghost H there (see :func:`_term_diff`)."""
+    if n <= 1 or periodic or (is_E and pmc_low):
         return slice(None)
     return slice(1, None) if is_E else slice(0, -1)
 
@@ -110,11 +114,27 @@ def _term_diff(src, t, jnp):
     depends on the pass.
     """
     ax = t["ax"]
-    if t.get("periodic", False):
+    if t.get("pmc_low", False):
+        # E on a PMC-low axis: H[i] - H[i-1] with H[-1] = 0 on the plane.
+        first = [slice(None)] * 3; first[ax] = slice(0, 1)
+        hi = [slice(None)] * 3; hi[ax] = slice(1, None)
+        lo = [slice(None)] * 3; lo[ax] = slice(0, -1)
+        d = jnp.concatenate([src[tuple(first)],
+                             src[tuple(hi)] - src[tuple(lo)]], axis=ax)
+    elif t.get("periodic", False):
+        ph = t.get("bloch")
         if t["is_E"]:
-            d = src - jnp.roll(src, 1, axis=ax)
+            nb = jnp.roll(src, 1, axis=ax)
+            if ph is not None:
+                # Cell 0's lower neighbour is cell n-1 one period back:
+                # F(x - L) = F(x) exp(-i k L).
+                nb = nb * jnp.asarray(ph, dtype=src.dtype)
+            d = src - nb
         else:
-            d = jnp.roll(src, -1, axis=ax) - src
+            nb = jnp.roll(src, -1, axis=ax)
+            if ph is not None:
+                nb = nb * jnp.asarray(ph, dtype=src.dtype)   # F(x+L) = F(x) e^{ikL}
+            d = nb - src
     else:
         hi = [slice(None)] * 3; hi[ax] = slice(1, None)
         lo = [slice(None)] * 3; lo[ax] = slice(0, -1)
@@ -149,11 +169,12 @@ def _build_static(sim):
     ch = [np.asarray(sim._c_h[a]) for a in range(3)]
 
     per = tuple(bool(p) for p in getattr(grid, "periodic", (False,) * 3))
+    pmc = tuple(s == 1 for s in getattr(grid, "symmetry", (0, 0, 0)))
     comps = []
     for Fkey, aligned, (axA, srcA), (axB, srcB), is_E in _TABLE:
         region = [slice(None), slice(None), slice(None)]
-        region[axA] = _crop(shape[axA], is_E, per[axA])
-        region[axB] = _crop(shape[axB], is_E, per[axB])
+        region[axA] = _crop(shape[axA], is_E, per[axA], pmc[axA])
+        region[axB] = _crop(shape[axB], is_E, per[axB], pmc[axB])
         region = tuple(region)
         b_src = be if is_E else bh
         c_src = ce if is_E else ch
@@ -164,14 +185,28 @@ def _build_static(sim):
             if shape[ax] <= 1:
                 continue
             osl = [slice(None), slice(None), slice(None)]
-            osl[other_ax] = _crop(shape[other_ax], is_E, per[other_ax])
+            osl[other_ax] = _crop(shape[other_ax], is_E, per[other_ax],
+                                  pmc[other_ax])
             ridx = region[ax]
             b1 = b_src[ax][ridx].astype(npdt).reshape(
                 [-1 if i == ax else 1 for i in range(3)])
             c1 = c_src[ax][ridx].astype(npdt).reshape(
                 [-1 if i == ax else 1 for i in range(3)])
+            bloch = None
+            if per[ax] and getattr(grid, "bloch", (0.0,) * 3)[ax] != 0.0:
+                # Phase vectors along ax: exp(-ikL) on cell 0 for the E
+                # (backward) difference, exp(+ikL) on cell n-1 for H.
+                phase = grid.bloch_phase(ax)
+                v = np.ones(shape[ax], dtype=complex)
+                if is_E:
+                    v[0] = np.conj(phase)
+                else:
+                    v[-1] = phase
+                v = v.reshape([-1 if i == ax else 1 for i in range(3)])
+                bloch = v
             terms.append(dict(ax=ax, src=src, sign=sign, osl=tuple(osl),
-                              periodic=per[ax], is_E=is_E,
+                              periodic=per[ax], is_E=is_E, bloch=bloch,
+                              pmc_low=bool(is_E and pmc[ax]),
                               b1=b1, c1=c1, key=f"{Fkey}_{_AXNAME[ax]}",
                               dl=cell[ax], pshape=rshape))
         comps.append(dict(Fkey=Fkey, region=region, is_E=is_E, terms=terms))
@@ -188,11 +223,13 @@ def _build_static(sim):
     # adds ``W[n, widx] * amp``. A dense (n_steps, n_src) table would cost
     # gigabytes for a 3-D plane-wave sheet (40k cells x 5k steps per component).
     steps = np.arange(n_steps)
+    is_complex = bool(getattr(grid, "is_complex", False))
     groups: Dict[str, list] = {}
     for src in sim.sources:
         i, j, k = grid.index_at(src.position)
+        amp = complex(src.amplitude) if is_complex else float(src.amplitude)
         groups.setdefault(src.component, []).append(
-            (i, j, k, src.waveform, float(src.amplitude)))
+            (i, j, k, src.waveform, amp))
     src_H, src_E = [], []
     for comp in sorted(groups):
         g = groups[comp]
@@ -207,7 +244,9 @@ def _build_static(sim):
         table = SourceTable(
             W=np.stack(wave_cols, axis=1).astype(npdt),
             widx=np.asarray(widx, dtype=np.int32),
-            amp=np.asarray([e[4] for e in g], dtype=npdt))
+            amp=np.asarray([e[4] for e in g],
+                           dtype=np.result_type(npdt, np.complex64)
+                           if is_complex else npdt))
         entry = (comp,
                  np.array([e[0] for e in g], dtype=np.int32),
                  np.array([e[1] for e in g], dtype=np.int32),
@@ -215,9 +254,44 @@ def _build_static(sim):
                  table)
         (src_H if comp[0] == "H" else src_E).append(entry)
 
+    ch_h, da_h = h_coefficients(sim, npdt)
     return dict(shape=shape, cell=cell, dt=dt, n_steps=n_steps, npdt=npdt,
-                periodic=per,
-                comps=comps, ch_field=float(dt / MU_0), src_H=src_H, src_E=src_E)
+                periodic=per, complex=is_complex,
+                comps=comps, ch_field=float(dt / MU_0), src_H=src_H, src_E=src_E,
+                ch_h=ch_h, da_h=da_h)
+
+
+def h_coefficients(sim, dtype=None):
+    """H-update coefficients ``(ch, da)`` for magnetic media, or ``(None, None)``.
+
+    The H update is ``H <- da*H + ch*curl E`` with, per component,
+    ``ch = -(dt / (mu_r MU_0)) / (1 + s)`` and ``da = (1 - s) / (1 + s)``,
+    ``s = sigma_m dt / (2 mu_r MU_0)`` (the magnetic dual of the lossy E
+    update). ``da`` is None when nothing has magnetic loss. Without magnetic
+    media every path uses the scalar ``-dt / MU_0`` instead.
+    """
+    if not getattr(sim, "_has_magnetic", False):
+        return None, None
+    npdt = np.dtype(dtype or sim.dtypes["Hx"])
+    dt = sim.dt
+    sigs = sim.magnetic_conductivity_components()
+    ch, da = {}, ({} if sigs is not None else None)
+    for a, (c, mu) in enumerate(zip(("Hx", "Hy", "Hz"), sim.mu_components())):
+        base = dt / (np.asarray(mu, dtype=np.float64) * MU_0)
+        sig = None if sigs is None else sigs[a]
+        if sig is None:
+            ch[c] = (-base).astype(npdt)
+        else:
+            sm = sig * base / 2.0
+            ch[c] = (-base / (1.0 + sm)).astype(npdt)
+            da[c] = ((1.0 - sm) / (1.0 + sm)).astype(npdt)
+    return ch, da
+
+
+def _h_coeff(neg_ch, ch_h, key, reg):
+    """The H-update coefficient for component ``key`` on region ``reg``:
+    the scalar ``neg_ch``, or the per-cell array when the run is magnetic."""
+    return neg_ch if ch_h is None else ch_h[key][reg]
 
 
 def _particle_plan(sim, static):
@@ -274,7 +348,9 @@ def _particle_plan(sim, static):
                     wvecs[a] = np.array([1.0]); starts[si, a] = 0
                     continue
                 npml = grid.pml_layers[a]
-                if pos[a] < coord[npml] or pos[a] > coord[n - 1 - npml]:
+                sym = grid.symmetry[a] if hasattr(grid, "symmetry") else 0
+                lo_edge = 0.0 if sym else coord[npml]
+                if pos[a] < lo_edge or pos[a] > coord[n - 1 - npml]:
                     inside = False
                     break
                 dl = grid.cell_size[a]
@@ -284,6 +360,15 @@ def _particle_plan(sim, static):
                 i1 = min(n, ic + radius + 1)
                 w = np.exp(-0.5 * ((coord[i0:i1] - pos[a]) / sigma) ** 2)
                 wsum = w.sum()
+                if sym:
+                    # The stepped cells carry half of a mirror-symmetric cloud;
+                    # the images of these nodes below the plane carry the rest
+                    # (the PEC node on the plane is its own image), so
+                    # normalise over both: the whole cloud holds exactly q.
+                    img = -coord[i0:i1]
+                    if sym == -1 and i0 == 0:
+                        img = img[1:]
+                    wsum = wsum + np.exp(-0.5 * ((img - pos[a]) / sigma) ** 2).sum()
                 if wsum == 0.0:
                     inside = False
                     break
@@ -378,12 +463,44 @@ def _build_ade_jax(sim, static):
     )
 
 
+def _check_symmetric_placement(grid, m):
+    """On a symmetric grid, refuse monitor planes in the mirrored-away half
+    and bounds that are not symmetric about the plane (they would snap to the
+    first cell and be silently wrong)."""
+    sym = getattr(grid, "symmetry", (0, 0, 0))
+    if not any(sym):
+        return
+    planes = []
+    if isinstance(m, FieldMonitor) and m.plane_z is not None:
+        planes.append((2, m.plane_z))
+    if isinstance(m, DFTMonitor) and m.plane() is not None:
+        planes.append(m.plane())
+    if isinstance(m, FluxMonitor):
+        planes.append((_FLUX_AXIS[m.plane_axis], m.plane_position))
+    for a, pos in planes:
+        if sym[a] and pos < -0.25 * grid.cell_size[a]:
+            raise ValueError(
+                f"monitor {m.name!r}: its plane lies in the mirrored-away half "
+                f"of symmetric axis {'xyz'[a]}; place it at a coordinate >= 0")
+    for a, b in enumerate(getattr(m, "bounds", None) or ()):
+        if b is None or not sym[a] or (isinstance(m, FluxMonitor)
+                                       and a == _FLUX_AXIS[m.plane_axis]):
+            continue
+        lo, hi = b
+        if lo < -0.25 * grid.cell_size[a] and abs(lo + hi) > 0.5 * grid.cell_size[a]:
+            raise ValueError(
+                f"monitor {m.name!r}: bounds on symmetric axis {'xyz'[a]} must "
+                "be symmetric about the plane (lo = -hi) or start at it (lo >= 0)")
+
+
 def _monitor_plan(sim):
     grid = sim.grid
     dt = sim.dt
     n_steps = sim.n_steps
     plans = []
+    sym = getattr(grid, "symmetry", (0, 0, 0))
     for m in sim.monitors:
+        _check_symmetric_placement(grid, m)
         if isinstance(m, FieldMonitor):
             rec = (sorted({int(round(t / dt)) for t in m.times
                            if 0 <= int(round(t / dt)) < n_steps})
@@ -401,10 +518,51 @@ def _monitor_plan(sim):
                 ci = int(np.argmin(np.abs(np.asarray(grid.coords[ax]) - pos)))
                 plane = (ax, ci)
             plans.append(dict(kind="dft", m=m, rec=list(range(0, n_steps, m.interval)),
-                              plane=plane, omega=2 * np.pi * np.asarray(m.freqs, float)))
+                              plane=plane, omega=2 * np.pi * np.asarray(m.freqs, float),
+                              pmc0=plane is not None and plane[1] == 0
+                              and sym[plane[0]] == 1))
         elif isinstance(m, FluxMonitor):
             plans.append(dict(kind="flux", m=m))
+        elif isinstance(m, EnergyMonitor):
+            plans.append(dict(kind="energy", m=m,
+                              rec=list(range(0, n_steps, m.interval)),
+                              w=_box_weights(grid, m.bounds, None)))
     return plans
+
+
+def _snap_range(coord, lo, hi):
+    """Node indices nearest ``lo`` and ``hi`` on one axis."""
+    c = np.asarray(coord)
+    return (int(np.argmin(np.abs(c - lo))), int(np.argmin(np.abs(c - hi))))
+
+
+def _box_weights(grid, bounds, skip_axis):
+    """Per-cell weights of an axis-aligned box (None: no restriction), as a
+    full-grid array (with ``skip_axis`` squeezed out when given): 1 inside,
+    1/2 on the snapped bounding nodes, 0 outside."""
+    if bounds is None or all(b is None for b in bounds):
+        return None
+    shape = list(grid.shape)
+    w = np.ones(shape)
+    for a in range(3):
+        b = bounds[a] if a < len(bounds) else None
+        if a == skip_axis or b is None or shape[a] == 1:
+            continue
+        i0, i1 = _snap_range(grid.coords[a], *b)
+        v = np.zeros(shape[a])
+        v[i0:i1 + 1] = 1.0
+        v[i0] = v[i1] = 0.5 if i1 > i0 else 1.0
+        if getattr(grid, "symmetry", (0, 0, 0))[a] and b[0] < 0:
+            # A box symmetric about a mirror plane: its lower part is the
+            # mirrored-away half, accounted for by the doubling. The first
+            # stepped node is not shared with the image (it sits off the
+            # plane, or holds a component that vanishes there): full weight.
+            v[0] = 1.0
+        sh = [1, 1, 1]; sh[a] = -1
+        w = w * v.reshape(sh)
+    if skip_axis is not None:
+        w = np.take(w, 0, axis=skip_axis)
+    return w
 
 
 def _snap(field, m, plane):
@@ -417,7 +575,7 @@ def _snap(field, m, plane):
     return field[tuple(sl)]
 
 
-def _dft_snap(field, comp, m, plane):
+def _dft_snap(field, comp, m, plane, pmc0=False):
     """Sample ``comp`` for a DFT monitor, on the monitor plane itself.
 
     A plane monitor sits at ``coord[ci]`` along its normal axis. Components
@@ -425,21 +583,24 @@ def _dft_snap(field, comp, m, plane):
     averaged over their two half-offset neighbours ``ci-1`` and ``ci``, so
     every recorded component lives on the same plane and ``E x H`` products
     are second-order accurate. Without a plane restriction, or at the first
-    plane, the raw samples are returned.
+    plane, the raw samples are returned, except that the first plane of a
+    PMC-symmetry axis (``pmc0``) averages against the zero below it.
     """
     s = _snap(field, m, plane)
     if plane is None:
         return s
     ax, ci = plane
     a = "xyz".index(comp[1])
-    if ci == 0 or (a == ax) != (comp[0] == "E"):
+    if (a == ax) != (comp[0] == "E"):
         return s
+    if ci == 0:
+        return 0.5 * s if pmc0 else s
     return 0.5 * (s + _snap(field, m, (ax, ci - 1)))
 
 
 def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                      ade=None, ce_particle=None, remat="none", checkpoint_levels=2,
-                     ca_e=None, modulation=None):
+                     ca_e=None, modulation=None, h_coef=None, shutoff=None):
     """Pure device-side time loop. Returns the raw monitor accumulators (field
     buffers, DFT accumulators, flux scalars) as JAX arrays.
 
@@ -462,6 +623,15 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
     values per step). Each step the coefficient in the box is rebuilt as
     ``dt / (EPS_0 * (eps_b + v[n] . deps))`` (an instantaneous-permittivity
     model, valid when the drive varies slowly next to the optical period).
+
+    ``h_coef`` (optional) is ``(ch, da)`` from :func:`h_coefficients` as JAX
+    arrays; by default they come from ``static`` (magnetic runs) or the plain
+    scalar ``-dt/MU_0`` is used.
+
+    ``shutoff`` (optional, forward runs only) is ``(fraction, interval,
+    min_steps)``: step in chunks of ``interval`` and stop once the field
+    energy has fallen below ``fraction`` of its peak, but not before
+    ``min_steps``. The return value then gains the number of steps run.
     """
     import jax.numpy as jnp
     from jax import lax
@@ -472,8 +642,15 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
     jdt = ce_e["Ex"].dtype
     cdt = jnp.complex128 if jdt == jnp.float64 else jnp.complex64
     neg_ch = jnp.asarray(-static["ch_field"], dtype=jdt)
+    # Bloch-periodic runs step complex fields (the coefficients stay real).
+    fdt = cdt if static.get("complex") else jdt
     if ce_particle is None:
         ce_particle = ce_e["Ex"]
+    ch_h, da_h = h_coef if h_coef is not None else (static["ch_h"], static["da_h"])
+    if ch_h is not None:
+        ch_h = {c: jnp.asarray(v, dtype=jdt) for c, v in ch_h.items()}
+    if da_h is not None:
+        da_h = {c: jnp.asarray(v, dtype=jdt) for c, v in da_h.items()}
 
     # Dispersive-media coefficients on device (masked: state lives only on the
     # dispersive cells, gathered/scattered by their flat indices each step).
@@ -487,19 +664,30 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
         npole = ade["npole"]
         n_disp = ade["n_disp"]
 
-    fields = {c: jnp.zeros(shape, dtype=jdt)
+    shard = _sharder(sim)
+    if getattr(sim, "devices", None) and ade is not None and ade["n_disp"] == 1:
+        # The one-element scatter that XLA's partitioner miscompiles (see the
+        # source padding below); one dispersive cell is not worth sharding.
+        raise NotImplementedError(
+            "a multi-device run with a single dispersive cell is not supported")
+    ce_e = {c: shard(v) if getattr(v, "ndim", 0) == 3 else v for c, v in ce_e.items()}
+    if ch_h is not None:
+        ch_h = {c: shard(v) for c, v in ch_h.items()}
+    if da_h is not None:
+        da_h = {c: shard(v) for c, v in da_h.items()}
+    fields = {c: shard(jnp.zeros(shape, dtype=fdt))
               for c in ("Ex", "Ey", "Ez", "Hx", "Hy", "Hz")}
     psis = {}
     for comp in static["comps"]:
         for t in comp["terms"]:
-            psis[t["key"]] = jnp.zeros(t["pshape"], dtype=jdt)
+            psis[t["key"]] = shard(jnp.zeros(t["pshape"], dtype=fdt))
 
     # Dispersive polarization state: (Pcur, Pprev), each (npole, 3, n_disp) -
     # only the dispersive cells; an empty tuple when there is no dispersion.
     if ade is not None:
         pol_shape = (npole, 3, n_disp)
-        ade_state = (jnp.zeros(pol_shape, dtype=jdt),
-                     jnp.zeros(pol_shape, dtype=jdt))
+        ade_state = (jnp.zeros(pol_shape, dtype=fdt),
+                     jnp.zeros(pol_shape, dtype=fdt))
     else:
         ade_state = ()
 
@@ -517,7 +705,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
             field_slot[m.name] = jnp.asarray(slot)
             state_field[m.name] = {
                 c: jnp.zeros((n_rec + 1,) + _snap(fields[c], m, p["plane"]).shape,
-                             dtype=jdt) for c in m.components}
+                             dtype=fdt) for c in m.components}
         elif p["kind"] == "dft":
             mask = np.zeros(n_steps, dtype=np.float64)
             for s in p["rec"]:
@@ -528,6 +716,18 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                              dtype=cdt) for c in m.components}
         elif p["kind"] == "flux":
             state_flux[m.name] = jnp.asarray(0.0, dtype=jdt)
+        elif p["kind"] == "energy":
+            n_rec = len(p["rec"])
+            slot = np.full(n_steps, n_rec, dtype=np.int32)
+            for r, s_ in enumerate(p["rec"]):
+                slot[s_] = r
+            field_slot[m.name] = jnp.asarray(slot)
+            state_field[m.name] = {"U": jnp.zeros((n_rec + 1,), dtype=jdt)}
+    dV = 1.0
+    for a in range(3):
+        if shape[a] > 1:
+            dV *= static["cell"][a]
+    dV *= 2 ** sum(1 for v in getattr(sim.grid, "symmetry", (0, 0, 0)) if v)
 
     if ca_e is not None:
         ca_e = {c: jnp.asarray(v, dtype=jdt) for c, v in ca_e.items()}
@@ -564,10 +764,14 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 continue
             reg = comp["region"]
             key = comp["Fkey"]
-            k = ce_now[key][reg] if comp["is_E"] else neg_ch
+            k = ce_now[key][reg] if comp["is_E"] else \
+                _h_coeff(neg_ch, ch_h, key, reg)
             if comp["is_E"] and ca_e is not None:
                 F = fields[key]
                 fields[key] = F.at[reg].set(ca_e[key][reg] * F[reg] + k * curl)
+            elif not comp["is_E"] and da_h is not None:
+                F = fields[key]
+                fields[key] = F.at[reg].set(da_h[key][reg] * F[reg] + k * curl)
             else:
                 fields[key] = fields[key].at[reg].add(k * curl)
         return fields, psis
@@ -575,6 +779,20 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
     # Source waveform tables on device so a traced step index can gather them.
     src_H = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_H"]]
     src_E = [(c, i, j, k, v.device()) for c, i, j, k, v in static["src_E"]]
+    if getattr(sim, "devices", None):
+        # XLA's SPMD partitioner (jax 0.10) miscompiles a one-element scatter
+        # into a sharded array; pad each single-source group with a
+        # zero-amplitude duplicate (two or more indices are exact).
+        def _pad(entry):
+            c, i, j, k, v = entry
+            if len(i) != 1:
+                return entry
+            two = lambda a: jnp.concatenate([jnp.asarray(a), jnp.asarray(a)])
+            tab = SourceTable(v.W, two(v.widx), jnp.concatenate(
+                [v.amp, jnp.zeros_like(v.amp)]))
+            return (c, two(i), two(j), two(k), tab)
+        src_H = [_pad(e) for e in src_H]
+        src_E = [_pad(e) for e in src_E]
 
     # Moving-charge deposition tables (per particle), on device.
     E_names = ("Ex", "Ey", "Ez")
@@ -601,6 +819,7 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
 
     def step(carry, step_idx):
         fields, psis, ade_state, sf, sd, sfx = carry
+        fields = {c: shard(v) for c, v in fields.items()}
         fields, psis = apply_pass(fields, psis, is_E_pass=False)
         for comp, i, j, k, vals in src_H:
             fields[comp] = fields[comp].at[i, j, k].add(vals[step_idx])
@@ -643,18 +862,120 @@ def _device_simulate(sim, static, plans, ce_e, particle_plans=(),
                 for c in m.components:
                     tt = (step_idx + (1.0 if c[0] == "E" else 0.5)) * dt
                     ph = jnp.exp(1j * jnp.asarray(p["omega"]) * tt).astype(cdt)
-                    s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
+                    s = _dft_snap(fields[c], c, m, p["plane"], p.get("pmc0", False)).astype(cdt)
                     ph = ph.reshape((-1,) + (1,) * s.ndim)
                     sd[m.name][c] = sd[m.name][c] + active * ph * s[None] * dt
             elif p["kind"] == "flux":
                 sfx[m.name] = sfx[m.name] + 0.5 * (
                     flux_pre[m.name] + _flux(fields, m, sim.grid, jnp)) * dt
+            elif p["kind"] == "energy":
+                slot = field_slot[m.name][step_idx]
+                u = _field_energy(fields, coefficients_at(step_idx), neg_ch,
+                                  ch_h, w=p["w"])
+                sf[m.name]["U"] = sf[m.name]["U"].at[slot].set(0.5 * dt * u * dV)
         return (fields, psis, ade_state, sf, sd, sfx), None
 
     init = (fields, psis, ade_state, state_field, state_dft, state_flux)
+    if shutoff is not None:
+        final, n_run = _run_until_decayed(step, init, n_steps, shutoff, ce_e,
+                                          neg_ch, ch_h)
+        (fields, psis, ade_state, sf, sd, sfx) = final
+        return sf, sd, sfx, n_run
     final, _ = _run_time_loop(step, init, n_steps, remat, levels=checkpoint_levels)
     (fields, psis, ade_state, sf, sd, sfx) = final
     return sf, sd, sfx
+
+
+def _sharder(sim):
+    """``x -> x`` constrained to the run's device mesh, or the identity.
+
+    With ``Simulation(devices=[...])`` every grid-shaped array (fields, CPML
+    psi, update coefficients) is split into slabs along ``sim.shard_axis``,
+    one per device; XLA's SPMD partitioner then runs each device on its slab
+    and inserts the halo exchanges the curl differences need. Shards need not
+    divide the axis evenly (XLA pads).
+    """
+    devs = getattr(sim, "devices", None)
+    if not devs or len(devs) < 2:
+        return lambda x: x
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    ax = sim.shard_axis
+    mesh = Mesh(np.asarray(devs), ("d",))
+    spec = [None, None, None]
+    spec[ax] = "d"
+    sh = NamedSharding(mesh, P(*spec))
+
+    def shard(x):
+        if getattr(x, "ndim", 0) != 3 or x.shape[ax] < len(devs):
+            return x
+        return jax.lax.with_sharding_constraint(x, sh)
+    return shard
+
+
+def _field_energy(fields, ce_e, neg_ch, ch_h, w=None):
+    """Discrete EM energy ``sum(eps|E|^2 + mu|H|^2)`` up to the factor
+    ``dV/2 dt`` (from the update coefficients ``dt/eps`` and ``dt/mu``),
+    optionally weighted per cell by ``w``."""
+    import jax.numpy as jnp
+    u = 0.0
+    for c in ("Ex", "Ey", "Ez"):
+        d = jnp.abs(fields[c]) ** 2 / ce_e[c]
+        u = u + jnp.sum(d if w is None else d * w)
+    for c in ("Hx", "Hy", "Hz"):
+        k = -neg_ch if ch_h is None else -ch_h[c]
+        d = jnp.abs(fields[c]) ** 2 / k
+        u = u + jnp.sum(d if w is None else d * w)
+    return u
+
+
+def _run_until_decayed(step, init, n_steps, shutoff, ce_e, neg_ch, ch_h):
+    """``lax.while_loop`` over chunks of ``interval`` steps that ends when the
+    energy drops below ``fraction`` of its running peak (after ``min_steps``)
+    or at ``n_steps``. Not reverse-differentiable (a while loop), so only for
+    forward runs."""
+    import jax.numpy as jnp
+    from jax import lax
+    fraction, interval, min_steps = shutoff
+    K = max(1, int(interval))
+
+    def guarded(carry, g):
+        def do(c):
+            return step(c, jnp.minimum(g, n_steps - 1))[0]
+        return lax.cond(g < n_steps, do, lambda c: c, carry), None
+
+    def body(st):
+        carry, n, peak, _ = st
+        carry, _ = lax.scan(guarded, carry, n + jnp.arange(K))
+        n = n + K
+        u = _field_energy(carry[0], ce_e, neg_ch, ch_h)
+        peak = jnp.maximum(peak, u)
+        stop = (n >= min_steps) & (u <= fraction * peak)
+        return carry, n, peak, stop
+
+    def cond(st):
+        return (st[1] < n_steps) & ~st[3]
+
+    z = jnp.zeros((), dtype=jnp.result_type(float))
+    carry, n, _, _ = lax.while_loop(cond, body, (init, jnp.asarray(0), z,
+                                                 jnp.asarray(False)))
+    return carry, jnp.minimum(n, n_steps)
+
+
+def _last_source_step(static, pplans):
+    """Index of the last step at which any source or moving charge injects."""
+    last = 0
+    for _, _, _, _, tab in static["src_H"] + static["src_E"]:
+        W = np.abs(np.asarray(tab.W))
+        if W.size:
+            live = np.flatnonzero(W.max(axis=1) > 1e-8 * W.max())
+            if live.size:
+                last = max(last, int(live[-1]))
+    for pp in pplans:
+        live = np.flatnonzero(np.abs(pp["wblocks"]).reshape(len(pp["wblocks"]), -1).max(axis=1) > 0)
+        if live.size:
+            last = max(last, int(live[-1]))
+    return last
 
 
 def _run_time_loop(step, init, n_steps, remat, levels=2):
@@ -737,9 +1058,13 @@ def _flux(fields, m, grid, jnp):
     def plane(F):
         return jnp.take(F, idx, axis=axis)
 
+    pmc_low = getattr(grid, "symmetry", (0, 0, 0))[axis] == 1 and idx == 0
+
     def plane_avg(F):
         if coord.size == 1:
             return plane(F)
+        if pmc_low:                       # the tangential H below is zero
+            return 0.5 * jnp.take(F, idx, axis=axis)
         return 0.5 * (jnp.take(F, lo, axis=axis) + jnp.take(F, idx, axis=axis))
 
     E1, E2, H1, H2 = {0: ("Ey", "Ez", "Hy", "Hz"),
@@ -747,10 +1072,15 @@ def _flux(fields, m, grid, jnp):
                       2: ("Ex", "Ey", "Hx", "Hy")}[axis]
     S = (plane(fields[E1]) * plane_avg(fields[H2])
          - plane(fields[E2]) * plane_avg(fields[H1]))
+    w = _box_weights(grid, getattr(m, "bounds", None), axis)
+    if w is not None:
+        S = S * jnp.asarray(w, dtype=S.dtype)
     dA = 1.0
     for a in range(3):
         if a != axis and grid.shape[a] > 1:
             dA *= grid.cell_size[a]
+    if hasattr(grid, "symmetry_factor"):
+        dA *= grid.symmetry_factor(axis)          # the mirrored half too
     return jnp.sum(S) * dA
 
 
@@ -758,6 +1088,20 @@ def _enable_x64_if_needed(sim):
     import jax
     if np.dtype(sim.dtypes["Ex"]) == np.float64:
         jax.config.update("jax_enable_x64", True)
+
+
+def _check_complex(sim):
+    """Refuse what a complex (Bloch-periodic) run cannot do."""
+    if not getattr(sim.grid, "is_complex", False):
+        return
+    if sim.particle_sources:
+        raise NotImplementedError(
+            "moving charges are not supported with a Bloch wavevector")
+    if any(isinstance(m, FluxMonitor) for m in sim.monitors):
+        raise NotImplementedError(
+            "a time-domain FluxMonitor is not defined for the complex fields "
+            "of a Bloch-periodic run; record the plane with a DFTMonitor and "
+            "use photonfdtd.photon_spectrum (or E x H* of the phasors)")
 
 
 def _validate(sim):
@@ -795,7 +1139,8 @@ def update_coefficients(sim, eps_components=None, sigma=None, dtype=None):
     return ce, ca
 
 
-def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None):
+def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None,
+            shutoff=None, shutoff_interval: int = 50):
     """Run ``sim`` on JAX and return a Result (see module docstring).
 
     ``ce`` (optional) replaces the E-update coefficients ``{'Ex','Ey','Ez'}``
@@ -810,6 +1155,7 @@ def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None):
 
     _validate(sim)
     _enable_x64_if_needed(sim)
+    _check_complex(sim)
     npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
@@ -840,24 +1186,50 @@ def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None):
     box = None if modulation is None else tuple(modulation["box"])
     mod = None if modulation is None else {
         k: modulation[k] for k in ("eps_b", "deps", "v")}
+    shut = None
+    if shutoff is not None:
+        if not 0.0 < float(shutoff) < 1.0:
+            raise ValueError("shutoff is a fraction of the peak energy, in (0, 1)")
+        if modulation is not None:
+            raise NotImplementedError("shutoff with a time-varying permittivity")
+        shut = (float(shutoff), int(shutoff_interval),
+                _last_source_step(static, pplans) + 1)
 
-    def fn(ce_e, ce_particle, ca_e, mod):
+    def fn(ce_e, ce_particle, ca_e, mod, h_coef):
         return _device_simulate(
             sim, static, plans, ce_e, pplans, ade=ade, ce_particle=ce_particle,
-            ca_e=ca_e, modulation=None if mod is None else dict(mod, box=box))
+            ca_e=ca_e, modulation=None if mod is None else dict(mod, box=box),
+            h_coef=h_coef, shutoff=shut)
     fn = jax.jit(fn) if jit else fn
     ce_e = {c: jnp.asarray(v) for c, v in ce_e_np.items()}
     ca_e = None if ca_np is None else {c: jnp.asarray(v) for c, v in ca_np.items()}
-    sf, sd, sfx = fn(ce_e, jnp.asarray(ce_scalar), ca_e, mod)
+    # The H coefficients go in as arguments, not closed-over constants, so a
+    # full-grid array is not baked into the compiled program.
+    h_coef = tuple(None if d is None else {c: jnp.asarray(v) for c, v in d.items()}
+                   for d in (static["ch_h"], static["da_h"]))
+    out = fn(ce_e, jnp.asarray(ce_scalar), ca_e, mod, h_coef)
+    n_run = n_steps
+    if shut is not None:
+        sf, sd, sfx, n_run = out
+        n_run = int(n_run)
+    else:
+        sf, sd, sfx = out
 
-    result = Result(times=np.arange(n_steps) * dt)
+    result = Result(times=np.arange(n_run) * dt)
     for p in plans:
         m = p["m"]
         if p["kind"] == "field":
             n_rec = len(p["rec"])
+            if n_run < n_steps:                   # stopped early
+                n_keep = sum(1 for r in p["rec"] if r < n_run)
+                p = dict(p, rec=p["rec"][:n_keep])
+                n_rec = n_keep
             if n_rec > 0:
+                mdt = np.dtype(sim.dtypes["monitors"])
+                if static.get("complex"):
+                    mdt = np.result_type(mdt, np.complex64)
                 result.fields[m.name] = {
-                    c: np.asarray(sf[m.name][c])[:n_rec].astype(sim.dtypes["monitors"])
+                    c: np.asarray(sf[m.name][c])[:n_rec].astype(mdt)
                     for c in m.components}
                 result.monitor_times[m.name] = np.asarray(p["rec"], float) * dt
             else:
@@ -869,6 +1241,10 @@ def run_jax(sim, jit: bool = True, ce=None, ca=None, modulation=None):
             result.dft_freqs[m.name] = np.asarray(m.freqs, float)
         elif p["kind"] == "flux":
             result.flux[m.name] = float(np.asarray(sfx[m.name]))
+        elif p["kind"] == "energy":
+            rec = [r for r in p["rec"] if r < n_run]
+            result.energy[m.name] = np.asarray(sf[m.name]["U"])[:len(rec)]
+            result.monitor_times[m.name] = np.asarray(rec, float) * dt
     return result
 
 
@@ -914,18 +1290,22 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
             "photonfdtd.design)."
         )
     _enable_x64_if_needed(sim)
+    _check_complex(sim)
     npdt = np.dtype(sim.dtypes["Ex"])
     static = _build_static(sim)
     plans = _monitor_plan(sim)
     pplans = _particle_plan(sim, static)
     ade = _build_ade_jax(sim, static)
 
-    def loss_of_eps(eps_r):
-        ce = sim.dt / (eps_r * EPS_0)
+    def sim_fn(ce):
         ce_e = {c: ce for c in ("Ex", "Ey", "Ez")}
-        sf, sd, sfx = _device_simulate(sim, static, plans, ce_e, pplans,
-                                       ade=ade, ce_particle=ce, remat=remat,
-                                       checkpoint_levels=checkpoint_levels)
+        return _device_simulate(sim, static, plans, ce_e, pplans,
+                                ade=ade, ce_particle=ce, remat=remat,
+                                checkpoint_levels=checkpoint_levels)
+    sim_fn = _multi_device_jit(sim, sim_fn)
+
+    def loss_of_eps(eps_r):
+        sf, sd, sfx = sim_fn(sim.dt / (eps_r * EPS_0))
         return loss(_out_dict(sf, sd, sfx, plans))
 
     eps0 = jnp.asarray(np.asarray(sim.eps_r, dtype=npdt))
@@ -935,9 +1315,13 @@ def value_and_grad_eps(sim, loss, remat="nested", checkpoint_levels=2):
 
 def _out_dict(sf, sd, sfx, plans):
     """Assemble the loss-facing monitor-output dict (JAX arrays)."""
-    n_rec = {p["m"].name: len(p["rec"]) for p in plans if p["kind"] == "field"}
+    kind = {p["m"].name: p["kind"] for p in plans}
+    n_rec = {p["m"].name: len(p["rec"]) for p in plans
+             if p["kind"] in ("field", "energy")}
     return {
-        "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf},
+        "fields": {n: {c: sf[n][c][:n_rec[n]] for c in sf[n]} for n in sf
+                   if kind[n] == "field"},
+        "energy": {n: sf[n]["U"][:n_rec[n]] for n in sf if kind[n] == "energy"},
         "dft": {n: {c: sd[n][c] for c in sd[n]} for n in sd},
         "flux": {n: sfx[n] for n in sfx},
     }
@@ -947,6 +1331,7 @@ def _prepare(sim):
     """Validate ``sim`` and build its fixed-for-the-run plans once."""
     _validate(sim)
     _enable_x64_if_needed(sim)
+    _check_complex(sim)
     static = _build_static(sim)
     return (static, _monitor_plan(sim), _particle_plan(sim, static),
             _build_ade_jax(sim, static))
@@ -960,11 +1345,23 @@ def _simulate_out(sim, prep, ce_e, remat="nested", checkpoint_levels=2):
     static, plans, pplans, ade = prep
     ca = ce_e.get("ca") if isinstance(ce_e, dict) else None
     ce_e = {c: ce_e[c] for c in ("Ex", "Ey", "Ez")}
-    sf, sd, sfx = _device_simulate(
-        sim, static, plans, ce_e, pplans, ade=ade,
-        ce_particle=ce_e["Ex"], remat=remat,
-        checkpoint_levels=checkpoint_levels, ca_e=ca)
+
+    def sim_fn(ce_e, ca):
+        return _device_simulate(
+            sim, static, plans, ce_e, pplans, ade=ade,
+            ce_particle=ce_e["Ex"], remat=remat,
+            checkpoint_levels=checkpoint_levels, ca_e=ca)
+    sf, sd, sfx = _multi_device_jit(sim, sim_fn)(ce_e, ca)
     return _out_dict(sf, sd, sfx, plans)
+
+
+def _multi_device_jit(sim, fn):
+    """``jax.jit(fn)`` on a multi-device run, else ``fn``: the slab sharding
+    constraints need a traced program when the slabs are uneven."""
+    if getattr(sim, "devices", None):
+        import jax
+        return jax.jit(fn)
+    return fn
 
 
 _METHODS = ("checkpoint", "reversible", "reversible_pml", "tiled")
@@ -979,14 +1376,19 @@ def _run_fn(sim, method="checkpoint", remat="nested", checkpoint_levels=2):
     """``ce_e -> out`` for ``sim``, differentiable with the chosen in-memory
     adjoint (``'checkpoint'``, ``'reversible'`` or ``'reversible_pml'``)."""
     _check_method(method)
+    if method != "checkpoint" and getattr(sim.grid, "is_complex", False):
+        raise NotImplementedError(
+            f"the {method!r} adjoint does not support Bloch-periodic (complex) "
+            "runs; use method='checkpoint'")
     if method == "checkpoint":
         prep = _prepare(sim)
         return lambda ce_e: _simulate_out(sim, prep, ce_e, remat,
                                           checkpoint_levels)
-    if sim._has_conductivity:
+    if sim._has_conductivity or getattr(sim, "_has_magnetic", False) and \
+            sim.magnetic_conductivity_map() is not None:
         raise NotImplementedError(
-            f"the {method!r} adjoint does not support conductive media; use "
-            "method='checkpoint'")
+            f"the {method!r} adjoint does not support conductive media or "
+            "magnetic loss; use method='checkpoint'")
     if method == "reversible":
         from .reversible import reversible_run
         return reversible_run(sim)
@@ -1078,9 +1480,9 @@ def make_value_and_grad_params(sim, ce_of_params, loss, remat="nested",
     import jax
 
     _check_method(method)
-    if method == "tiled" and sim._has_conductivity:
+    if method == "tiled" and (sim._has_conductivity or sim._has_magnetic):
         raise NotImplementedError("the tiled adjoint does not support conductive "
-                                  "media; use method='checkpoint'")
+                                  "or magnetic media; use method='checkpoint'")
     if method == "tiled":
         tvg = _tiled_value_and_grad([sim], ce_of_params,
                                     lambda outs: loss(outs[0]), tiled_options)

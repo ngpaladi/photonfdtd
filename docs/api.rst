@@ -51,6 +51,16 @@ Far-field projection
 
 .. automodule:: photonfdtd.farfield
 
+Diffraction orders
+------------------
+
+.. automodule:: photonfdtd.diffraction
+
+Symmetry planes
+---------------
+
+.. automodule:: photonfdtd.symmetry
+
 Boundaries
 ----------
 
@@ -113,6 +123,11 @@ Inverse design
 
 .. automodule:: photonfdtd.design
 
+Fabrication constraints
+-----------------------
+
+.. automodule:: photonfdtd.fabrication
+
 Optimization loops
 ------------------
 
@@ -127,6 +142,11 @@ GDS export
 ----------
 
 .. automodule:: photonfdtd.gds
+
+VTK and STL export
+------------------
+
+.. automodule:: photonfdtd.export
 
 Active devices
 --------------

@@ -35,28 +35,38 @@ Capabilities
 - 1D / 2D / 3D Yee-grid FDTD with the Courant-stable time step selected
   automatically.
 - **CPML** absorbing boundaries (Roden & Gedney 2000, kappa = 1) on any
-  number of axes, and **periodic** boundaries per axis
-  (``Grid(periodic=...)``) for unit cells of gratings, photonic crystals and
-  metasurfaces.
+  number of axes, **periodic** and **Bloch-periodic** boundaries per axis
+  (``Grid(periodic=..., bloch=...)``) for unit cells of gratings, photonic
+  crystals and metasurfaces at any angle of incidence, and **mirror-symmetry
+  planes** (``Grid(symmetry=...)``, PEC or PMC) that halve the domain per
+  symmetric axis (:mod:`photonfdtd.symmetry`).
 - Isotropic dielectric media, non-dispersive or **dispersive** (Lorentz /
   Drude / Sellmeier poles via the ADE method) with a cited material library
-  (SiO2, Si, Si3N4, LiNbO3, Au, Ag). See :doc:`accuracy`.
+  (SiO2, Si, Si3N4, LiNbO3, Au, Ag). See :doc:`accuracy`. **Magnetic**
+  media: relative permeability (scalar or diagonal tensor) and magnetic loss.
 - **Anisotropic subpixel smoothing** of material interfaces for second-order
   boundary accuracy (``Simulation(subpixel=True)``). See :doc:`accuracy`.
-- Geometry primitives: axis-aligned :class:`~photonfdtd.Box` and
-  arbitrary-polygon :class:`~photonfdtd.PolySlab`.
+- Geometry primitives: axis-aligned :class:`~photonfdtd.Box`,
+  arbitrary-polygon :class:`~photonfdtd.PolySlab`,
+  :class:`~photonfdtd.Sphere` (or ellipsoid) and
+  :class:`~photonfdtd.Cylinder` (fibres, pillars, tubes).
 - Sources: soft point dipole (:class:`~photonfdtd.PointDipole`), distributed
   mode injection (:class:`~photonfdtd.ModeSource`, and the one-way
-  :class:`~photonfdtd.UniModeSource`), one-way normal-incidence
+  :class:`~photonfdtd.UniModeSource`), one-way normal- or oblique-incidence
   :class:`~photonfdtd.PlaneWave` and :class:`~photonfdtd.GaussianBeam`
   sources from a Huygens current sheet, an energy-normalised
   :class:`~photonfdtd.SinglePhotonSource`, and a moving-charge
   :class:`~photonfdtd.ChargedParticle` that emits Cherenkov radiation.
 - Monitors: time-domain snapshots (:class:`~photonfdtd.FieldMonitor`, with
   plane and stride selection), Poynting flux
-  (:class:`~photonfdtd.FluxMonitor`), and a running frequency-domain
+  (:class:`~photonfdtd.FluxMonitor`, whole plane or a rectangle, and closed
+  boxes via :func:`~photonfdtd.closed_surface`), the energy in a box over
+  time (:class:`~photonfdtd.EnergyMonitor`), and a running frequency-domain
   :class:`~photonfdtd.DFTMonitor` whose storage scales with the number of
-  frequencies rather than timesteps.
+  frequencies rather than timesteps. Runs can stop early once the fields
+  have decayed (``Simulation.run(shutoff=...)``).
+- **Diffraction orders** of periodic structures
+  (:func:`~photonfdtd.diffraction_orders`): per-order power and direction.
 - **Near-to-far-field projection** (:func:`~photonfdtd.project_far_field`)
   from plane DFT monitors on a closed box or an open plane, in 2-D and 3-D:
   radiation patterns, radiant intensity, and Cherenkov angular spectra.
@@ -78,7 +88,10 @@ Capabilities
   :doc:`backends`.
 - **Inverse design**: a differentiable 2-D etch-density pipeline
   (:class:`~photonfdtd.EtchedCore`, :func:`~photonfdtd.value_and_grad_density`)
-  for topology optimization of PIC devices. See :doc:`accuracy`.
+  for topology optimization of PIC devices, with **fabrication constraints**
+  (:mod:`photonfdtd.fabrication`: design symmetries, minimum-length-scale
+  penalties, brush rule checks, floating-material clean-up). See
+  :doc:`accuracy`.
 - **Geometry optimization and chip training**: design regions inside a real
   layout, parametric shapes, Adam / optax loops with beta continuation, robust
   (eroded / dilated) objectives, GDS export, and training a chip on a dataset
@@ -97,7 +110,11 @@ Capabilities
 - **Big runs**: a memory planner (:func:`~photonfdtd.estimate_memory`,
   :func:`~photonfdtd.recommend_mode`) that sizes a run against the device
   before it starts, and disk-tiled forward runs and adjoints for grids that
-  don't fit (:mod:`photonfdtd.tiled`).
+  don't fit (:mod:`photonfdtd.tiled`), and **multi-device** domain
+  decomposition (``Simulation(devices=...)``) that splits the grid into
+  slabs across GPUs.
+- Export of grids, fields and structures to ParaView (``.vti``) and STL
+  (:mod:`photonfdtd.export`).
 - A :func:`~photonfdtd.from_gdsfactory` adapter that turns a gdsfactory
   ``Component`` into a fully-built :class:`~photonfdtd.Simulation`.
 

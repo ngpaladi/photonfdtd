@@ -38,8 +38,8 @@ from __future__ import annotations
 import numpy as np
 
 from .constants import EPS_0
-from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
-from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS, _term_diff,
+from .monitors import DFTMonitor, FluxMonitor, FieldMonitor, EnergyMonitor
+from .jaxbackend import (_build_static, _monitor_plan, _snap, _dft_snap, _FLUX_AXIS, _term_diff, _h_coeff,
                          _build_ade_jax)
 from .reversible import _pass_increment, _flux, _ADE, lossless_poles
 
@@ -58,7 +58,8 @@ def pml_mask(grid):
         hi = [slice(None)] * 3
         lo[a] = slice(0, npml)
         hi[a] = slice(n - npml, n)
-        mask[tuple(lo)] = True
+        if not getattr(grid, "symmetry", (0, 0, 0))[a]:   # no PML on a mirror plane
+            mask[tuple(lo)] = True
         mask[tuple(hi)] = True
     return mask
 
@@ -86,7 +87,8 @@ def _pass_with_psi(fields, psi, is_E_pass, ce_e, static, neg_ch):
         if curl is None:
             continue
         reg = comp["region"]
-        K = ce_e[comp["Fkey"]][reg] if is_E_pass else neg_ch
+        K = ce_e[comp["Fkey"]][reg] if is_E_pass else \
+            _h_coeff(neg_ch, static["ch_h"], comp["Fkey"], reg)
         inc[comp["Fkey"]] = (reg, K * curl)
     return inc, psi
 
@@ -147,7 +149,7 @@ def make_pml_reversible(sim, static, plans, ce_e, ade=None):
             for c in m.components:
                 t = (n + (1.0 if c[0] == "E" else 0.5)) * dt
                 ph = jnp.exp(1j * jnp.asarray(p["omega"]) * t).astype(cdt)
-                s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
+                s = _dft_snap(fields[c], c, m, p["plane"], p.get("pmc0", False)).astype(cdt)
                 ph = ph.reshape((-1,) + (1,) * s.ndim)
                 dft[m.name][c] = dft[m.name][c] + sgn * ph * s[None] * dt
         flux = _flux_half(fields, flux, sgn)
@@ -244,8 +246,19 @@ def reversible_pml_run(sim):
             "reversible PML adjoint needs lossless dispersion poles (gamma == 0)")
     if getattr(sim, "particle_sources", None):
         raise NotImplementedError("reversible PML adjoint: no moving charges.")
+    if getattr(sim, "devices", None):
+        raise NotImplementedError("reversible PML adjoint runs on one device; "
+                                  "build the Simulation with devices=None.")
+    if getattr(sim.grid, "is_complex", False):
+        raise NotImplementedError("reversible PML adjoint: no Bloch-periodic "
+                                  "(complex) runs; use the checkpointed adjoint.")
+    if getattr(sim, "_has_conductivity", False) or \
+            (getattr(sim, "_has_magnetic", False)
+             and sim.magnetic_conductivity_map() is not None):
+        raise NotImplementedError("reversible PML adjoint: no electric or "
+                                  "magnetic loss (it cannot be stepped backward).")
     for m in sim.monitors:
-        if isinstance(m, FieldMonitor):
+        if isinstance(m, (FieldMonitor, EnergyMonitor)):
             raise NotImplementedError("reversible PML adjoint: DFT/Flux monitors only.")
     _validate(sim)
     _enable_x64_if_needed(sim)
