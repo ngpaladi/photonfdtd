@@ -37,10 +37,10 @@ from __future__ import annotations
 import numpy as np
 
 from .constants import EPS_0
-from .monitors import DFTMonitor, FluxMonitor, FieldMonitor
+from .monitors import DFTMonitor, FluxMonitor, FieldMonitor, EnergyMonitor
 from .jaxbackend import (_build_static, _monitor_plan, _validate, _term_diff,
                          _enable_x64_if_needed, _snap, _dft_snap, _FLUX_AXIS,
-                         _flux, _build_ade_jax)
+                         _flux, _build_ade_jax, _h_coeff)
 
 
 def reversible_available(sim):
@@ -53,10 +53,18 @@ def reversible_available(sim):
                        "stably")
     if getattr(sim, "particle_sources", None):
         return False, "reversible adjoint does not support moving-charge sources"
+    if getattr(sim.grid, "is_complex", False):
+        return False, ("reversible adjoint does not support Bloch-periodic "
+                       "(complex) runs")
+    if getattr(sim, "devices", None):
+        return False, "reversible adjoint runs on one device (devices=None)"
     if getattr(sim, "_has_conductivity", False):
         return False, "reversible adjoint does not support conductive media"
+    if getattr(sim, "_has_magnetic", False) and \
+            sim.magnetic_conductivity_map() is not None:
+        return False, "reversible adjoint does not support magnetic loss"
     for m in sim.monitors:
-        if isinstance(m, FieldMonitor):
+        if isinstance(m, (FieldMonitor, EnergyMonitor)):
             return False, "reversible adjoint supports DFT/Flux monitors only"
     return True, ""
 
@@ -156,7 +164,8 @@ def _pass_increment(fields, is_E_pass, ce_e, static, neg_ch):
         if curl is None:
             continue
         reg = comp["region"]
-        K = ce_e[comp["Fkey"]][reg] if is_E_pass else neg_ch
+        K = ce_e[comp["Fkey"]][reg] if is_E_pass else \
+            _h_coeff(neg_ch, static["ch_h"], comp["Fkey"], reg)
         out[comp["Fkey"]] = (reg, K * curl)
     return out
 
@@ -198,7 +207,7 @@ def _make_reversible(sim, static, plans, ce_e, ade=None):
             for c in m.components:
                 t = (n + (1.0 if c[0] == "E" else 0.5)) * dt
                 ph = jnp.exp(1j * jnp.asarray(p["omega"]) * t).astype(cdt)
-                s = _dft_snap(fields[c], c, m, p["plane"]).astype(cdt)
+                s = _dft_snap(fields[c], c, m, p["plane"], p.get("pmc0", False)).astype(cdt)
                 ph = ph.reshape((-1,) + (1,) * s.ndim)
                 dft[m.name][c] = dft[m.name][c] + sgn * ph * s[None] * dt
         flux = _flux_half(fields, flux, sgn)

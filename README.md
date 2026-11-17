@@ -93,6 +93,23 @@ print(result.n_eff)            # array of effective indices
   (`Grid(periodic=(False, True, True))`) for one unit cell of a grating,
   photonic crystal or metasurface. A grid edge with neither is a perfect
   electric conductor.
+- **Bloch-periodic boundaries** (`Grid(bloch=(kx, ky, kz))`): the fields
+  pick up `exp(i k L)` across the cell, so the run steps complex fields. With
+  an oblique `PlaneWave(angle=..., tilt_axis=...)` this gives any angle of
+  incidence on a periodic cell. At 30° onto an n = 2 half-space the
+  transmitted power matches Fresnel's T_s and T_p to <1%.
+- **Mirror-symmetry planes** (`Grid(symmetry=(sx, sy, sz))`, −1 PEC / +1
+  PMC about the domain centre) step only the upper half of each symmetric
+  axis: 2×, 4× or 8× fewer cells. The half run is the exactly mirror-symmetric
+  discretization. Unfolded (`pf.unfold`, with each component's parity), its
+  fields match a full-domain run given the same mirrored permittivity to
+  round-off (fluxes to 2e-11). A plain full-domain run rasterizes ε per
+  node, which is not exactly mirror-symmetric for the half-cell-offset
+  components at an interface. With an n = 2 block straddling both planes at
+  20 cells/λ the two runs' fluxes differ by 1–3%; with no structure on the
+  planes they agree to round-off. Flux, photon counts and energy come back
+  as whole-domain values. A charge on the axis of a tube (PMC in x and y)
+  runs on a quarter of the grid.
 - **Isotropic dielectric media, non-dispersive or dispersive.** Non-dispersive
   media stamp a single `eps_r` per cell; dispersive media (`DispersiveMedium`,
   with `.lorentz` / `.drude` / `.sellmeier` constructors) carry Lorentz, Drude
@@ -106,8 +123,15 @@ print(result.n_eff)            # array of effective indices
   (harmonic mean normal to the interface, arithmetic mean tangential), removing
   the staircase error and restoring second-order boundary accuracy
   (Farjadpour et al. 2006). See [`docs/accuracy.rst`](docs/accuracy.rst).
-- **Geometry primitives**: axis-aligned `Box` and arbitrary-polygon
-  `PolySlab` (a polygon in xy extruded between two z bounds).
+- **Magnetic media**: `Medium(permeability=..., magnetic_conductivity=...)`
+  (a diagonal μ tensor on `AnisotropicMedium`), with μ averaged onto the
+  staggered H nodes so magnetic interfaces sit where electric ones do. An
+  ε = μ slab is impedance matched: its reflection falls off second order in
+  the cell size. A matched electric/magnetic loss absorbs without
+  reflecting.
+- **Geometry primitives**: axis-aligned `Box`, arbitrary-polygon
+  `PolySlab` (a polygon in xy extruded between two z bounds), `Sphere`
+  (or ellipsoid) and `Cylinder` along any axis (fibres, pillars, tubes).
 - **Sources**: soft point-dipole (`PointDipole`), distributed line/area
   mode injection (`ModeSource`, and the one-way `UniModeSource` built from
   equivalence-principle current sheets), one-way **plane waves**
@@ -124,11 +148,21 @@ print(result.n_eff)            # array of effective indices
   `exp(-k_x |y| / gamma)` law to a few percent, the coupling that drives a
   Cherenkov radiator in a hollow tube (`examples/05_cherenkov_tube.py`).
 - **Monitors**: time-domain field snapshots (`FieldMonitor`), Poynting flux
-  (`FluxMonitor`), and a frequency-domain `DFTMonitor` that accumulates a
+  (`FluxMonitor` through a whole plane or a rectangle of it, and
+  `closed_surface` / `closed_surface_flux` for a box), the electromagnetic
+  energy in a box over time (`EnergyMonitor`), and a frequency-domain
+  `DFTMonitor` that accumulates a
   running Fourier transform at chosen frequencies so storage scales with the
   number of frequencies rather than the number of timesteps (routinely
   50-1000x smaller than an equivalent time-domain monitor, exact at those
-  frequencies).
+  frequencies). `sim.run(shutoff=1e-5)` stops once the field energy has
+  decayed to that fraction of its peak (never before the sources finish);
+  `run_time` stays the upper limit.
+- **Diffraction orders** (`diffraction_orders`): split the flux through a
+  plane of a periodic (or Bloch-periodic) cell into its orders, with each
+  order's direction, propagating/evanescent flag and power. The order
+  powers sum to the plane flux exactly (Parseval). A grating's orders leave
+  at `sin θ = m λ / Λ`.
 - **Near-to-far-field projection** (`project_far_field`): turn plane
   `DFTMonitor`s on a closed box (or one open plane) into the far field and
   radiant intensity at any directions, in 2-D or 3-D, from Love's
@@ -201,6 +235,12 @@ print(result.n_eff)            # array of effective indices
   Parts travel as component files (`*.pcomp.json`): layout, ports, pins and
   model (solved physics, S-parameter tables, the recipe) in one JSON file,
   importable like a KiCad library part.
+- **Fabrication constraints** (`photonfdtd.fabrication`): design
+  symmetries (`symmetrize`), the differentiable minimum-length-scale
+  penalties of Zhou et al. 2015 (`lengthscale_constraints`), a circular-brush
+  rule check (`brush_violations`, `minimum_lengthscale`), and clean-up of
+  floating islands and enclosed voids (`remove_floating`,
+  `fill_enclosed_voids`).
 - **Geometry optimization and chip training.** Optimize a `DesignRegion` box
   inside a real layout (fixed waveguides around it) or a `ShapeDesign`'s
   parametric polygons (widths, gaps, tapers), with a compile-once gradient
@@ -217,6 +257,18 @@ print(result.n_eff)            # array of effective indices
   arrays share one dtype; monitor storage may differ) and a memory planner
   (`estimate_memory`, `recommend_mode`, `format_report`, `available_memory`)
   that sizes a run against the device before it OOMs.
+- **Multi-device runs (experimental)**: `Simulation(devices=4)` (or a list
+  of JAX devices) splits the grid into slabs, one per GPU, and XLA
+  exchanges the slab faces each step. This covers forward runs and the checkpointed
+  gradients. On 4 simulated devices a 3-D run with PML, a periodic axis,
+  and magnetic, dispersive, plane-wave and moving-charge sources matches the
+  single-device answer to round-off. Correctness has been shown on
+  simulated CPU devices only. Scaling on real multi-GPU hardware has not
+  been measured. XLA's partitioner (jax 0.10) miscompiled a one-element
+  source scatter; the stepper works around it.
+- **Export** to ParaView (`export_vti`: permittivity, snapshots, complex
+  DFT fields) and STL (`export_stl`: a closed voxel surface of any mask,
+  such as an optimized design).
 - **gdsfactory adapter** (`from_gdsfactory`) that reads a layout
   `Component`, maps its layers onto user-supplied materials, and returns a
   pre-built `Simulation`.
@@ -260,15 +312,23 @@ demand rather than grabbing most of the card up front.
 - The reversible adjoint with CPML is exact but only saves memory when the PML
   shell is a small fraction (under ~5%) of the volume; for ordinary PML runs
   use checkpointing.
-- Anisotropic media are diagonal tensors in the grid frame (no rotated
-  crystal axes), and neither they nor dispersive media combine with subpixel
-  smoothing.
-- Plane waves are normal-incidence only: oblique incidence on a periodic cell
-  needs Bloch-periodic (complex) fields, which the engine does not step, and
-  there is no total-field/scattered-field box. Periodic boundaries run in
-  memory (not disk-tiled).
-- One device per run: no multi-GPU domain decomposition. Grids are uniform
-  per axis, and there are no symmetry planes.
+- Anisotropic media (ε and μ) are diagonal tensors in the grid frame (no
+  rotated crystal axes, no off-diagonal terms). Subpixel smoothing does not
+  combine with anisotropic, dispersive or magnetic media.
+- Oblique plane waves use a fixed Bloch wavevector, so the angle is exact at
+  the pulse's centre frequency only. Read results from DFT monitors there,
+  or run one frequency per angle. Bloch (complex) runs support the
+  checkpointed adjoint but not the reversible or disk-tiled ones, moving
+  charges, or time-domain `FluxMonitor` (use DFT planes). There is no
+  total-field/scattered-field box.
+- Symmetry planes sit at the domain centre. The sources must share the
+  symmetry: those in the mirrored half are dropped. Far-field projection on
+  a symmetric grid is not supported yet; unfold the DFT data or run the full
+  domain.
+- Periodic, Bloch and symmetric grids, magnetic media, `EnergyMonitor` and
+  bounded `FluxMonitor` run in memory (not disk-tiled). Multi-device runs
+  cover the forward run and the checkpointed adjoint only. Grids are
+  uniform per axis.
 
 ## Releasing (maintainers)
 

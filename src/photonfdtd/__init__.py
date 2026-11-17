@@ -47,16 +47,23 @@ from .materials import (
     silica, silicon, silicon_nitride, lithium_niobate, gold, silver,
 )
 from . import materials
-from .geometry import Box, PolySlab
+from .geometry import Box, PolySlab, Sphere, Cylinder
 from .sources import (
     GaussianPulse, PointDipole, ModeSource, UniModeSource, SinglePhotonSource,
     PlaneWave, GaussianBeam,
     ChargedParticle, single_photon_field_amplitude, PLANCK_H,
 )
-from .monitors import FieldMonitor, FluxMonitor, DFTMonitor
+from .monitors import (FieldMonitor, FluxMonitor, DFTMonitor, EnergyMonitor,
+                       closed_surface, closed_surface_flux)
 from .farfield import (FarField, project_far_field, spherical_directions,
                        polar_directions)
 from .simulation import Simulation
+from .symmetry import unfold, full_coords
+from .diffraction import DiffractionOrders, diffraction_orders
+from . import fabrication
+from .export import export_vti, export_stl
+from .fabrication import (symmetrize, lengthscale_constraints, brush_violations,
+                          minimum_lengthscale, remove_floating, fill_enclosed_voids)
 # Differentiable JAX entry points.
 from .jaxbackend import value_and_grad_eps as jax_value_and_grad_eps
 from .reversible import (
@@ -104,13 +111,18 @@ __all__ = [
     "C_0", "EPS_0", "MU_0", "ETA_0", "Q_E", "PLANCK_H",
     "Grid", "Medium", "DispersiveMedium", "Pole", "AnisotropicMedium", "materials",
     "silica", "silicon", "silicon_nitride", "lithium_niobate", "gold", "silver",
-    "Box", "PolySlab",
+    "Box", "PolySlab", "Sphere", "Cylinder",
     "GaussianPulse", "PointDipole", "ModeSource", "UniModeSource",
     "PlaneWave", "GaussianBeam",
+    "unfold", "full_coords", "DiffractionOrders", "diffraction_orders",
+    "export_vti", "export_stl",
+    "fabrication", "symmetrize", "lengthscale_constraints", "brush_violations",
+    "minimum_lengthscale", "remove_floating", "fill_enclosed_voids",
     "FarField", "project_far_field", "spherical_directions", "polar_directions",
     "SinglePhotonSource",
     "ChargedParticle", "single_photon_field_amplitude",
-    "FieldMonitor", "FluxMonitor", "DFTMonitor",
+    "FieldMonitor", "FluxMonitor", "DFTMonitor", "EnergyMonitor",
+    "closed_surface", "closed_surface_flux",
     "Simulation", "ModeSolver", "jax_value_and_grad_eps",
     "jax_value_and_grad_eps_reversible",
     "jax_value_and_grad_eps_reversible_pml", "jax_value_and_grad_eps_tiled",

@@ -139,6 +139,8 @@ class Result:
     # (n_freq, *snapshot_shape); dft_freqs[name] holds the frequencies (Hz).
     dft: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     dft_freqs: Dict[str, np.ndarray] = field(default_factory=dict)
+    # EnergyMonitor output: energy[name] is the (n_rec,) energy series (J).
+    energy: Dict[str, np.ndarray] = field(default_factory=dict)
 
 
 
@@ -176,6 +178,15 @@ class Simulation:
     subpixel, subpixel_factor : bool, int
         Anisotropic subpixel smoothing of material interfaces and its
         supersampling factor (see :mod:`photonfdtd.smoothing`).
+    devices : sequence of jax devices, int, or None
+        *Experimental.* Run on several devices (GPUs) at once by domain
+        decomposition: the
+        grid is split into slabs along ``shard_axis``, one per device, and
+        XLA exchanges the slab faces each step. An int takes the first that
+        many of ``jax.devices()``. Applies to :meth:`run` and the
+        checkpointed design gradients; ``None`` (default) runs on one device.
+    shard_axis : int or None
+        Axis to split (default: the longest).
     """
 
     def __init__(
@@ -191,6 +202,8 @@ class Simulation:
         precision="float64",
         subpixel: bool = False,
         subpixel_factor: int = 3,
+        devices=None,
+        shard_axis: Optional[int] = None,
     ) -> None:
         # Working dtype(s) for fields, CPML state, coefficients and monitor
         # storage. float32 halves memory and roughly doubles throughput (FDTD is
@@ -240,6 +253,17 @@ class Simulation:
             float(getattr(getattr(s, "medium", None), "conductivity", 0.0) or 0.0) != 0.0
             for s in self.structures
         )
+        # Magnetic media (mu_r != 1 or magnetic loss) make the H update use a
+        # per-cell coefficient (see jaxbackend.h_coefficients).
+        self._has_magnetic = any(
+            getattr(getattr(s, "medium", None), "is_magnetic", False)
+            for s in self.structures
+        )
+        if self._has_magnetic and self.subpixel:
+            raise NotImplementedError(
+                "Subpixel smoothing combined with magnetic media is not yet "
+                "supported (only the permittivity would be smoothed). Use one "
+                "or the other.")
         self.run_time = float(run_time)
         self.courant = float(courant)
         # Time step from the Courant condition.
@@ -268,7 +292,7 @@ class Simulation:
                     "SinglePhotonSource, PlaneWave, GaussianBeam or "
                     "ChargedParticle."
                 )
-        self.sources = expanded
+        self.sources = self._on_symmetry_half(expanded)
         self.monitors = list(monitors)
         self.cpml_params = cpml_params
         self.verbose = verbose
@@ -278,6 +302,17 @@ class Simulation:
         # attribute so callers can attach it to an already-built Simulation
         # (e.g. one made by from_gdsfactory).
         self.progress_callback: Optional[Callable[[int, int], None]] = None
+        self.devices = None
+        self.shard_axis = None
+        if devices is not None:
+            import jax
+            devs = list(jax.devices()[:int(devices)]) if isinstance(devices, int) \
+                else list(devices)
+            self.devices = devs if len(devs) > 1 else None
+            self.shard_axis = int(np.argmax(grid.shape)) if shard_axis is None \
+                else int(shard_axis)
+            if grid.shape[self.shard_axis] < len(devs):
+                raise ValueError("the shard axis has fewer cells than devices")
 
         # Per-cell relative permittivity (background = 1), stamped on host in
         # the 'eps_r' working dtype from grid + structures.
@@ -366,6 +401,64 @@ class Simulation:
                 getattr(st.medium, "conductivity", 0.0) or 0.0)
         return sig
 
+    def mu_components(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Relative permeability seen by Hx, Hy and Hz, or None when no medium
+        is magnetic. Stamped per cell (later structures on top), then averaged
+        onto each H component's staggered position (see :meth:`_to_h_nodes`)."""
+        if not self._has_magnetic:
+            return None
+        from .materials import mu_components_of
+        comps = [np.ones(self.grid.shape, dtype=np.float64) for _ in range(3)]
+        for st in self.structures:
+            mask = st.region_mask(self.grid)
+            for c, v in zip(comps, mu_components_of(st.medium)):
+                c[mask] = v
+        return tuple(self._to_h_nodes(c, a) for a, c in enumerate(comps))
+
+    def _to_h_nodes(self, cell_values: np.ndarray, axis: int) -> np.ndarray:
+        """Average a per-cell material value onto the H-component nodes.
+
+        Materials are stamped at the E nodes (integer cells), but ``H_axis``
+        sits half a cell up along the two other axes. Averaging the cell value
+        over those neighbours puts the magnetic interface where the electric
+        one is; sampled at the cell itself instead, an ``eps_r = mu_r`` slab
+        would reflect from a half-cell sliver of mismatch (first order in dx).
+        """
+        out = np.asarray(cell_values, dtype=np.float64)
+        per = getattr(self.grid, "periodic", (False,) * 3)
+        for b in range(3):
+            if b == axis or out.shape[b] <= 1:
+                continue
+            if per[b]:
+                up = np.roll(out, -1, axis=b)
+            else:
+                up = np.concatenate(
+                    [np.take(out, range(1, out.shape[b]), axis=b),
+                     np.take(out, [out.shape[b] - 1], axis=b)], axis=b)
+            out = 0.5 * (out + up)
+        return out
+
+    def magnetic_conductivity_map(self) -> Optional[np.ndarray]:
+        """Per-cell magnetic conductivity sigma_m (ohm/m), or None if no
+        medium has magnetic loss."""
+        if not any(float(getattr(getattr(s, "medium", None),
+                                 "magnetic_conductivity", 0.0) or 0.0) != 0.0
+                   for s in self.structures):
+            return None
+        sig = np.zeros(self.grid.shape, dtype=np.float64)
+        for st in self.structures:
+            sig[st.region_mask(self.grid)] = float(
+                getattr(st.medium, "magnetic_conductivity", 0.0) or 0.0)
+        return sig
+
+    def magnetic_conductivity_components(self):
+        """``magnetic_conductivity_map`` averaged onto the Hx, Hy, Hz nodes
+        (see :meth:`mu_components`), or None."""
+        sig = self.magnetic_conductivity_map()
+        if sig is None:
+            return None
+        return tuple(self._to_h_nodes(sig, a) for a in range(3))
+
     # ------------------------------------------------------------------ #
     # Attach sources / monitors after construction. Useful when the
     # Simulation was produced by an adapter (e.g. from_gdsfactory) and the
@@ -373,11 +466,11 @@ class Simulation:
     # ------------------------------------------------------------------ #
     def add_source(self, source) -> None:
         if isinstance(source, PointDipole):
-            self.sources.append(source)
+            self.sources.extend(self._on_symmetry_half([source]))
         elif isinstance(source, ChargedParticle):
             self._register_particle(source)
         elif hasattr(source, "expand"):
-            self.sources.extend(self._expand(source))
+            self.sources.extend(self._on_symmetry_half(self._expand(source)))
         else:
             raise TypeError(
                 f"Unsupported source type: {type(source).__name__}"
@@ -389,6 +482,31 @@ class Simulation:
         if getattr(source, "needs_dt", False):
             return source.expand(self.grid, dt=self.dt)
         return source.expand(self.grid)
+
+    def _on_symmetry_half(self, dipoles):
+        """Keep the point sources a symmetric grid steps.
+
+        On a symmetry axis the sources are taken to be mirror symmetric (as
+        the fields are): those in the mirrored-away half are images of ones
+        kept and are dropped. On a PEC plane the tangential E and normal H
+        are odd, hence zero on the plane, so sources of those components
+        there are dropped too.
+        """
+        g = self.grid
+        if not getattr(g, "has_symmetry", False):
+            return list(dipoles)
+        out = []
+        for d in dipoles:
+            if not g.in_domain(d.position):
+                continue
+            idx = g.index_at(d.position)
+            a = "xyz".index(d.component[1])
+            odd_on_plane = any(
+                s == -1 and idx[b] == 0 and ((b != a) == (d.component[0] == "E"))
+                for b, s in enumerate(g.symmetry))
+            if not odd_on_plane:
+                out.append(d)
+        return out
 
     def _register_particle(self, p: ChargedParticle) -> None:
         """Validate and store a moving charged-particle current source."""
@@ -413,7 +531,8 @@ class Simulation:
             dl = self.grid.cell_size[ax]
             n_pml = self.grid.pml_layers[ax] if n_cells > 1 else 0
             be_ax, ce_ax, bh_ax, ch_ax = cpml_coeffs_1axis(
-                n_cells, dl if n_cells > 1 else 1.0, n_pml, self.dt, self.cpml_params
+                n_cells, dl if n_cells > 1 else 1.0, n_pml, self.dt, self.cpml_params,
+                low=not getattr(self.grid, "symmetry", (0, 0, 0))[ax],
             )
             be.append(be_ax); ce.append(ce_ax)
             bh.append(bh_ax); ch.append(ch_ax)
@@ -424,7 +543,8 @@ class Simulation:
     def run(self, disk_tiled: Optional[bool] = None,
             tile_cells: Optional[int] = None, steps_per_tile: int = 8,
             workdir: Optional[str] = None, ce=None, ca=None,
-            modulation=None) -> Result:
+            modulation=None, shutoff: Optional[float] = None,
+            shutoff_interval: int = 50) -> Result:
         """Time-step the simulation on JAX/XLA and return the recorded monitor
         data (see :func:`photonfdtd.jaxbackend.run_jax`).
 
@@ -445,6 +565,13 @@ class Simulation:
             permittivity drive, as built by :class:`photonfdtd.active.ActiveRegion`
             (see :func:`photonfdtd.jaxbackend.run_jax`). Disk tiling takes
             ``ce`` only.
+        shutoff, shutoff_interval
+            Stop early once the field energy in the domain has decayed below
+            ``shutoff`` (e.g. ``1e-5``) of its peak, checked every
+            ``shutoff_interval`` steps and never before the sources have
+            finished; ``run_time`` stays the upper limit. ``result.times``
+            then ends at the step reached. In-memory forward runs only (the
+            gradient paths need a fixed step count).
         """
         if disk_tiled is None:
             disk_tiled = self._needs_disk_tiling()
@@ -460,18 +587,23 @@ class Simulation:
             print(f"[photonfdtd] JAX {jax.__version__} on "
                   f"{jax.devices()[0]}, grid {self.grid.shape}, "
                   f"{self.n_steps} steps, {mode}")
+        if disk_tiled and shutoff is not None:
+            raise NotImplementedError("shutoff is not supported for disk-tiled runs")
         if disk_tiled:
-            if ca is not None or modulation is not None or self._has_conductivity:
+            if ca is not None or modulation is not None or self._has_conductivity \
+                    or self._has_magnetic:
                 raise NotImplementedError(
-                    "disk-tiled runs support neither conductive media nor a "
-                    "time-varying permittivity; run in memory (disk_tiled=False)")
+                    "disk-tiled runs support neither conductive or magnetic "
+                    "media nor a time-varying permittivity; run in memory "
+                    "(disk_tiled=False)")
             from .tiled import run_tiled
             result = run_tiled(self, tile_cells=tile_cells,
                                steps_per_tile=steps_per_tile, workdir=workdir,
                                **({"ce": ce} if ce is not None else {}))
         else:
             from .jaxbackend import run_jax
-            result = run_jax(self, ce=ce, ca=ca, modulation=modulation)
+            result = run_jax(self, ce=ce, ca=ca, modulation=modulation,
+                             shutoff=shutoff, shutoff_interval=shutoff_interval)
         if self.progress_callback is not None:
             self.progress_callback(self.n_steps, self.n_steps)
         return result

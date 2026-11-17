@@ -201,6 +201,13 @@ def photon_spectrum(result, sim, monitor: str, direction: int = +1,
         against ``direction``. The monitor records tangential H averaged onto
         the E plane (see :class:`~photonfdtd.DFTMonitor`), as
         :class:`~photonfdtd.FluxMonitor` does.
+
+    Notes
+    -----
+    On a grid with symmetry planes the result is the whole plane's (the
+    stepped part times two per symmetric in-plane axis). For the complex
+    fields of a Bloch-periodic run the absolute scale assumes real fields, so
+    use ratios (transmission against an incident run) there.
     """
     m = next((mm for mm in sim.monitors if mm.name == monitor), None)
     if not isinstance(m, DFTMonitor):
@@ -235,6 +242,14 @@ def photon_spectrum(result, sim, monitor: str, direction: int = +1,
             shp = [1, 1, 1]
             shp[a] = -1
             mask = mask & sel.reshape(shp)
+    sym = getattr(grid, "symmetry", (0, 0, 0))
+    for a in range(3):
+        if sym[a] and a != axis:
+            if bounds is not None and bounds[a] is not None:
+                raise ValueError(
+                    f"bounds on symmetric axis {a} are ambiguous (the stepped "
+                    "half is mirrored); leave that axis unbounded")
+            dA *= 2.0                             # the mirrored half too
     dUdf = 2.0 * direction * (flux * mask).reshape(flux.shape[0], -1).sum(axis=1) * dA
     # The DFT samples H at its own half-step times. The Yee discrete energy
     # flux pairs E^n with (H^{n-1/2} + H^{n+1/2}) / 2, whose transform is that

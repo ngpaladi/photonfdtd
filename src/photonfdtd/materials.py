@@ -1,12 +1,12 @@
 """Material definitions.
 
-v0.1 supports isotropic, non-dispersive dielectrics. Each Medium is reduced to
-a single relative permittivity that the grid rasteriser stamps into a per-cell
-epsilon_r array. Magnetic permeability is fixed at mu_r = 1.
-
-Dispersive media (Lorentz, Drude, Debye) are planned for a future release via
-the auxiliary-differential-equation method; the API is left open so a Lorentz
-class can slot in without breaking callers.
+Each medium reduces to a relative permittivity that the grid rasteriser
+stamps into a per-cell epsilon_r array: isotropic (:class:`Medium`), a
+diagonal tensor (:class:`AnisotropicMedium`) or dispersive
+(:class:`DispersiveMedium`, Lorentz / Drude / Sellmeier poles advanced by the
+ADE method). A medium may also carry an electric conductivity, a relative
+permeability mu_r and a magnetic conductivity (magnetic loss); these default
+to the lossless, non-magnetic values.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -29,10 +29,20 @@ class Medium:
         Electric conductivity sigma in S/m (default 0). A non-zero value makes
         the medium lossy, with E decaying as exp(-sigma t / (2 eps)) in time;
         the FDTD E update then uses the standard lossy (ca, cb) coefficients.
+    permeability : float, optional
+        Relative permeability mu_r (default 1). Values other than 1 make the H
+        update use a per-cell coefficient ``dt / (mu_r MU_0)``.
+    magnetic_conductivity : float, optional
+        Magnetic conductivity sigma_m in ohm/m (default 0): magnetic loss, with
+        H decaying as exp(-sigma_m t / (2 mu)) in time. A medium with
+        ``magnetic_conductivity / (mu_r MU_0) == conductivity / (eps_r EPS_0)``
+        is impedance matched to vacuum when ``eps_r == mu_r``.
     """
     permittivity: float = 1.0
     name: str = ""
     conductivity: float = 0.0
+    permeability: float = 1.0
+    magnetic_conductivity: float = 0.0
 
     #: Marks this as a plain non-dispersive dielectric (see DispersiveMedium).
     is_dispersive: ClassVar[bool] = False
@@ -42,6 +52,11 @@ class Medium:
     @property
     def eps_r(self) -> float:
         return float(self.permittivity)
+
+    @property
+    def is_magnetic(self) -> bool:
+        """True when mu_r != 1 or the medium has magnetic loss."""
+        return float(self.permeability) != 1.0 or float(self.magnetic_conductivity) != 0.0
 
     @classmethod
     def from_index(cls, n: float, name: str = "") -> "Medium":
@@ -68,6 +83,10 @@ class AnisotropicMedium:
     permittivity: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     name: str = ""
     conductivity: float = 0.0
+    #: Relative permeability: a scalar or ``(mu_xx, mu_yy, mu_zz)`` in the grid
+    #: frame (the value seen by Hx, Hy, Hz).
+    permeability: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    magnetic_conductivity: float = 0.0
 
     is_dispersive: ClassVar[bool] = False
     is_anisotropic: ClassVar[bool] = True
@@ -77,6 +96,16 @@ class AnisotropicMedium:
         if len(p) != 3:
             raise ValueError("permittivity must be (eps_xx, eps_yy, eps_zz)")
         object.__setattr__(self, "permittivity", p)
+        mu = self.permeability
+        mu = (float(mu),) * 3 if _isscalar(mu) else tuple(float(v) for v in mu)
+        if len(mu) != 3:
+            raise ValueError("permeability must be a scalar or (mu_xx, mu_yy, mu_zz)")
+        object.__setattr__(self, "permeability", mu)
+
+    @property
+    def is_magnetic(self) -> bool:
+        return any(v != 1.0 for v in self.permeability) or \
+            float(self.magnetic_conductivity) != 0.0
 
     @property
     def eps_r(self) -> float:
@@ -90,6 +119,22 @@ class AnisotropicMedium:
     def from_index(cls, n, name: str = "") -> "AnisotropicMedium":
         """From refractive indices ``(n_x, n_y, n_z)`` along the grid axes."""
         return cls(permittivity=tuple(float(v) ** 2 for v in n), name=name)
+
+
+def _isscalar(x) -> bool:
+    try:
+        float(x)
+        return True
+    except TypeError:
+        return False
+
+
+def mu_components_of(medium) -> Tuple[float, float, float]:
+    """``(mu_xx, mu_yy, mu_zz)`` of any medium (1 for non-magnetic media)."""
+    mu = getattr(medium, "permeability", 1.0)
+    if _isscalar(mu):
+        return (float(mu),) * 3
+    return tuple(float(v) for v in mu)
 
 
 def eps_components_of(medium) -> Tuple[float, float, float]:

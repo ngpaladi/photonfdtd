@@ -9,9 +9,10 @@ Primitive source types:
   injected as a moving current source; radiates Cherenkov light when it
   outruns the local phase velocity.
 
-- :class:`PlaneWave`       - one-way plane wave at normal incidence from a
-  Huygens (electric + magnetic) current sheet; :class:`GaussianBeam` is the
-  same sheet with a Gaussian transverse profile.
+- :class:`PlaneWave`       - one-way plane wave, at normal incidence or
+  oblique on a Bloch-periodic cell, from a Huygens (electric + magnetic)
+  current sheet; :class:`GaussianBeam` is the same sheet with a Gaussian
+  transverse profile.
 
 And one factory built on top:
 
@@ -27,7 +28,7 @@ list of `PointDipole` instances before running.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Sequence, Tuple, List, TYPE_CHECKING
+from typing import Optional, Sequence, Tuple, List, TYPE_CHECKING
 import math
 import numpy as np
 
@@ -573,7 +574,7 @@ def _parse_direction(direction: str) -> Tuple[int, float]:
 
 @dataclass(frozen=True)
 class PlaneWave:
-    r"""One-way plane wave at normal incidence, from a Huygens current sheet.
+    r"""One-way plane wave, normal or oblique, from a Huygens current sheet.
 
     A plane of soft electric sources on the polarization component and a
     co-located plane of magnetic sources on the matching H component (half a
@@ -596,9 +597,21 @@ class PlaneWave:
     Make the transverse axes periodic (``Grid(periodic=...)``) for an
     infinite plane wave, e.g. one unit cell of a grating or metasurface; with
     PML on a transverse axis the sheet is truncated and diffracts from its
-    edges. Only normal incidence is supported: oblique incidence on a periodic
-    cell needs Bloch-periodic (complex) fields, which this engine does not
-    step.
+    edges.
+
+    **Oblique incidence.** ``angle`` (degrees) tilts the wavevector from
+    ``direction`` towards ``+tilt_axis``, which must be a periodic transverse
+    axis carrying the matching Bloch wavevector
+    ``k_t = 2 pi f0 n sin(angle) / c`` (``Grid(bloch=pw.bloch_vector())``);
+    the run then steps complex fields. The sheet carries the tangential fields
+    of the tilted wave (equivalence principle: ``J = n x H``, ``M = -n x E``)
+    with the phase ``exp(i k_t x_t)`` at each component's Yee position. With
+    ``polarization`` normal to the plane of incidence (s / TE) ``amplitude``
+    is that E; with ``polarization == 'E' + tilt_axis`` (p / TM, E in the plane
+    of incidence) ``amplitude`` is the full E, whose tangential part is
+    ``amplitude * cos(angle)``. Read the result from DFT monitors at ``f0``:
+    the fixed ``k_t`` means other frequencies of the pulse travel at other
+    angles, ``asin(k_t c / (2 pi f n))``.
 
     Parameters
     ----------
@@ -619,6 +632,11 @@ class PlaneWave:
     size : 3-tuple or None
         Extent of the sheet on the transverse axes (m); ``None`` (default) or
         ``inf`` entries span the whole grid.
+    angle : float
+        Angle of incidence in degrees from ``direction`` (default 0).
+    tilt_axis : str or None
+        ``'x'``, ``'y'`` or ``'z'``: the transverse axis the wavevector tilts
+        towards (required when ``angle`` is not 0).
     """
     center: Tuple[float, ...]
     direction: str
@@ -627,6 +645,32 @@ class PlaneWave:
     amplitude: float = 1.0
     index: float = 1.0
     size: Tuple[float, ...] = None
+    angle: float = 0.0
+    tilt_axis: Optional[str] = None
+
+    def _tilt(self):
+        """``(tilt axis index, k_t)``, or ``(None, 0.0)`` at normal incidence."""
+        if float(self.angle) == 0.0:
+            return None, 0.0
+        if abs(float(self.angle)) >= 90.0:
+            raise ValueError("angle must be between -90 and 90 degrees")
+        if self.tilt_axis not in ("x", "y", "z"):
+            raise ValueError("an oblique PlaneWave needs tilt_axis 'x', 'y' or 'z'")
+        t = _AXIS[self.tilt_axis]
+        if t == _parse_direction(self.direction)[0]:
+            raise ValueError("tilt_axis must be transverse to the direction")
+        kt = (2.0 * math.pi * float(self.waveform.freq0) * float(self.index)
+              * math.sin(math.radians(float(self.angle))) / C_0)
+        return t, kt
+
+    def bloch_vector(self) -> Tuple[float, float, float]:
+        """The Bloch wavevector ``(kx, ky, kz)`` (rad/m) the grid needs for this
+        wave: ``k_t`` on the tilt axis at the waveform's centre frequency."""
+        t, kt = self._tilt()
+        k = [0.0, 0.0, 0.0]
+        if t is not None:
+            k[t] = kt
+        return tuple(k)
 
     def _profile(self, coords_t1, coords_t2, t_axes, center):
         return np.ones((coords_t1.size, coords_t2.size))
@@ -653,6 +697,18 @@ class PlaneWave:
         h_ax = 3 - p - e_ax
         levi = 1.0 if (p, e_ax, h_ax) in ((0, 1, 2), (1, 2, 0), (2, 0, 1)) else -1.0
         h_sign = s * levi
+        t_ax, kt = self._tilt()
+        cos_t = math.cos(math.radians(float(self.angle)))
+        if t_ax is not None:
+            if grid.shape[t_ax] <= 1 or not grid.periodic[t_ax]:
+                raise ValueError(f"an oblique PlaneWave needs a periodic tilt "
+                                 f"axis; make axis {'xyz'[t_ax]} periodic")
+            kg = getattr(grid, "bloch", (0.0, 0.0, 0.0))[t_ax]
+            if not math.isclose(kg, kt, rel_tol=1e-9, abs_tol=1e-12 * abs(kt)):
+                raise ValueError(
+                    f"the grid's Bloch wavevector on axis {'xyz'[t_ax]} is {kg:g} "
+                    f"rad/m; this wave needs {kt:g} (pass "
+                    "Grid(bloch=plane_wave.bloch_vector()))")
 
         center = _to3vec(self.center)
         size = (None, None, None) if self.size is None else tuple(
@@ -662,6 +718,14 @@ class PlaneWave:
         n = float(self.index)
         dE = S / n * float(self.amplitude)
         dH = h_sign * S / math.sqrt(MU_0 / EPS_0) * float(self.amplitude)
+        if t_ax is not None:
+            # The tangential H (s / TE) or E (p / TM) of the tilted wave is
+            # cos(angle) of its normal-incidence value: J = n x H carries the
+            # first, M = -n x E the second.
+            if e_ax != t_ax:
+                dE *= cos_t
+            else:
+                dH *= cos_t
 
         # Sheet cells on the propagation axis: E at cell i_p; H (half a cell
         # +p of its integer index) downstream: same index for +p, i_p-1 for -p.
@@ -688,7 +752,7 @@ class PlaneWave:
 
         # Shared waveforms: the E sheet samples w(t), the H sheet w(t + tau).
         w_e = self.waveform
-        w_h = _TimeShifted(self.waveform, n * dl / (2.0 * C_0))
+        w_h = _TimeShifted(self.waveform, n * cos_t * dl / (2.0 * C_0))
         comp_e = pol
         comp_h = "H" + "xyz"[h_ax]
         dipoles: List[PointDipole] = []
@@ -704,8 +768,17 @@ class PlaneWave:
                     ijk[t_axes[0]] = int(i1)
                     ijk[t_axes[1]] = int(i2)
                     pos = tuple(float(grid.coords[a][ijk[a]]) for a in range(3))
+                    a_ = amp * w
+                    if t_ax is not None:
+                        # Phase at the component's Yee position along the
+                        # tilt axis: E_t and the H components across it sit
+                        # half a cell up.
+                        along = "xyz".index(comp[1]) == t_ax
+                        stag = along if comp[0] == "E" else not along
+                        xt = pos[t_ax] + (0.5 * grid.cell_size[t_ax] if stag else 0.0)
+                        a_ = a_ * complex(np.exp(1j * kt * xt))
                     dipoles.append(PointDipole(position=pos, component=comp,
-                                               waveform=wave, amplitude=amp * w))
+                                               waveform=wave, amplitude=a_))
         return dipoles
 
 

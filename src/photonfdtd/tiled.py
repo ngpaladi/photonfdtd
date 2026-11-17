@@ -237,6 +237,25 @@ class _Tiled:
             raise NotImplementedError(
                 "disk-tiled stepping does not support periodic boundaries; "
                 "run in memory (disk_tiled=False)")
+        from .monitors import EnergyMonitor, FluxMonitor
+        for m in sim.monitors:
+            if isinstance(m, EnergyMonitor) or (
+                    isinstance(m, FluxMonitor) and m.bounds is not None):
+                raise NotImplementedError(
+                    "disk-tiled stepping supports neither EnergyMonitor nor "
+                    "bounded FluxMonitor; run in memory (disk_tiled=False)")
+        if getattr(sim, "devices", None):
+            raise NotImplementedError(
+                "disk-tiled stepping runs on one device; build the Simulation "
+                "with devices=None")
+        if getattr(sim.grid, "has_symmetry", False):
+            raise NotImplementedError(
+                "disk-tiled stepping does not support symmetry planes; run in "
+                "memory (disk_tiled=False)")
+        if getattr(sim, "_has_magnetic", False):
+            raise NotImplementedError(
+                "disk-tiled stepping does not support magnetic media; run in "
+                "memory (disk_tiled=False)")
         self.sim = sim
         self.static = static = _build_static(sim)
         plans = _monitor_plan(sim)

@@ -169,7 +169,89 @@ class FluxMonitor:
         'x', 'y', or 'z' - the axis normal to the integration plane.
     plane_position : float
         Coordinate along plane_axis where the plane sits (m).
+    bounds : optional
+        ``(lo, hi)`` (m) per axis, ``None`` for the whole axis, restricting
+        the plane to a rectangle (the entry on ``plane_axis`` is ignored).
+        Each bound snaps to the nearest node, and the cells on it count half,
+        so faces sharing an edge (see :func:`closed_surface`) close exactly.
     """
     name: str
     plane_axis: str
     plane_position: float
+    bounds: Optional[Sequence[Optional[Tuple[float, float]]]] = None
+
+
+@dataclass
+class EnergyMonitor:
+    """Time series of the electromagnetic energy in a box (J; J/m in 2-D).
+
+    ``U = 1/2 sum (eps |E|^2 + mu |H|^2) dV`` over the cells inside ``bounds``
+    (``(lo, hi)`` per axis, ``None`` for the whole axis; default the whole
+    grid, PML included), every ``interval`` steps. On a grid with symmetry
+    planes it is the whole-domain energy. ``result.energy[name]`` holds the
+    values and ``result.monitor_times[name]`` their times. In a lossless,
+    source-free box the energy is conserved, so its decay measures loss and
+    outflow; a Q factor follows from the decay rate.
+    """
+    name: str
+    interval: int = 1
+    bounds: Optional[Sequence[Optional[Tuple[float, float]]]] = None
+
+    def __post_init__(self):
+        if int(self.interval) != self.interval or self.interval < 1:
+            raise ValueError("interval must be a positive integer")
+        self.interval = int(self.interval)
+
+
+_FACES = ("-x", "+x", "-y", "+y", "-z", "+z")
+
+
+def closed_surface(name: str, center, size, grid=None):
+    """Flux monitors on the faces of a box, for :func:`closed_surface_flux`.
+
+    Returns one bounded :class:`FluxMonitor` per face, named
+    ``f"{name}{face}"`` with ``face`` in ``-x, +x, -y, +y, -z, +z``; faces on
+    an axis collapsed in ``grid`` (or of zero ``size``) are left out, so in
+    2-D a box is four lines. On a grid with symmetry planes pass ``grid``: the
+    box must be centred on each plane, its ``-`` face there is the mirror
+    image of the ``+`` face and is left out, and :func:`closed_surface_flux`
+    counts the ``+`` face twice.
+    """
+    c = list(center) + [0.0] * (3 - len(center))
+    sz = list(size) + [0.0] * (3 - len(size))
+    lim = [(c[a] - sz[a] / 2.0, c[a] + sz[a] / 2.0) for a in range(3)]
+    sym = getattr(grid, "symmetry", (0, 0, 0)) if grid is not None else (0, 0, 0)
+    for a in range(3):
+        if sym[a] and abs(c[a]) > 1e-12 * max(abs(sz[a]), 1e-30):
+            raise ValueError(f"the box must be centred on the symmetry plane of "
+                             f"axis {'xyz'[a]}")
+    mons = []
+    for face in _FACES:
+        a = "xyz".index(face[1])
+        if sz[a] == 0 or (grid is not None and grid.shape[a] == 1):
+            continue
+        if sym[a] and face[0] == "-":
+            continue
+        pos = lim[a][0] if face[0] == "-" else lim[a][1]
+        b = [None if (sz[k] == 0 or (grid is not None and grid.shape[k] == 1))
+             else lim[k] for k in range(3)]
+        mons.append(FluxMonitor(name=name + face, plane_axis=face[1],
+                                plane_position=pos, bounds=b))
+    return mons
+
+
+def closed_surface_flux(result, name: str) -> float:
+    """Net outward energy through the faces made by :func:`closed_surface`."""
+    total, found = 0.0, False
+    for face in _FACES:
+        key = name + face
+        if key in result.flux:
+            found = True
+            sign = 1.0 if face[0] == "+" else -1.0
+            # A + face without its - partner sits on a symmetric axis, where
+            # the - face is its mirror image: count it twice.
+            twice = face[0] == "+" and (name + "-" + face[1]) not in result.flux
+            total += sign * (2.0 if twice else 1.0) * float(result.flux[key])
+    if not found:
+        raise KeyError(f"no closed_surface monitors named {name!r} in the result")
+    return total

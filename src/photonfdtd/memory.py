@@ -40,11 +40,21 @@ def _working_set_bytes(sim) -> int:
     n_cell = int(np.prod(shape))
     itemsize = np.dtype(sim.dtypes["Ex"]).itemsize
     n_fields = 6
-    n_coeff = 3 if getattr(sim, "subpixel", False) else 1
+    n_coeff = 3 if (getattr(sim, "subpixel", False)
+                    or getattr(sim, "_has_anisotropy", False)) else 1
+    if getattr(sim, "_has_conductivity", False):
+        n_coeff += 3                          # lossy decay factors ca
+    if getattr(sim, "_has_magnetic", False):
+        n_coeff += 3                          # per-cell H coefficients
+        if sim.magnetic_conductivity_map() is not None:
+            n_coeff += 3                      # magnetic decay factors da
     # CPML psi: up to 12 running convolution terms (2 per E/H component), each of
     # order the domain size in the dense JAX layout. Zero when there is no PML.
     has_pml = any(int(p) > 0 for p in sim.grid.pml_layers)
     n_psi = 12 if has_pml else 0
+    if getattr(sim.grid, "is_complex", False):
+        # Bloch runs step complex fields and psi (the coefficients stay real).
+        n_fields, n_psi = 2 * n_fields, 2 * n_psi
     return (n_fields + n_coeff + n_psi) * n_cell * itemsize
 
 

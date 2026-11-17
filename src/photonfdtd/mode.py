@@ -191,6 +191,10 @@ class ModeSolver:
         # the permittivity seen by (Ex, Ey, Ez); it stays None for an
         # isotropic layout, and then every component uses eps_r.
         self.structures = list(structures)
+        if any(getattr(getattr(st, "medium", None), "is_magnetic", False)
+               for st in self.structures):
+            raise NotImplementedError(
+                "the mode solver assumes mu_r = 1; magnetic media are FDTD-only")
         self.background_eps = float(background_eps)
         eps_r = np.full((ny, nz), float(background_eps))
         aniso = any(getattr(getattr(st, "medium", None), "is_anisotropic", False)
