@@ -147,3 +147,19 @@ def test_1x2_switch_model_solved():
     v = m.switching_voltage("bar")
     assert abs(v) == pytest.approx(m.info["vpi"] / 2, rel=0.05)
     assert m.bar(v) > 0.95 and m.cross(-v) > 0.95
+
+
+@pytest.mark.parametrize("width", [1.2, 0.8])
+def test_1x2_y_junction_has_a_blunt_tip(width):
+    """No gap on the waveguide layer narrower than the tip gap: the notch
+    where the branches part is filled until they are tip_gap apart."""
+    import klayout.db as kdb
+
+    c = lnoi.mzi_switch_1x2(arm_length=200, width=width)
+    dbu = c.kcl.dbu
+    region = kdb.Region(c.begin_shapes_rec(c.kcl.layer(1, 0))).merged()
+    narrow = region.space_check(int(round(0.999 / dbu)))
+    assert narrow.is_empty(), [e.bbox() for e in narrow.each()]
+    sharp = kdb.Region(lnoi.mzi_switch_1x2(arm_length=200, width=width, tip_gap=0)
+                       .begin_shapes_rec(c.kcl.layer(1, 0))).merged()
+    assert not sharp.space_check(int(round(0.999 / dbu))).is_empty()

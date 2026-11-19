@@ -176,6 +176,31 @@ def _pair(c, x0, length, gap, xs, width, dy, bend_length):
     return out["lower"][0], out["upper"][0], out["upper"][1], out["lower"][1]
 
 
+def _branch_gap_at(upper, layer, gap, length):
+    """Distance along a Y-junction from its vertex (x = 0) at which the
+    upper branch's lower edge is ``gap / 2`` above the axis, so the two
+    mirrored branches are ``gap`` apart; 0 if they never get that close."""
+    import klayout.db as kdb
+
+    region = kdb.Region(upper.cell.begin_shapes_rec(upper.cell.kcl.layer(*layer)))
+    region.transform(upper.trans)
+    dbu = upper.cell.kcl.dbu
+
+    def lower_edge(x):
+        strip = kdb.Region(kdb.Box(int(round(x / dbu)) - 1, -10**9, int(round(x / dbu)) + 1, 10**9))
+        cut = region & strip
+        return cut.bbox().bottom * dbu if not cut.is_empty() else float("inf")
+
+    if lower_edge(0.0) >= gap / 2:
+        return 0.0
+    lo, hi = 0.0, float(length)
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if lower_edge(mid) < gap / 2 else (lo, mid)
+    # Up to the next 2 nm, so the strip's corner never leaves a sliver.
+    return float(np.ceil(hi / 0.002) * 0.002)
+
+
 def _record(c, kind, **data):
     c.info["lnoi"] = dict(kind=kind, **data)
 
@@ -276,14 +301,17 @@ def mzi_switch_1x2(arm_length: float = 5000.0, width: float = 1.2,
                    coupler_gap: float = 1.0, coupler_length: float = 276.0,
                    electrode_gap: float = 5.0, signal_width: float = 20.0,
                    ground_width: float = 60.0, bend_length: float = 150.0,
-                   input_length: float = 50.0, radius: float = 80.0,
-                   layers: Layers = LAYERS) -> gf.Component:
+                   input_length: float = 50.0, tip_gap: float = 1.0,
+                   radius: float = 80.0, layers: Layers = LAYERS) -> gf.Component:
     """A 1 x 2 Mach-Zehnder switch on x-cut LN: one input, a 1 x 2 splitter.
 
     The input ``o1`` runs ``input_length`` straight into a symmetric
     Y-junction: two S-bends, ``bend_length`` long, that open from the input to
     the arms. By symmetry, the junction splits the light 50:50 and in phase
-    at any width. The arms and electrodes are those of :func:`mzi_switch`,
+    at any width. Where the branches part, the notch between them is filled
+    until they are ``tip_gap`` apart (a blunt tip, as fabricated; 0 leaves the
+    knife-edge notch, which no lithography resolves and DRC flags). The arms
+    and electrodes are those of :func:`mzi_switch`,
     and so is the output: a directional coupler (``coupler_gap``,
     ``coupler_length``; 50:50 for the default stack) onto ``o3`` (upper right)
     and ``o4`` (lower right). With equal arms, the coupler gets the two inputs
@@ -305,6 +333,10 @@ def mzi_switch_1x2(arm_length: float = 5000.0, width: float = 1.2,
     upper.connect("o1", feed.ports["o2"])
     lower = c << branch
     lower.connect("o1", feed.ports["o2"], mirror=True)
+    if tip_gap > 0:
+        x_tip = _branch_gap_at(upper, layers.rib, tip_gap, bend_length)
+        if x_tip > 0:
+            _strip(c, 0.0, x_tip, 0.0, tip_gap, layers.rib)
     (b3, b4), record = _arms_and_recombiner(
         c, (upper.ports["o2"], lower.ports["o2"]), arm_length, width, coupler_gap,
         coupler_length, electrode_gap, signal_width, ground_width, bend_length, xs, layers)
