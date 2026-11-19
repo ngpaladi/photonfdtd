@@ -226,10 +226,12 @@ def from_lnoi(m, length: float = 0.0, bandwidth: Optional[float] = None,
         common = np.exp(-1j * 2 * np.pi / (wl * 1e-6) * n0 * length * 1e-6) * \
             10 ** (-loss_db_cm * length * 1e-4 / 20)
         T = T * common[:, None, None]
-        # rows: outputs (o4 lower, o3 upper); columns: inputs (o1 lower, o2 upper)
-        for i, pin in enumerate(("o1", "o2")):
+        # rows: outputs (o4 lower, o3 upper); columns: inputs (o1 lower, o2
+        # upper), or the single input o1 of the 1 x 2 switch
+        inputs = ("o1",) if m.kind == "mzi_switch_1x2" else ("o1", "o2")
+        for i, pin in enumerate(inputs):
             for o, pout in enumerate(("o4", "o3")):
                 out[(pin, pout)] = T[:, o, i]
         return reciprocal(out)
-    return Modulator(fn, ("o1", "o2", "o3", "o4"),
-                     {n: (f"{n}_w", f"{n}_e") for n in names}, bandwidth=bandwidth)
+    ports = ("o1", "o3", "o4") if m.kind == "mzi_switch_1x2" else ("o1", "o2", "o3", "o4")
+    return Modulator(fn, ports, {n: (f"{n}_w", f"{n}_e") for n in names}, bandwidth=bandwidth)

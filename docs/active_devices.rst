@@ -158,7 +158,13 @@ computed from its own geometry:
      - x-cut ridge between signal and ground; ``model`` gives ``vpi_l``,
        ``vpi`` and ``phase(V)``
    * - :func:`~photonfdtd.lnoi.mzi_switch`
-     - x-cut 2 x 2 MZI, directional couplers and push-pull GSG electrodes
+     - x-cut 2 x 2 MZI, directional couplers and push-pull GSG electrodes;
+       crossed at 0 V
+   * - :func:`~photonfdtd.lnoi.mzi_switch_1x2`
+     - the same MZI with one input: a symmetric Y-junction splits it 50:50 by
+       symmetry, at any width. Its outputs are 50:50 at 0 V and switch fully at
+       ``+-V_pi/2``; ``transfer`` is 2 x 1, ``bar`` is the lower output ``o4``
+       and ``cross`` the upper ``o3``
    * - :func:`~photonfdtd.lnoi.dbeta_coupler_switch`
      - z-cut delta-beta coupler with electrodes on top of both waveguides,
        optionally in reversed sections
