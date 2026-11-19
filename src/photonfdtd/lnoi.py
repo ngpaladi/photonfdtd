@@ -22,6 +22,8 @@ The cells:
   electrode.
 - :func:`mzi_switch`: a 2 x 2 Mach-Zehnder switch, two directional couplers
   and push-pull ground-signal-ground electrodes on the arms (x-cut).
+- :func:`mzi_switch_1x2`: the same switch with one input and a Y-junction
+  1 x 2 splitter in place of the first coupler.
 - :func:`dbeta_coupler_switch`: a directional coupler with electrodes on top
   of the two waveguides (z-cut, TM). The vertical fields under the electrodes
   point in opposite directions in the two waveguides, so the drive detunes
@@ -60,7 +62,7 @@ UM = 1e-6
 _CACHE_VERSION = 1
 
 __all__ = ["Layers", "LAYERS", "Stack", "rib", "phase_shifter", "mzi_switch",
-           "dbeta_coupler_switch", "model", "SwitchModel", "PhaseShifterModel",
+           "mzi_switch_1x2", "dbeta_coupler_switch", "model", "SwitchModel", "PhaseShifterModel",
            "coupler_length", "layer_map", "to_simulation"]
 
 
@@ -174,6 +176,31 @@ def _pair(c, x0, length, gap, xs, width, dy, bend_length):
     return out["lower"][0], out["upper"][0], out["upper"][1], out["lower"][1]
 
 
+def _branch_gap_at(upper, layer, gap, length):
+    """Distance along a Y-junction from its vertex (x = 0) at which the
+    upper branch's lower edge is ``gap / 2`` above the axis, so the two
+    mirrored branches are ``gap`` apart; 0 if they never get that close."""
+    import klayout.db as kdb
+
+    region = kdb.Region(upper.cell.begin_shapes_rec(upper.cell.kcl.layer(*layer)))
+    region.transform(upper.trans)
+    dbu = upper.cell.kcl.dbu
+
+    def lower_edge(x):
+        strip = kdb.Region(kdb.Box(int(round(x / dbu)) - 1, -10**9, int(round(x / dbu)) + 1, 10**9))
+        cut = region & strip
+        return cut.bbox().bottom * dbu if not cut.is_empty() else float("inf")
+
+    if lower_edge(0.0) >= gap / 2:
+        return 0.0
+    lo, hi = 0.0, float(length)
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if lower_edge(mid) < gap / 2 else (lo, mid)
+    # Up to the next 2 nm, so the strip's corner never leaves a sliver.
+    return float(np.ceil(hi / 0.002) * 0.002)
+
+
 def _record(c, kind, **data):
     c.info["lnoi"] = dict(kind=kind, **data)
 
@@ -205,6 +232,36 @@ def phase_shifter(length: float = 5000.0, width: float = 1.2, electrode_gap: flo
     return c
 
 
+def _arms_and_recombiner(c, ports, arm_length, width, coupler_gap, coupler_length,
+                         electrode_gap, signal_width, ground_width, bend_length, xs, layers):
+    """From the arm starts ``ports`` (upper, lower; ``signal_width +
+    electrode_gap`` apart): the two push-pull arms between ground-signal-ground
+    electrodes and the output 50:50 coupler. Returns the coupler's outer east
+    ports ``(upper, lower)`` and the cell record's electrode fields."""
+    sep = signal_width + electrode_gap
+    dy = sep / 2 - (width + coupler_gap) / 2
+    x_arm0 = ports[0].center[0]
+    for p in ports:
+        arm = c << gf.components.straight(length=arm_length, cross_section=xs)
+        arm.connect("o1", p)
+    x_arm1 = x_arm0 + arm_length
+    x_dc2 = x_arm1 + bend_length
+    _b1, _b2, b3, b4 = _pair(c, x_dc2, coupler_length, coupler_gap, xs, width, dy, bend_length)
+    y_g = sep / 2 + electrode_gap / 2 + ground_width / 2
+    strips = [dict(name="sig", y=0.0, width=signal_width),
+              dict(name="gnd_top", y=y_g, width=ground_width),
+              dict(name="gnd_bot", y=-y_g, width=ground_width)]
+    for st in strips:
+        _strip(c, x_arm0, x_arm1, st["y"], st["width"], layers.metal)
+        _electrical_ports(c, st["name"], x_arm0, x_arm1, st["y"], st["width"], layers.metal)
+    record = dict(width=width, ribs=[-sep / 2, sep / 2],
+                  coupler=dict(gap=coupler_gap, length=coupler_length),
+                  strips=[dict(y=st["y"], width=st["width"], style="lateral") for st in strips],
+                  segments=[dict(x0=x_arm0, x1=x_arm1,
+                                 electrodes=dict(sig=0, gnd_top=1, gnd_bot=2))])
+    return (b3, b4), record
+
+
 @gf.cell
 def mzi_switch(arm_length: float = 5000.0, width: float = 1.2,
                coupler_gap: float = 1.0, coupler_length: float = 276.0,
@@ -221,7 +278,7 @@ def mzi_switch(arm_length: float = 5000.0, width: float = 1.2,
     ``signal_width + electrode_gap`` apart, and so are the optical ports
     ``o1`` (lower left), ``o2`` (upper left), ``o3`` (upper right) and
     ``o4`` (lower right). Electrical ports: ``sig_*``, ``gnd_top_*``,
-    ``gnd_bot_*``.
+    ``gnd_bot_*``. At 0 V the light crosses over (``o1`` to ``o3``).
     """
     c = gf.Component()
     xs = rib(width, radius, layers)
@@ -230,27 +287,63 @@ def mzi_switch(arm_length: float = 5000.0, width: float = 1.2,
     if dy <= 0:
         raise ValueError("the arms must be further apart than the coupler waveguides")
     a1, a2, a3, a4 = _pair(c, 0.0, coupler_length, coupler_gap, xs, width, dy, bend_length)
-    x_arm0 = a3.center[0]
-    for p in (a3, a4):
-        arm = c << gf.components.straight(length=arm_length, cross_section=xs)
-        arm.connect("o1", p)
-    x_arm1 = x_arm0 + arm_length
-    x_dc2 = x_arm1 + bend_length
-    b1, b2, b3, b4 = _pair(c, x_dc2, coupler_length, coupler_gap, xs, width, dy, bend_length)
+    (b3, b4), record = _arms_and_recombiner(
+        c, (a3, a4), arm_length, width, coupler_gap, coupler_length, electrode_gap,
+        signal_width, ground_width, bend_length, xs, layers)
     for name, p in (("o1", a1), ("o2", a2), ("o3", b3), ("o4", b4)):
         c.add_port(name, port=p)
-    y_g = sep / 2 + electrode_gap / 2 + ground_width / 2
-    strips = [dict(name="sig", y=0.0, width=signal_width),
-              dict(name="gnd_top", y=y_g, width=ground_width),
-              dict(name="gnd_bot", y=-y_g, width=ground_width)]
-    for s in strips:
-        _strip(c, x_arm0, x_arm1, s["y"], s["width"], layers.metal)
-        _electrical_ports(c, s["name"], x_arm0, x_arm1, s["y"], s["width"], layers.metal)
-    _record(c, "mzi_switch", width=width, ribs=[-sep / 2, sep / 2],
-            coupler=dict(gap=coupler_gap, length=coupler_length),
-            strips=[dict(y=s["y"], width=s["width"], style="lateral") for s in strips],
-            segments=[dict(x0=x_arm0, x1=x_arm1,
-                           electrodes=dict(sig=0, gnd_top=1, gnd_bot=2))])
+    _record(c, "mzi_switch", **record)
+    return c
+
+
+@gf.cell
+def mzi_switch_1x2(arm_length: float = 5000.0, width: float = 1.2,
+                   coupler_gap: float = 1.0, coupler_length: float = 276.0,
+                   electrode_gap: float = 5.0, signal_width: float = 20.0,
+                   ground_width: float = 60.0, bend_length: float = 150.0,
+                   input_length: float = 50.0, tip_gap: float = 1.0,
+                   radius: float = 80.0, layers: Layers = LAYERS) -> gf.Component:
+    """A 1 x 2 Mach-Zehnder switch on x-cut LN: one input, a 1 x 2 splitter.
+
+    The input ``o1`` runs ``input_length`` straight into a symmetric
+    Y-junction: two S-bends, ``bend_length`` long, that open from the input to
+    the arms. By symmetry, the junction splits the light 50:50 and in phase
+    at any width. Where the branches part, the notch between them is filled
+    until they are ``tip_gap`` apart (a blunt tip, as fabricated; 0 leaves the
+    knife-edge notch, which no lithography resolves and DRC flags). The arms
+    and electrodes are those of :func:`mzi_switch`,
+    and so is the output: a directional coupler (``coupler_gap``,
+    ``coupler_length``; 50:50 for the default stack) onto ``o3`` (upper right)
+    and ``o4`` (lower right). With equal arms, the coupler gets the two inputs
+    in phase and splits them 50:50, so the switch sits at quadrature at 0 V.
+    ``+V_pi/2`` sends all the light to one output and ``-V_pi/2`` to the other
+    (see :meth:`SwitchModel.switching_voltage`). Electrical ports as in
+    :func:`mzi_switch`.
+    """
+    c = gf.Component()
+    xs = rib(width, radius, layers)
+    sep = signal_width + electrode_gap
+    if sep / 2 - (width + coupler_gap) / 2 <= 0:
+        raise ValueError("the arms must be further apart than the coupler waveguides")
+    feed = c << gf.components.straight(length=input_length, cross_section=xs)
+    feed.move((-input_length, 0.0))
+    branch = gf.components.bend_s(size=(bend_length, sep / 2), cross_section=xs,
+                                  allow_min_radius_violation=True)
+    upper = c << branch
+    upper.connect("o1", feed.ports["o2"])
+    lower = c << branch
+    lower.connect("o1", feed.ports["o2"], mirror=True)
+    if tip_gap > 0:
+        x_tip = _branch_gap_at(upper, layers.rib, tip_gap, bend_length)
+        if x_tip > 0:
+            _strip(c, 0.0, x_tip, 0.0, tip_gap, layers.rib)
+    (b3, b4), record = _arms_and_recombiner(
+        c, (upper.ports["o2"], lower.ports["o2"]), arm_length, width, coupler_gap,
+        coupler_length, electrode_gap, signal_width, ground_width, bend_length, xs, layers)
+    c.add_port("o1", port=feed.ports["o1"])
+    c.add_port("o3", port=b3)
+    c.add_port("o4", port=b4)
+    _record(c, "mzi_switch_1x2", **record)
     return c
 
 
@@ -478,18 +571,25 @@ class SwitchModel:
     def transfer(self, V=0.0, wavelength: Optional[float] = None) -> np.ndarray:
         """``wavelength`` (m, default the design wavelength) rescales the
         phases as 1/λ, with the coupling and ``d n_eff / dV`` kept from the
-        design wavelength."""
+        design wavelength. For the 1 x 2 switch (``kind ==
+        "mzi_switch_1x2"``) the matrix is 2 x 1: the outputs (``o4`` lower,
+        ``o3`` upper) from the single input ``o1``."""
         V = _drives(V, self.electrode_names, self.signals)
         k0 = 2 * np.pi / (self.wavelength if wavelength is None else float(wavelength))
         rec = self.rec
-        if self.kind == "mzi_switch":
+        if self.kind in ("mzi_switch", "mzi_switch_1x2"):
             dc = _coupled(self.kappa, 0.0, rec["coupler"]["length"] * UM)
             seg = rec["segments"][0]
             dn = self._delta_n(seg, V)
             L = (seg["x1"] - seg["x0"]) * UM
             # ribs are ordered (lower, upper)
             arms = np.diag(np.exp(-1j * k0 * dn * L))
-            return dc @ arms @ dc
+            if self.kind == "mzi_switch":
+                return dc @ arms @ dc
+            # The Y-junction: half the power into each arm, in phase.
+            return dc @ arms @ np.full((2, 1), 1 / np.sqrt(2), dtype=complex)
+        if self.kind != "dbeta_coupler_switch":
+            raise ValueError(f"no transfer model for LNOI cell kind {self.kind!r}")
         M = np.eye(2, dtype=complex)
         x = 0.0
         for seg in rec["segments"]:
@@ -501,14 +601,25 @@ class SwitchModel:
             x = seg["x1"]
         return M
 
+    def _input(self, port):
+        if self.kind == "mzi_switch_1x2":
+            if port != "o1":
+                raise ValueError("the 1 x 2 switch has one input, o1")
+            return 0
+        return {"o1": 0, "o2": 1}[port]
+
     def cross(self, V=0.0, port: str = "o1") -> float:
         """Power fraction from input ``port`` (o1 or o2) to the other
-        waveguide's output."""
-        i = {"o1": 0, "o2": 1}[port]
-        return float(abs(self.transfer(V)[1 - i, i]) ** 2)
+        waveguide's output. For the 1 x 2 switch: from ``o1`` to the upper
+        output ``o3``."""
+        i = self._input(port)
+        T = self.transfer(V)
+        return float(abs(T[1, 0] if self.kind == "mzi_switch_1x2" else T[1 - i, i]) ** 2)
 
     def bar(self, V=0.0, port: str = "o1") -> float:
-        i = {"o1": 0, "o2": 1}[port]
+        """Power fraction from input ``port`` to its own waveguide's output. For
+        the 1 x 2 switch: from ``o1`` to the lower output ``o4``."""
+        i = self._input(port)
         return float(abs(self.transfer(V)[i, i]) ** 2)
 
     def sweep(self, voltages) -> Tuple[np.ndarray, np.ndarray]:
@@ -611,7 +722,7 @@ def _solve_model(rec, stack, cell_size):
     n_even, n_odd = _supermodes(cp["gap"], rec["width"], stack, cell_size)
     kappa = np.pi * (n_even - n_odd) / lam
     info = dict(n_even=n_even, n_odd=n_odd, coupling_length=np.pi / (2 * kappa))
-    if kind == "mzi_switch":
+    if kind in ("mzi_switch", "mzi_switch_1x2"):
         dn = S[:, 0]   # per volt on the signal: (lower, upper)
         seg = rec["segments"][0]
         info["vpi"] = lam / (2 * abs(dn[0] - dn[1]) * (seg["x1"] - seg["x0"]) * UM)

@@ -21,7 +21,7 @@ def test_coupled_mode_limits():
 
 
 @pytest.mark.parametrize("cell", [lnoi.phase_shifter, lnoi.mzi_switch,
-                                  lnoi.dbeta_coupler_switch])
+                                  lnoi.mzi_switch_1x2, lnoi.dbeta_coupler_switch])
 def test_cells_draw(cell):
     c = cell()
     names = {p.name for p in c.ports}
@@ -31,7 +31,8 @@ def test_cells_draw(cell):
         for e in seg["electrodes"]:
             assert {f"{e}_w", f"{e}_e"} <= names
     optical = {p.name for p in c.ports if p.port_type == "optical"}
-    assert optical == ({"o1", "o2"} if cell is lnoi.phase_shifter else {"o1", "o2", "o3", "o4"})
+    expected = {lnoi.phase_shifter: {"o1", "o2"}, lnoi.mzi_switch_1x2: {"o1", "o3", "o4"}}
+    assert optical == expected.get(cell, {"o1", "o2", "o3", "o4"})
     assert c.get_polygons()             # draws something
 
 
@@ -62,3 +63,103 @@ def test_switch_models():
     assert db.cross(0) > 0.9
     v = db.switching_voltage("bar")
     assert db.bar(v) > 0.95
+
+
+def test_1x2_switch_geometry():
+    """The Y-junction opens from the single input, centred between the arms,
+    to the arm separation; the outputs are where the 2 x 2's are."""
+    c = lnoi.mzi_switch_1x2(arm_length=1000)
+    two = lnoi.mzi_switch(arm_length=1000)
+    p = {q.name: q for q in c.ports}
+    assert p["o1"].center[1] == pytest.approx(0.0)
+    assert p["o1"].orientation == 180
+    for name in ("o3", "o4"):
+        assert p[name].center[1] == pytest.approx(two.ports[name].center[1])
+    # The first coupler and its bends (150 + 276 + 150 um) give way to the
+    # 50 um input and the 150 um Y.
+    span_two = two.ports["o3"].center[0] - two.ports["o1"].center[0]
+    assert p["o3"].center[0] - p["o1"].center[0] == pytest.approx(span_two - 576.0 + 200.0)
+    (seg,), (seg2,) = c.info["lnoi"]["segments"], two.info["lnoi"]["segments"]
+    assert seg["x1"] - seg["x0"] == pytest.approx(seg2["x1"] - seg2["x0"])
+    assert seg["electrodes"] == seg2["electrodes"]
+    assert c.info["lnoi"]["ribs"] == two.info["lnoi"]["ribs"]
+
+
+def _ideal_1x2():
+    """A 1 x 2 model with exact 50:50 output coupler and V_pi = 4 V."""
+    rec = lnoi.mzi_switch_1x2(arm_length=1000).info["lnoi"]
+    L = rec["coupler"]["length"] * 1e-6
+    kappa = np.pi / (4 * L)
+    seg = rec["segments"][0]
+    d = 1.55e-6 / (2 * 4.0 * (seg["x1"] - seg["x0"]) * 1e-6) / 2
+    return lnoi.SwitchModel(kind="mzi_switch_1x2", wavelength=1.55e-6, kappa=kappa,
+                            slopes=np.array([[-d, 0, 0], [d, 0, 0]]), rec=rec,
+                            electrode_names=["sig", "gnd_top", "gnd_bot"], signals=["sig"],
+                            info=dict(n_even=2.0, n_odd=2.0, vpi=4.0))
+
+
+def test_1x2_transfer_splits_at_0v_and_switches_at_half_vpi():
+    m = _ideal_1x2()
+    assert m.transfer(0).shape == (2, 1)
+    assert m.bar(0) == pytest.approx(0.5, abs=1e-9)
+    assert m.cross(0) == pytest.approx(0.5, abs=1e-9)
+    lo, hi = sorted([m.bar(2.0), m.bar(-2.0)])
+    assert hi == pytest.approx(1.0, abs=1e-9) and lo == pytest.approx(0.0, abs=1e-9)
+    for V in (-3.0, 0.7, 2.0):
+        assert m.bar(V) + m.cross(V) == pytest.approx(1.0, abs=1e-12)   # lossless
+    assert abs(m.switching_voltage("bar")) == pytest.approx(2.0, abs=0.01)
+    with pytest.raises(ValueError):
+        m.bar(0, port="o2")
+
+
+def test_1x2_circuit_model_is_a_three_port():
+    from photonfdtd.circuit.models import from_lnoi
+
+    m = _ideal_1x2()
+    mod = from_lnoi(m, length=100.0)
+    assert set(mod.ports) == {"o1", "o3", "o4"}
+    s = mod.fn(np.array([1.55]), V={"sig": 2.0})
+    p4, p3 = abs(s[("o1", "o4")][0]) ** 2, abs(s[("o1", "o3")][0]) ** 2
+    assert p4 + p3 == pytest.approx(1.0, abs=1e-9)
+    assert max(p4, p3) == pytest.approx(1.0, abs=1e-9)
+    assert s[("o4", "o1")][0] == s[("o1", "o4")][0]            # reciprocal
+
+
+def test_1x2_json_round_trip():
+    m = _ideal_1x2()
+    back = lnoi._from_json(lnoi._to_json(m))
+    assert back.kind == "mzi_switch_1x2"
+    assert np.allclose(back.transfer(1.3), m.transfer(1.3))
+
+
+def test_unknown_kind_has_no_transfer():
+    m = _ideal_1x2()
+    m.kind = "something_else"
+    with pytest.raises(ValueError):
+        m.transfer(0)
+
+
+def test_1x2_switch_model_solved():
+    """The real cross-section solve: the default 1 x 2 is 50:50 at 0 V (within
+    the default coupler's split) and switches at +-V_pi/2."""
+    m = lnoi.model(lnoi.mzi_switch_1x2(), cell_size=0.05)
+    assert m.bar(0) == pytest.approx(0.5, abs=0.03)
+    v = m.switching_voltage("bar")
+    assert abs(v) == pytest.approx(m.info["vpi"] / 2, rel=0.05)
+    assert m.bar(v) > 0.95 and m.cross(-v) > 0.95
+
+
+@pytest.mark.parametrize("width", [1.2, 0.8])
+def test_1x2_y_junction_has_a_blunt_tip(width):
+    """No gap on the waveguide layer narrower than the tip gap: the notch
+    where the branches part is filled until they are tip_gap apart."""
+    import klayout.db as kdb
+
+    c = lnoi.mzi_switch_1x2(arm_length=200, width=width)
+    dbu = c.kcl.dbu
+    region = kdb.Region(c.begin_shapes_rec(c.kcl.layer(1, 0))).merged()
+    narrow = region.space_check(int(round(0.999 / dbu)))
+    assert narrow.is_empty(), [e.bbox() for e in narrow.each()]
+    sharp = kdb.Region(lnoi.mzi_switch_1x2(arm_length=200, width=width, tip_gap=0)
+                       .begin_shapes_rec(c.kcl.layer(1, 0))).merged()
+    assert not sharp.space_check(int(round(0.999 / dbu))).is_empty()
