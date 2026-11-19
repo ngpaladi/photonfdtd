@@ -148,4 +148,4 @@ __all__ = [
     "Sinusoid", "Ramp", "Step",
 ]
 
-__version__ = "0.16.1"
+__version__ = "0.16.2"
